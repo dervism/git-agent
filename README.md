@@ -1,14 +1,16 @@
 # git-agent
 
-Generates git commit messages from your changes using a local LLM served through an
-OpenAI-compatible API (LM Studio, Ollama, llama.cpp, vLLM, or a hosted provider).
+git-agent writes git commit messages for your changes using a local LLM served through
+an OpenAI-compatible API (LM Studio, Ollama, llama.cpp, vLLM, or a hosted provider).
 You review each proposed message, then commit it, edit it, regenerate it, or tell the
 model what to change.
 
-## Motivation to make git-agent
+## Why I made git-agent
 
-I primarily made this agent to resemble IntelliJ IDEA's git commit message generation. IDEA uses 
-nearly 3-4GB of RAM, taking up much needed memory for running local language models. This agent makes it possible to get the same commit message generation features without IDEA, while providing stronger automation features for your pipelines and light-weight code editors.
+I made git-agent mainly to get the commit message generation from IntelliJ IDEA
+without running IDEA. IDEA uses nearly 3-4 GB of RAM, and I need that memory for
+running local language models. git-agent also has stronger automation features, for
+use in pipelines or with lightweight code editors.
 
 ## Install
 
@@ -17,13 +19,13 @@ cargo install --path . --locked
 ```
 
 This builds an optimized binary in `target/release/` and copies it to `~/.cargo/bin/`
-(or `$CARGO_HOME/bin/`).
-
-Because the binary is called `git-agent`, git also runs it as `git agent`.
+(or `$CARGO_HOME/bin/`). Because the binary is called `git-agent`, git also runs it as
+`git agent`.
 
 ### If you installed Rust with Homebrew or a Linux package manager
-`~/.cargo/bin` must be on your `PATH`. rustup sets this up for you, but if Rust came
-from Homebrew or a Linux package manager, add it yourself, e.g. in `~/.zshrc`:
+
+`~/.cargo/bin` must be on your `PATH`. rustup adds it for you, but Homebrew and Linux
+package managers don't, so add it yourself, for example in `~/.zshrc`:
 
 ```sh
 export PATH="$HOME/.cargo/bin:$PATH"
@@ -42,11 +44,11 @@ git agent --raw            # print just the message, e.g. for `| git commit -F -
 git agent -- --signoff     # pass extra arguments to `git commit`
 ```
 
-If something is staged, only the staged changes are described and committed. If
-nothing is staged, git-agent describes all changes to tracked files and commits them
-with `git commit --all`. Untracked files are left out unless you use `--all`.
+If you have staged changes, git-agent describes and commits only those. If nothing is
+staged, it describes all changes to tracked files and commits them with
+`git commit --all`. Untracked files are left out unless you use `--all`.
 
-After a message is generated you choose what to do with it:
+After git-agent generates a message, you choose what to do with it:
 
 | Key | Action |
 | --- | --- |
@@ -57,28 +59,30 @@ After a message is generated you choose what to do with it:
 | `f` | Tell the model what to change, e.g. `f shorter, and mention the CLI flags` |
 | `q` | Quit without committing |
 
-If `git commit` fails (for example, because a hook rejects it), the message is saved
-to `.git/GIT_AGENT_MSG` so you can reuse it with `git commit --file .git/GIT_AGENT_MSG`.
+If `git commit` fails (for example, because a hook rejects it), git-agent saves the
+message to `.git/GIT_AGENT_MSG` so you can reuse it with
+`git commit --file .git/GIT_AGENT_MSG`.
 
 Pushing runs a plain `git push`, so it works with GitHub or any other remote and uses
-your existing git credentials. The first time you push a branch that has no
-upstream, git-agent pushes it to `origin` (or your only remote, or `remote.pushDefault`)
-and sets the upstream. If the repository has no remote yet, create one on GitHub with
-`gh repo create --source . --push`. If the push fails, the commit is kept; fix the
-problem and run `git push`.
+your existing git credentials. The first time you push a branch that has no upstream,
+git-agent sets one: it uses `remote.pushDefault` if you've configured it, otherwise
+your only remote, otherwise `origin`. If the repository has no remote yet, create one
+on GitHub with `gh repo create --source . --push`. If the push fails, the commit is
+kept; fix the problem and run `git push`.
 
 Before pushing, git-agent fetches from the remote. If the remote has commits you don't
-have (for example, a file you edited on GitHub), it lists them and rebases your
-commit on top of them, so the history stays linear and nothing on the remote is
-lost. In the review menu it asks first; with `--commit --push` it does this
-automatically. Uncommitted changes are set aside during the rebase and restored
-afterwards. If your commit conflicts with the remote commits, the rebase is cancelled
-and your branch is left as it was; run `git pull --rebase`, resolve the conflicts,
-and `git push`. git-agent never force-pushes.
+have, such as a file you edited on GitHub, git-agent lists them and rebases your
+commit on top of them. That keeps the history linear and leaves the remote commits in
+place. The review menu asks before rebasing; `--commit --push` rebases without
+asking. Uncommitted changes are set aside during the rebase and restored afterwards.
+
+If your commit conflicts with the remote commits, git-agent cancels the rebase and
+leaves your branch as it was. Run `git pull --rebase`, resolve the conflicts, and
+`git push`. git-agent never force-pushes.
 
 ## Configuration
 
-Settings are resolved in this order, later ones winning:
+Settings come from these sources, and later ones override earlier ones:
 
 1. Built-in defaults
 2. The config file: `~/.config/git-agent/config.toml` (or `$XDG_CONFIG_HOME/git-agent/config.toml`)
@@ -116,17 +120,17 @@ Notes:
   still appear in the list of changed files sent to the model, but their diffs don't.
 - Diffs longer than `max_diff_chars` are cut off. Lower it if your model has a small
   context window.
-- Reasoning blocks (`<think>…</think>`) and code fences around the reply are removed.
+- git-agent removes reasoning blocks (`<think>…</think>`) and code fences around the
+  model's reply.
 - Set `NO_COLOR` to turn off colored output.
 
 ## Contributing
 
-Contributions are welcome! Feel free to open an
-[issue](https://github.com/dervism/git-agent/issues) for bugs and feature ideas, or
-send a pull request. For larger changes, opening an issue first to discuss the
-approach is appreciated.
+Contributions are welcome! Open an [issue](https://github.com/dervism/git-agent/issues)
+for bugs and feature ideas, or send a pull request. For larger changes, please open an
+issue first so we can discuss the approach.
 
-Before submitting a pull request, please make sure these pass:
+Before you send a pull request, make sure these pass:
 
 ```sh
 cargo fmt --check

@@ -5,6 +5,15 @@ OpenAI-compatible API (LM Studio, Ollama, llama.cpp, vLLM, or a hosted provider)
 You review each proposed message, then commit it, edit it, regenerate it, or tell the
 model what to change.
 
+## Motivation to make git-agent
+
+I primarily made this agent to resemble a very useful feature in IntelliJ IDEA: generating
+git commit messages from uncommitted changes in a git repo with LLM's. IntelliJ IDEA uses 
+nearly 3-4GB of RAM when running, even when many plugins are disabled. As we code less manually, 
+lighter  code editors free up much needed memory for running local language models. This agent  
+makes it possible to get the same features from IDEA, while providing automation features for  
+your pipelines.
+
 ## Install
 
 ```sh

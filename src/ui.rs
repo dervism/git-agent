@@ -64,6 +64,19 @@ pub fn yellow(text: &str) -> String {
     paint("33", text)
 }
 
+/// Formats a number with thousands separators, e.g. 131,072.
+pub fn thousands(number: usize) -> String {
+    let digits = number.to_string();
+    let mut out = String::new();
+    for (index, digit) in digits.chars().enumerate() {
+        if index > 0 && (digits.len() - index).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(digit);
+    }
+    out
+}
+
 pub fn info(message: impl Display) {
     eprintln!("{message}");
 }
@@ -223,6 +236,15 @@ fn strip_comments(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn separates_thousands() {
+        assert_eq!(thousands(0), "0");
+        assert_eq!(thousands(999), "999");
+        assert_eq!(thousands(4096), "4,096");
+        assert_eq!(thousands(131072), "131,072");
+        assert_eq!(thousands(1234567), "1,234,567");
+    }
 
     #[test]
     fn strips_comment_lines_and_padding() {

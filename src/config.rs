@@ -12,10 +12,10 @@ use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
 pub const DEFAULT_BASE_URL: &str = "http://localhost:1234/v1";
-pub const DEFAULT_MODEL: &str = "google/gemma-4-e4b";
 pub const DEFAULT_TEMPERATURE: f32 = 0.4;
 pub const DEFAULT_TIMEOUT_SECS: u64 = 300;
-pub const DEFAULT_MAX_DIFF_CHARS: usize = 16_000;
+/// Smallest usable context: the system prompt, a little of the diff, and the reply.
+pub const MIN_CONTEXT_LENGTH: usize = 2048;
 
 /// Files whose diffs are noise for a commit message. They still appear in the file list.
 pub const DEFAULT_EXCLUDE: &[&str] = &[
@@ -49,12 +49,16 @@ Reply with the commit message only: no introduction, no Markdown headings, no co
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
     pub base_url: String,
-    pub model: String,
+    /// `None` uses the model loaded on the server.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub api_key: Option<String>,
     pub temperature: f32,
     pub timeout_secs: u64,
-    pub max_diff_chars: usize,
+    /// The model's context window in tokens. `None` asks the server.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context_length: Option<usize>,
     pub exclude: Vec<String>,
     pub system_prompt: String,
 }
@@ -63,11 +67,11 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             base_url: DEFAULT_BASE_URL.to_owned(),
-            model: DEFAULT_MODEL.to_owned(),
+            model: None,
             api_key: None,
             temperature: DEFAULT_TEMPERATURE,
             timeout_secs: DEFAULT_TIMEOUT_SECS,
-            max_diff_chars: DEFAULT_MAX_DIFF_CHARS,
+            context_length: None,
             exclude: DEFAULT_EXCLUDE.iter().map(|s| s.to_string()).collect(),
             system_prompt: DEFAULT_SYSTEM_PROMPT.to_owned(),
         }
@@ -120,7 +124,7 @@ impl Config {
             self.base_url = base_url.clone();
         }
         if let Some(model) = &args.model {
-            self.model = model.clone();
+            self.model = Some(model.clone());
         }
         if let Some(api_key) = &args.api_key {
             self.api_key = Some(api_key.clone());
@@ -128,12 +132,18 @@ impl Config {
         if let Some(temperature) = args.temperature {
             self.temperature = temperature;
         }
+        if let Some(context_length) = args.context_length {
+            self.context_length = Some(context_length);
+        }
+        self.model = self.model.take().filter(|model| !model.trim().is_empty());
         self.api_key = self.api_key.take().filter(|key| !key.trim().is_empty());
     }
 
     fn validate(&self) -> Result<()> {
-        if self.model.trim().is_empty() {
-            bail!("no model configured; set `model` in the config file or pass --model");
+        if let Some(tokens) = self.context_length
+            && tokens < MIN_CONTEXT_LENGTH
+        {
+            bail!("context_length must be at least {MIN_CONTEXT_LENGTH} tokens (got {tokens})");
         }
         if !(self.base_url.starts_with("http://") || self.base_url.starts_with("https://")) {
             bail!(
@@ -190,6 +200,14 @@ pub fn template(config: &Config) -> String {
     } else {
         format!("'''\n{}\n'''", config.system_prompt.trim())
     };
+    let model = match &config.model {
+        Some(model) => format!("model = {}", toml_string(model)),
+        None => "# model = \"qwen/qwen3-8b\"".to_owned(),
+    };
+    let context_length = match config.context_length {
+        Some(tokens) => format!("context_length = {tokens}"),
+        None => "# context_length = 32768".to_owned(),
+    };
     format!(
         r#"# git-agent configuration
 #
@@ -202,9 +220,10 @@ pub fn template(config: &Config) -> String {
 # Overridden by --base-url / GIT_AGENT_BASE_URL.
 base_url = {base_url}
 
-# Model ID as listed by `git-agent models`.
+# Model ID as listed by `git-agent models`. When it isn't set, git-agent uses
+# the model that is loaded on the server, or the only model the server has.
 # Overridden by --model / GIT_AGENT_MODEL.
-model = {model}
+{model}
 
 # API key sent as a Bearer token. Local servers usually don't need one.
 # Prefer the GIT_AGENT_API_KEY environment variable to storing it here.
@@ -217,10 +236,13 @@ temperature = {temperature}
 # Seconds to wait for the model to answer.
 timeout_secs = {timeout_secs}
 
-# Diffs longer than this many characters are cut off before being sent to the
-# model. The list of changed files is always sent in full. Lower this if your
-# model has a small context window.
-max_diff_chars = {max_diff_chars}
+# The model's context window in tokens. git-agent shortens large diffs to fit
+# it, leaving room for the reply. When it isn't set, git-agent asks the server
+# (LM Studio, Ollama, llama.cpp and vLLM report it) or assumes {fallback}
+# tokens. Set it if your server doesn't report it, or lower it to keep prompts
+# small and fast.
+# Overridden by --context-length / GIT_AGENT_CONTEXT_LENGTH.
+{context_length}
 
 # Files whose content is left out of the diff sent to the model. They still
 # appear in the list of changed files. Patterns without a "/" match the file
@@ -232,10 +254,9 @@ exclude = [
 system_prompt = {system_prompt}
 "#,
         base_url = toml_string(&config.base_url),
-        model = toml_string(&config.model),
         temperature = config.temperature,
         timeout_secs = config.timeout_secs,
-        max_diff_chars = config.max_diff_chars,
+        fallback = crate::models::FALLBACK_CONTEXT_LENGTH,
     )
 }
 
@@ -247,25 +268,33 @@ fn toml_string(value: &str) -> String {
 mod tests {
     use super::*;
 
+    fn round_trip(config: &Config) -> Config {
+        let mut parsed: Config = toml::from_str(&template(config)).unwrap();
+        parsed.system_prompt = parsed.system_prompt.trim().to_owned();
+        parsed
+    }
+
     #[test]
     fn template_round_trips() {
-        let mut config = Config {
-            model: "qwen/qwen3-8b".into(),
-            exclude: vec!["*.min.js".into(), "docs/generated/**".into()],
-            ..Config::default()
-        };
-        let mut parsed: Config = toml::from_str(&template(&config)).unwrap();
-        parsed.system_prompt = parsed.system_prompt.trim().to_owned();
+        let mut config = Config::default();
         config.system_prompt = config.system_prompt.trim().to_owned();
-        assert_eq!(parsed, config);
+        assert_eq!(round_trip(&config), config);
+
+        let config = Config {
+            model: Some("qwen/qwen3-8b".into()),
+            context_length: Some(32768),
+            exclude: vec!["*.min.js".into(), "docs/generated/**".into()],
+            ..config
+        };
+        assert_eq!(round_trip(&config), config);
     }
 
     #[test]
     fn missing_keys_fall_back_to_defaults() {
         let config: Config = toml::from_str("model = \"llama3\"").unwrap();
-        assert_eq!(config.model, "llama3");
+        assert_eq!(config.model.as_deref(), Some("llama3"));
         assert_eq!(config.base_url, DEFAULT_BASE_URL);
-        assert_eq!(config.max_diff_chars, DEFAULT_MAX_DIFF_CHARS);
+        assert_eq!(config.context_length, None);
     }
 
     #[test]
@@ -275,21 +304,33 @@ mod tests {
 
     #[test]
     fn flags_override_file_values() {
-        let mut config = Config::default();
+        let mut config = Config {
+            model: Some("from-file".into()),
+            ..Config::default()
+        };
         config.apply(&SettingArgs {
             model: Some("other".into()),
             temperature: Some(1.0),
+            context_length: Some(8192),
             api_key: Some("  ".into()),
             ..SettingArgs::default()
         });
-        assert_eq!(config.model, "other");
+        assert_eq!(config.model.as_deref(), Some("other"));
         assert_eq!(config.temperature, 1.0);
+        assert_eq!(config.context_length, Some(8192));
         assert_eq!(config.api_key, None);
         assert_eq!(config.base_url, DEFAULT_BASE_URL);
+
+        let mut blank = Config::default();
+        blank.apply(&SettingArgs {
+            model: Some(" ".into()),
+            ..SettingArgs::default()
+        });
+        assert_eq!(blank.model, None);
     }
 
     #[test]
-    fn validates_temperature_and_url() {
+    fn validates_settings() {
         let bad_temperature = Config {
             temperature: 3.0,
             ..Config::default()
@@ -300,6 +341,11 @@ mod tests {
             ..Config::default()
         };
         assert!(bad_url.validate().is_err());
+        let tiny_context = Config {
+            context_length: Some(512),
+            ..Config::default()
+        };
+        assert!(tiny_context.validate().is_err());
         assert!(Config::default().validate().is_ok());
     }
 }

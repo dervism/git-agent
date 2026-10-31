@@ -73,20 +73,9 @@ struct ChoiceMessage {
     content: Option<String>,
 }
 
-#[derive(Deserialize)]
-struct ModelList {
-    data: Vec<ModelEntry>,
-}
-
-#[derive(Deserialize)]
-struct ModelEntry {
-    id: String,
-}
-
 pub struct Client {
     http: reqwest::Client,
     base_url: String,
-    model: String,
     api_key: Option<String>,
     temperature: f32,
     timeout: Duration,
@@ -107,22 +96,29 @@ impl Client {
         Ok(Self {
             http,
             base_url: config.base_url.trim_end_matches('/').to_owned(),
-            model: config.model.clone(),
             api_key: config.api_key.clone(),
             temperature: config.temperature,
             timeout,
         })
     }
 
-    pub fn model(&self) -> &str {
-        &self.model
+    /// URL of an endpoint of the OpenAI-compatible API, e.g. `models`.
+    pub fn api_url(&self, path: &str) -> String {
+        format!("{}/{path}", self.base_url)
     }
 
-    /// Sends a conversation and returns the model's raw reply.
-    pub async fn complete(&self, messages: &[Message]) -> Result<String> {
-        let url = format!("{}/chat/completions", self.base_url);
+    /// URL of a server-specific endpoint next to the OpenAI-compatible API,
+    /// e.g. LM Studio's `api/v0/models`.
+    pub fn server_url(&self, path: &str) -> String {
+        let root = self.base_url.strip_suffix("/v1").unwrap_or(&self.base_url);
+        format!("{root}/{path}")
+    }
+
+    /// Sends a conversation to `model` and returns its raw reply.
+    pub async fn complete(&self, model: &str, messages: &[Message]) -> Result<String> {
+        let url = self.api_url("chat/completions");
         let body = ChatRequest {
-            model: &self.model,
+            model,
             messages,
             temperature: self.temperature,
             stream: false,
@@ -137,12 +133,10 @@ impl Client {
             .ok_or_else(|| anyhow!("the model returned no message"))
     }
 
-    /// IDs of the models the server offers.
-    pub async fn models(&self) -> Result<Vec<String>> {
-        let url = format!("{}/models", self.base_url);
-        let response = self.send(self.http.get(&url), &url).await?;
-        let list: ModelList = parse(response, &url).await?;
-        Ok(list.data.into_iter().map(|model| model.id).collect())
+    /// Fetches and decodes a JSON document.
+    pub async fn get<T: DeserializeOwned>(&self, url: &str) -> Result<T> {
+        let response = self.send(self.http.get(url), url).await?;
+        parse(response, url).await
     }
 
     async fn send(&self, request: RequestBuilder, url: &str) -> Result<Response> {
@@ -177,10 +171,23 @@ impl Client {
             .is_some_and(|value| value.starts_with("text/html"));
         let body = response.text().await.unwrap_or_default();
         match error_detail(&body, is_html) {
+            Some(detail) if mentions_context(&detail) => bail!(
+                "{url} returned {status}: {detail}\n\
+                 The prompt may be larger than the model's context. Set `context_length` \
+                 in the config file (or pass --context-length) to the context the model \
+                 is loaded with."
+            ),
             Some(detail) => bail!("{url} returned {status}: {detail}"),
             None => bail!("{url} returned {status}"),
         }
     }
+}
+
+/// Whether an error message is about the context window, as servers word it
+/// ("context length", "context size", "n_ctx", ...).
+fn mentions_context(detail: &str) -> bool {
+    let detail = detail.to_ascii_lowercase();
+    detail.contains("context") || detail.contains("n_ctx")
 }
 
 /// Decodes a successful response. Some servers (LM Studio, for one) also answer
@@ -254,6 +261,18 @@ mod tests {
             let detail = detail.unwrap();
             assert!(detail.contains("web page") && detail.contains("base_url"));
         }
+    }
+
+    #[test]
+    fn recognizes_context_errors() {
+        assert!(mentions_context(
+            "This model's maximum context length is 4096 tokens."
+        ));
+        assert!(mentions_context(
+            "request (5000 tokens) exceeds the available Context Size"
+        ));
+        assert!(mentions_context("n_ctx is too small"));
+        assert!(!mentions_context("model not found"));
     }
 
     #[test]

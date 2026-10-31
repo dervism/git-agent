@@ -1,7 +1,9 @@
 mod cli;
 mod config;
+mod fit;
 mod git;
 mod llm;
+mod models;
 mod prompt;
 mod ui;
 
@@ -9,11 +11,14 @@ use anyhow::{Context, Result, bail};
 use clap::Parser;
 use cli::{Cli, Command, ConfigCommand, GenerateArgs, SettingArgs};
 use config::Config;
+use fit::Kept;
 use git::{Repo, Scope};
+use models::{ContextSource, Model, Pick};
+use prompt::Fit;
 use std::fs;
 use std::io::{self, IsTerminal};
 use std::process::ExitCode;
-use ui::Action;
+use ui::{Action, thousands};
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> ExitCode {
@@ -66,13 +71,15 @@ async fn generate(args: &GenerateArgs, settings: &SettingArgs) -> Result<()> {
     }
 
     let client = llm::Client::new(&config)?;
-    let conversation = prompt::initial_messages(
+    let model = models::resolve(&client, &config).await?;
+    let (conversation, fit) = prompt::initial_messages(
         &config.system_prompt,
         &changes,
         args.hint.as_deref(),
-        config.max_diff_chars,
+        model.context_length,
     );
-    let mut message = generate_message(&client, &conversation).await?;
+    report_fit(&model, &fit);
+    let mut message = generate_message(&client, &model, &conversation).await?;
 
     if args.raw {
         println!("{message}");
@@ -110,10 +117,12 @@ async fn generate(args: &GenerateArgs, settings: &SettingArgs) -> Result<()> {
                 return Ok(());
             }
             Action::Edit => ui::edit_message(&repo, &message),
-            Action::Regenerate => generate_message(&client, &conversation).await.map(Some),
+            Action::Regenerate => generate_message(&client, &model, &conversation)
+                .await
+                .map(Some),
             Action::Refine(feedback) => {
                 let refined = prompt::refine_messages(&conversation, &message, &feedback);
-                generate_message(&client, &refined).await.map(Some)
+                generate_message(&client, &model, &refined).await.map(Some)
             }
         };
         // A failed edit or generation keeps the current message so the review can go on.
@@ -126,10 +135,112 @@ async fn generate(args: &GenerateArgs, settings: &SettingArgs) -> Result<()> {
     }
 }
 
-async fn generate_message(client: &llm::Client, conversation: &[llm::Message]) -> Result<String> {
+/// Says which model gets the changes and, if they didn't fit its context, what was left out.
+fn report_fit(model: &Model, fit: &Fit) {
+    let chosen = match model.picked {
+        Some(Pick::Loaded) => " (loaded on the server)",
+        Some(Pick::Only) => " (the server's only model)",
+        None => "",
+    };
+    ui::info(format!(
+        "🤖 {}{chosen} {}",
+        model.id,
+        ui::dim(&format!(
+            "· prompt about {} of {} context tokens",
+            thousands(fit.prompt_tokens),
+            thousands(model.context_length)
+        ))
+    ));
+    if model.context_source == ContextSource::Assumed {
+        ui::info(ui::dim(&format!(
+            "   The server didn't report the model's context length, so git-agent assumes {} \
+             tokens.\n   If the model has more, set `context_length` in the config file or pass \
+             --context-length.",
+            thousands(model.context_length)
+        )));
+    }
+    if fit.is_complete() {
+        if fit.context_trimmed {
+            ui::info(ui::dim(
+                "   To fit, git-agent left out the unchanged lines around the changes; \
+                 every changed line was sent.",
+            ));
+        }
+        return;
+    }
+
+    ui::warn(format!(
+        "the changes need about {} tokens, more than fit in the context, so git-agent sent \
+         part of them:",
+        thousands(fit.full_tokens)
+    ));
+    let whole = fit.files.iter().filter(|file| file.is_whole()).count();
+    let cut: Vec<String> = fit
+        .files
+        .iter()
+        .filter(|file| file.kept == Kept::Start)
+        .map(|file| {
+            format!(
+                "{} ({} of {} changed lines)",
+                file.path, file.kept_changed_lines, file.changed_lines
+            )
+        })
+        .collect();
+    let dropped: Vec<String> = fit
+        .files
+        .iter()
+        .filter(|file| file.is_dropped())
+        .map(|file| file.path.clone())
+        .collect();
+    ui::info(format!(
+        "   {whole} of {} files in full, without the unchanged lines around the changes",
+        fit.files.len()
+    ));
+    if !cut.is_empty() {
+        ui::info(format!("   {} cut short: {}", cut.len(), first_few(&cut)));
+    }
+    if !dropped.is_empty() {
+        ui::info(format!(
+            "   {} by name only: {}",
+            dropped.len(),
+            first_few(&dropped)
+        ));
+    }
+    if fit.list_lines_left_out > 0 {
+        ui::info(format!(
+            "   {} files left out of the file list too",
+            fit.list_lines_left_out
+        ));
+    }
+    let larger_context = match model.context_source {
+        ContextSource::Server => "load the model with a larger context length",
+        ContextSource::Config => "raise `context_length` if the model allows more",
+        ContextSource::Assumed => "set `context_length` if the model has more",
+    };
+    ui::info(ui::dim(&format!(
+        "   The message may miss details from these files. To send more, commit in smaller \
+         parts\n   (stage some files, then run git agent), or {larger_context}."
+    )));
+}
+
+/// The first three items, then how many more there are.
+fn first_few(items: &[String]) -> String {
+    const SHOWN: usize = 3;
+    let mut text = items[..items.len().min(SHOWN)].join(", ");
+    if items.len() > SHOWN {
+        text.push_str(&format!(", and {} more", items.len() - SHOWN));
+    }
+    text
+}
+
+async fn generate_message(
+    client: &llm::Client,
+    model: &Model,
+    conversation: &[llm::Message],
+) -> Result<String> {
     let reply = {
-        let _spinner = ui::Spinner::start(format!("Generating with {}", client.model()));
-        client.complete(conversation).await?
+        let _spinner = ui::Spinner::start(format!("Generating with {}", model.id));
+        client.complete(&model.id, conversation).await?
     };
     let message = prompt::clean_response(&reply);
     if message.is_empty() {
@@ -176,19 +287,46 @@ fn push(repo: &Repo, ask: bool) -> Result<()> {
 
 async fn list_models(settings: &SettingArgs) -> Result<()> {
     let config = Config::load(settings)?.config;
-    let models = llm::Client::new(&config)?.models().await?;
+    let models = models::list(&llm::Client::new(&config)?).await?;
+    let chosen = match &config.model {
+        Some(model) => Some(model.clone()),
+        None => models::choose(models.clone()).ok().map(|model| model.id),
+    };
+    let width = models.iter().map(|model| model.id.len()).max().unwrap_or(0);
     for model in &models {
-        let marker = if *model == config.model { "*" } else { " " };
-        println!("{marker} {model}");
+        let marker = if chosen.as_ref() == Some(&model.id) {
+            "*"
+        } else {
+            " "
+        };
+        let mut details = Vec::new();
+        if model.loaded == Some(true) {
+            details.push("loaded".to_owned());
+        }
+        if let Some(tokens) = model.context_length {
+            details.push(format!("{} tokens of context", thousands(tokens)));
+        }
+        if details.is_empty() {
+            println!("{marker} {}", model.id);
+        } else {
+            let details = ui::dim(&details.join(", "));
+            println!("{marker} {:width$}  {details}", model.id);
+        }
     }
-    if !models.contains(&config.model) {
-        ui::warn(format!(
-            "the configured model {:?} is not in this list",
-            config.model
-        ));
+
+    match (&config.model, chosen) {
+        (Some(model), _) if !models.iter().any(|listed| listed.id == *model) => ui::warn(format!(
+            "the configured model {model:?} is not in this list"
+        )),
+        (None, None) => ui::info(
+            "No model is set, and git-agent can't tell which one to use: \
+             none or several are loaded.",
+        ),
+        _ => {}
     }
     ui::info(ui::dim(
-        "Choose with --model, GIT_AGENT_MODEL, or `model` in the config file (git-agent config init).",
+        "* marks the model git-agent uses: the one set with --model, GIT_AGENT_MODEL or \
+         `model` in the config file,\n  or else the one loaded on the server.",
     ));
     Ok(())
 }
@@ -220,7 +358,16 @@ fn show_config(settings: &SettingArgs) -> Result<()> {
         (Some(path), false) => format!("# No file at {}; using defaults", path.display()),
         (None, _) => "# No config location found; using defaults".to_owned(),
     };
-    println!("{source}\n# Flags and GIT_AGENT_* environment variables are applied.\n");
-    print!("{}", toml::to_string_pretty(&loaded.config.redacted())?);
+    println!("{source}\n# Flags and GIT_AGENT_* environment variables are applied.");
+    if loaded.config.model.is_none() {
+        println!("# `model` is not set: git-agent uses the model loaded on the server.");
+    }
+    if loaded.config.context_length.is_none() {
+        println!(
+            "# `context_length` is not set: git-agent asks the server, or assumes {} tokens.",
+            models::FALLBACK_CONTEXT_LENGTH
+        );
+    }
+    print!("\n{}", toml::to_string_pretty(&loaded.config.redacted())?);
     Ok(())
 }

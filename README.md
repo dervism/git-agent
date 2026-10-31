@@ -95,6 +95,49 @@ If your commit conflicts with the remote commits, git-agent cancels the rebase a
 leaves your branch as it was. Run `git pull --rebase`, resolve the conflicts, and
 `git push`. git-agent never force-pushes.
 
+## Choosing a model
+
+You don't have to configure a model. git-agent asks the server which model is loaded
+and uses it. If several models are loaded, or none is and the server has more than
+one, git-agent asks you to choose with `--model` or `model` in the config file.
+`git agent models` lists the server's models and marks the one git-agent uses.
+
+git-agent also asks the server how large the model's context window is, so it knows
+how much of your changes it can send. LM Studio, Ollama, llama.cpp and vLLM report
+it. For other servers, and for models that aren't loaded yet, git-agent assumes
+4,096 tokens and says so. Set `context_length` to tell it the real size.
+
+## Large changes
+
+Before each run, git-agent prints the model it uses and how much of the context the
+prompt takes:
+
+```text
+🤖 google/gemma-4-e4b (loaded on the server) · prompt about 24,578 of 131,072 context tokens
+```
+
+The prompt always leaves room for the reply. When your changes don't fit,
+git-agent shortens them in steps and stops as soon as they fit:
+
+1. It leaves out the unchanged lines that git shows around each change.
+2. It shares the remaining room between the files. Files with small diffs are
+   sent whole, and the larger ones are cut short, so every file shows at least its
+   first changes.
+3. If there are too many files even for that, the largest ones are sent by name
+   only. The list of changed files always includes them.
+
+git-agent then tells you what it left out:
+
+```text
+warning: the changes need about 24,656 tokens, more than fit in the context, so git-agent sent part of them:
+   46 of 58 files in full, without the unchanged lines around the changes
+   12 cut short: src/builder/arg.rs (6 of 23 changed lines), src/builder/command.rs (6 of 93 changed lines), and 10 more
+```
+
+When that happens, the message may miss details from the shortened files. You get a
+better message by committing in smaller parts: stage some of the files, run
+`git agent`, and repeat. Loading the model with a larger context also helps.
+
 ## Configuration
 
 Settings come from these sources, and later ones override earlier ones:
@@ -113,11 +156,11 @@ git agent models            # list models on the server; * marks the configured 
 | Key | Flag | Environment variable | Default |
 | --- | --- | --- | --- |
 | `base_url` | `--base-url` | `GIT_AGENT_BASE_URL` | `http://localhost:1234/v1` |
-| `model` | `-m`, `--model` | `GIT_AGENT_MODEL` | `google/gemma-4-e4b` |
+| `model` | `-m`, `--model` | `GIT_AGENT_MODEL` | the model loaded on the server |
+| `context_length` | `--context-length` | `GIT_AGENT_CONTEXT_LENGTH` | reported by the server, or 4096 |
 | `api_key` | `--api-key` | `GIT_AGENT_API_KEY` | none |
 | `temperature` | `-t`, `--temperature` | | `0.4` |
 | `timeout_secs` | | | `300` |
-| `max_diff_chars` | | | `16000` |
 | `exclude` | | | common lockfiles |
 | `system_prompt` | | | Conventional Commits instructions |
 | (file location) | `--config` | `GIT_AGENT_CONFIG` | see above |
@@ -133,8 +176,9 @@ Notes:
 
 - Files matching `exclude` (by default `Cargo.lock`, `package-lock.json`, and similar)
   still appear in the list of changed files sent to the model, but their diffs don't.
-- Diffs longer than `max_diff_chars` are cut off. Lower it if your model has a small
-  context window.
+  Deleted files are sent by name, without their old content.
+- Large prompts take longer to process. To keep them smaller, set `context_length`
+  below the model's real context.
 - git-agent removes reasoning blocks (`<think>…</think>`) and code fences around the
   model's reply.
 - Set `NO_COLOR` to turn off colored output.

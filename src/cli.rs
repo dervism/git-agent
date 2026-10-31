@@ -55,9 +55,18 @@ pub struct SettingArgs {
     #[arg(long, global = true, env = "GIT_AGENT_CONFIG", value_name = "PATH")]
     pub config: Option<PathBuf>,
 
-    /// Model ID (see `git-agent models`)
+    /// Model ID (see `git-agent models`) [default: the model loaded on the server]
     #[arg(short, long, global = true, env = "GIT_AGENT_MODEL")]
     pub model: Option<String>,
+
+    /// The model's context window in tokens [default: as reported by the server]
+    #[arg(
+        long,
+        global = true,
+        env = "GIT_AGENT_CONTEXT_LENGTH",
+        value_name = "TOKENS"
+    )]
+    pub context_length: Option<usize>,
 
     /// Base URL of an OpenAI-compatible API, e.g. http://localhost:11434/v1
     #[arg(long, global = true, env = "GIT_AGENT_BASE_URL", value_name = "URL")]
@@ -122,5 +131,7 @@ mod tests {
         let cli = Cli::try_parse_from(["git-agent", "models", "--model", "qwen3"]).unwrap();
         assert!(matches!(cli.command, Some(Command::Models)));
         assert_eq!(cli.settings.model.as_deref(), Some("qwen3"));
+        let cli = Cli::try_parse_from(["git-agent", "--context-length", "8192"]).unwrap();
+        assert_eq!(cli.settings.context_length, Some(8192));
     }
 }

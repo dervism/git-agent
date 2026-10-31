@@ -100,7 +100,8 @@ impl Repo {
 
         let excludes = exclude_pathspecs(exclude);
         let mut diff_args = base;
-        diff_args.extend(["--", ":/"]);
+        // A deleted file's old content says little about the change; its name is enough.
+        diff_args.extend(["--irreversible-delete", "--", ":/"]);
         diff_args.extend(excludes.iter().map(String::as_str));
         let diff = self.git(&diff_args)?;
 
@@ -395,6 +396,16 @@ mod tests {
         assert!(changes.stat.contains("sub/Cargo.lock"));
         assert!(!changes.diff.contains("Cargo.lock"));
         assert!(changes.diff.contains("main.rs"));
+    }
+
+    #[test]
+    fn deleted_files_show_only_their_name() {
+        let (dir, repo) = setup();
+        fs::remove_file(dir.path().join("lib.rs")).unwrap();
+
+        let changes = repo.changes(&[]).unwrap().unwrap();
+        assert!(changes.diff.contains("deleted file"));
+        assert!(!changes.diff.contains("fn a()"));
     }
 
     #[test]

@@ -94,6 +94,10 @@ impl Client {
         let http = reqwest::Client::builder()
             .connect_timeout(CONNECT_TIMEOUT)
             .timeout(timeout)
+            // Requests are separated by the user reviewing the message, long enough for
+            // servers to close idle keep-alive connections. Reusing one fails with
+            // "connection closed before message completed", so open a new one each time.
+            .pool_max_idle_per_host(0)
             .build()
             .context("failed to create HTTP client")?;
         Ok(Self {

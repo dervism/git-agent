@@ -10,9 +10,7 @@ model what to change.
 I primarily made this agent to resemble a very useful feature in IntelliJ IDEA: generating
 git commit messages from uncommitted changes in a git repo with LLM's. IntelliJ IDEA uses 
 nearly 3-4GB of RAM when running, even when many plugins are disabled. As we code less manually, 
-lighter  code editors free up much needed memory for running local language models. This agent  
-makes it possible to get the same features from IDEA, while providing automation features for  
-your pipelines.
+lighter  code editors free up much needed memory for running local language models. This agent makes it possible to get the same features from IDEA, while providing automation features for your pipelines.
 
 ## Install
 

@@ -117,17 +117,50 @@ leaves your branch as it was. Run `git pull --rebase`, resolve the conflicts, th
 
 ## Choosing a model
 
-You don't have to configure a model. git-agent asks the server which model is loaded
-and uses that one. If several models are loaded, or none is and the server has more
-than one, git-agent asks you to pick one with `--model` or `model` in the config file.
-`git agent models` lists the server's models and marks the one git-agent uses.
+git-agent sends your changes to the model server at `base_url`. By default that is
+`http://localhost:1234/v1`, the address of LM Studio running on your own machine.
+For another local server, such as Ollama, or for a cloud provider, change `base_url`
+(see [Configuration](#configuration)).
+
+### Local servers
+
+With a local server, you don't have to configure a model. git-agent asks the server
+which model is loaded and uses that one. If several models are loaded, or none is and
+the server has more than one, git-agent asks you to pick one with `--model` or `model`
+in the config file. `git agent models` lists the server's models and marks the one
+git-agent uses.
+
+### Cloud providers
+
+Any provider with an OpenAI-compatible API works. Your diffs then leave your machine
+and go to that provider. Point `base_url` at the provider's endpoint and pass your API
+key in the `GIT_AGENT_API_KEY` environment variable, which keeps it out of the config
+file:
+
+```sh
+export GIT_AGENT_API_KEY="your-api-key"
+```
+
+Cloud providers offer many models and nothing is "loaded", so set `model` as well.
+Most providers also don't report a model's context window, so set `context_length`
+too. Without it, git-agent assumes 4,096 tokens and shortens large diffs much more
+than it needs to. In the config file:
+
+```toml
+base_url = "https://api.example.com/v1"   # the provider's OpenAI-compatible endpoint
+model = "model-id"                        # an ID from `git agent models`
+context_length = 128000                   # from the provider's model documentation
+```
+
+OpenRouter (`https://openrouter.ai/api/v1`) reports each model's context window, so
+you can leave out `context_length` there.
 
 ### Context window
 
 git-agent asks the server how large the model's context window is, so it knows how
-much of your changes it can send. LM Studio, Ollama, llama.cpp and vLLM report it.
-For other servers, and for models that aren't loaded yet, git-agent assumes 4,096
-tokens and tells you so. Set `context_length` to give it the real size.
+much of your changes it can send. LM Studio, Ollama, llama.cpp, vLLM and OpenRouter
+report it. For other servers, and for models that aren't loaded yet, git-agent
+assumes 4,096 tokens and tells you so. Set `context_length` to give it the real size.
 
 ## Large changes
 

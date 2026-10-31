@@ -14,13 +14,25 @@ use in pipelines or with lightweight code editors.
 
 ## Install
 
+git-agent is published on [crates.io](https://crates.io/crates/git-agent). With Rust
+1.88 or newer installed, run:
+
+```sh
+cargo install git-agent --locked
+```
+
+Cargo builds an optimized binary and copies it to `~/.cargo/bin/` (or
+`$CARGO_HOME/bin/`). `--locked` uses the exact dependency versions the release was
+tested with. Run the same command again to update to the latest release, and
+`cargo uninstall git-agent` to remove it.
+
+Because the binary is called `git-agent`, git also runs it as `git agent`.
+
+To install from a local checkout instead, for example to try unreleased changes:
+
 ```sh
 cargo install --path . --locked
 ```
-
-This builds an optimized binary in `target/release/` and copies it to `~/.cargo/bin/`
-(or `$CARGO_HOME/bin/`). Because the binary is called `git-agent`, git also runs it as
-`git agent`.
 
 ### If you installed Rust with Homebrew or a Linux package manager
 
@@ -139,6 +151,14 @@ cargo test
 ```
 
 The tests create temporary git repositories and don't need a running model server.
+
+## Releasing
+
+Maintainers release a new version with `scripts/release.sh <version>`. The script
+runs the checks, bumps the version in `Cargo.toml`, publishes the crate to crates.io,
+tags and pushes the release commit, and creates a GitHub release. Run it with
+`--dry-run` first to see each step without changing anything. It needs the `gh` CLI
+and a crates.io token from `cargo login`.
 
 ## License
 

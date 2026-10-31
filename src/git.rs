@@ -177,6 +177,53 @@ impl Repo {
         Ok(())
     }
 
+    /// Fetches the upstream and returns the commits on it that the current branch
+    /// lacks, as `<hash> <subject>` lines. Empty if the branch has no upstream.
+    pub fn incoming_commits(&self) -> Result<Vec<String>> {
+        if !self.has_upstream() {
+            return Ok(Vec::new());
+        }
+        // Uses the terminal so git can show errors and ask for credentials.
+        let status = self
+            .command(&["fetch", "--quiet"])
+            .status()
+            .context("failed to run git fetch")?;
+        if !status.success() {
+            bail!("`git fetch` failed ({status})");
+        }
+        let log = self.git(&["log", "--format=%h %s", "HEAD..@{upstream}"])?;
+        Ok(log.lines().map(str::to_owned).collect())
+    }
+
+    /// Replays local commits on top of the upstream, setting uncommitted changes
+    /// aside meanwhile. If that fails the rebase is aborted, leaving the branch as it was.
+    pub fn rebase_onto_upstream(&self) -> Result<()> {
+        let output = self
+            .command(&["rebase", "--autostash", "@{upstream}"])
+            .output()
+            .context("failed to run git rebase")?;
+        if output.status.success() {
+            return Ok(());
+        }
+        let _ = self.command(&["rebase", "--abort"]).output();
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let conflicts: Vec<&str> = stdout
+            .lines()
+            .chain(stderr.lines())
+            .filter(|line| line.starts_with("CONFLICT"))
+            .collect();
+        if conflicts.is_empty() {
+            bail!("`git rebase` failed: {}", stderr.trim());
+        }
+        bail!(
+            "your changes conflict with the new remote commits, so the rebase was cancelled:\n  {}\n\
+             Run `git pull --rebase`, resolve the conflicts, then `git push`",
+            conflicts.join("\n  ")
+        );
+    }
+
     fn has_upstream(&self) -> bool {
         self.git(&[
             "rev-parse",
@@ -228,27 +275,65 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
+    /// Runs git in `dir`, panicking on failure, and returns its stdout.
+    fn run(dir: &Path, args: &[&str]) -> String {
+        let output = Command::new("git")
+            .current_dir(dir)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).into_owned()
+    }
+
+    /// Keeps the user's global settings (signing, hooks) out of the tests.
+    fn isolate(dir: &Path) {
+        run(dir, &["config", "user.name", "Test"]);
+        run(dir, &["config", "user.email", "test@example.com"]);
+        run(dir, &["config", "commit.gpgsign", "false"]);
+        run(dir, &["config", "core.hooksPath", "no-hooks"]);
+    }
+
     fn setup() -> (TempDir, Repo) {
         let dir = TempDir::new().unwrap();
-        let run = |args: &[&str]| {
-            let status = Command::new("git")
-                .current_dir(dir.path())
-                .args(args)
-                .output()
-                .unwrap();
-            assert!(status.status.success(), "git {args:?} failed");
-        };
-        run(&["init", "-q"]);
-        // Keep the user's global settings (signing, hooks) out of the tests.
-        run(&["config", "user.name", "Test"]);
-        run(&["config", "user.email", "test@example.com"]);
-        run(&["config", "commit.gpgsign", "false"]);
-        run(&["config", "core.hooksPath", "no-hooks"]);
+        run(dir.path(), &["init", "-q", "--initial-branch", "main"]);
+        isolate(dir.path());
         fs::write(dir.path().join("lib.rs"), "fn a() {}\n").unwrap();
-        run(&["add", "lib.rs"]);
-        run(&["commit", "-q", "-m", "init"]);
+        run(dir.path(), &["add", "lib.rs"]);
+        run(dir.path(), &["commit", "-q", "-m", "init"]);
         let repo = Repo::open(dir.path()).unwrap();
         (dir, repo)
+    }
+
+    /// Adds a bare repository as `origin` and pushes to it, setting the upstream.
+    fn add_remote(repo: &Repo) -> TempDir {
+        let remote = TempDir::new().unwrap();
+        run(
+            remote.path(),
+            &["init", "--bare", "-q", "--initial-branch", "main"],
+        );
+        repo.git(&["remote", "add", "origin", remote.path().to_str().unwrap()])
+            .unwrap();
+        repo.push().unwrap();
+        remote
+    }
+
+    /// Pushes a commit to `remote` from another clone, like an edit made on GitHub.
+    fn commit_elsewhere(remote: &TempDir, file: &str, content: &str, subject: &str) {
+        let clone = TempDir::new().unwrap();
+        run(
+            clone.path(),
+            &["clone", "-q", remote.path().to_str().unwrap(), "."],
+        );
+        isolate(clone.path());
+        fs::write(clone.path().join(file), content).unwrap();
+        run(clone.path(), &["add", "--all"]);
+        run(clone.path(), &["commit", "-q", "-m", subject]);
+        run(clone.path(), &["push", "-q"]);
     }
 
     fn log(repo: &Repo) -> String {
@@ -315,39 +400,66 @@ mod tests {
     #[test]
     fn push_sets_upstream_then_reuses_it() {
         let (dir, repo) = setup();
-        let remote = TempDir::new().unwrap();
-        let init = Command::new("git")
-            .args(["init", "--bare", "-q"])
-            .arg(remote.path())
-            .status()
-            .unwrap();
-        assert!(init.success());
-        repo.git(&["remote", "add", "origin", remote.path().to_str().unwrap()])
-            .unwrap();
-
-        repo.push().unwrap();
+        let remote = add_remote(&repo);
         assert!(repo.has_upstream());
 
         fs::write(dir.path().join("lib.rs"), "fn b() {}\n").unwrap();
         repo.commit("feat: second", Scope::Tracked, &[]).unwrap();
+        assert!(repo.incoming_commits().unwrap().is_empty());
         repo.push().unwrap();
-        let pushed = Command::new("git")
-            .arg("-C")
-            .arg(remote.path())
-            .args(["log", "--format=%s", "-1"])
-            .output()
-            .unwrap();
-        assert_eq!(
-            String::from_utf8_lossy(&pushed.stdout).trim(),
-            "feat: second"
-        );
+        let pushed = run(remote.path(), &["log", "--format=%s", "-1", "main"]);
+        assert_eq!(pushed.trim(), "feat: second");
     }
 
     #[test]
     fn push_without_remote_explains_how_to_add_one() {
         let (_dir, repo) = setup();
+        assert!(repo.incoming_commits().unwrap().is_empty());
         let err = repo.push().unwrap_err();
         assert!(err.to_string().contains("gh repo create"));
+    }
+
+    #[test]
+    fn rebases_onto_remote_commits_keeping_uncommitted_changes() {
+        let (dir, repo) = setup();
+        let remote = add_remote(&repo);
+        commit_elsewhere(&remote, "LICENSE", "MIT\n", "docs: add license");
+
+        fs::write(dir.path().join("lib.rs"), "fn b() {}\n").unwrap();
+        repo.commit("feat: local", Scope::Tracked, &[]).unwrap();
+        fs::write(dir.path().join("lib.rs"), "fn uncommitted() {}\n").unwrap();
+
+        let incoming = repo.incoming_commits().unwrap();
+        assert_eq!(incoming.len(), 1);
+        assert!(incoming[0].ends_with(" docs: add license"));
+        repo.rebase_onto_upstream().unwrap();
+        repo.push().unwrap();
+
+        let history = run(remote.path(), &["log", "--format=%s", "main"]);
+        assert_eq!(history, "feat: local\ndocs: add license\ninit\n");
+        let lib = fs::read_to_string(dir.path().join("lib.rs")).unwrap();
+        assert_eq!(lib, "fn uncommitted() {}\n");
+    }
+
+    #[test]
+    fn conflicting_rebase_is_cancelled() {
+        let (dir, repo) = setup();
+        let remote = add_remote(&repo);
+        commit_elsewhere(&remote, "lib.rs", "fn remote() {}\n", "fix: remote");
+
+        fs::write(dir.path().join("lib.rs"), "fn local() {}\n").unwrap();
+        repo.commit("fix: local", Scope::Tracked, &[]).unwrap();
+        let before = repo.git(&["rev-parse", "HEAD"]).unwrap();
+
+        assert_eq!(repo.incoming_commits().unwrap().len(), 1);
+        let err = repo.rebase_onto_upstream().unwrap_err();
+        assert!(
+            err.to_string().contains("Merge conflict in lib.rs"),
+            "{err}"
+        );
+        assert_eq!(repo.git(&["rev-parse", "HEAD"]).unwrap(), before);
+        assert!(!repo.git_path("rebase-merge").unwrap().exists());
+        assert!(repo.changes(&[]).unwrap().is_none());
     }
 
     #[test]

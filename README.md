@@ -67,6 +67,15 @@ and sets the upstream. If the repository has no remote yet, create one on GitHub
 `gh repo create --source . --push`. If the push fails, the commit is kept; fix the
 problem and run `git push`.
 
+Before pushing, git-agent fetches from the remote. If the remote has commits you don't
+have (for example, a file you edited on GitHub), it lists them and rebases your
+commit on top of them, so the history stays linear and nothing on the remote is
+lost. In the review menu it asks first; with `--commit --push` it does this
+automatically. Uncommitted changes are set aside during the rebase and restored
+afterwards. If your commit conflicts with the remote commits, the rebase is cancelled
+and your branch is left as it was; run `git pull --rebase`, resolve the conflicts,
+and `git push`. git-agent never force-pushes.
+
 ## Configuration
 
 Settings are resolved in this order, later ones winning:

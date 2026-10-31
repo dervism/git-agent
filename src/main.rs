@@ -80,7 +80,12 @@ async fn generate(args: &GenerateArgs, settings: &SettingArgs) -> Result<()> {
     }
     ui::show_message(&message);
     if args.commit {
-        return commit(&repo, &message, changes.scope, &args.git_args, args.push);
+        commit(&repo, &message, changes.scope, &args.git_args)?;
+        return if args.push {
+            push(&repo, false)
+        } else {
+            Ok(())
+        };
     }
     if !io::stdin().is_terminal() {
         ui::info(ui::dim(
@@ -92,9 +97,13 @@ async fn generate(args: &GenerateArgs, settings: &SettingArgs) -> Result<()> {
 
     loop {
         let revised = match ui::ask_action()? {
-            Action::Commit { push } => {
-                let push = push || args.push;
-                return commit(&repo, &message, changes.scope, &args.git_args, push);
+            Action::Commit { push: and_push } => {
+                commit(&repo, &message, changes.scope, &args.git_args)?;
+                return if and_push || args.push {
+                    push(&repo, true)
+                } else {
+                    Ok(())
+                };
             }
             Action::Quit => {
                 ui::info("Nothing committed.");
@@ -129,14 +138,39 @@ async fn generate_message(client: &llm::Client, conversation: &[llm::Message]) -
     Ok(message)
 }
 
-fn commit(repo: &Repo, message: &str, scope: Scope, git_args: &[String], push: bool) -> Result<()> {
+fn commit(repo: &Repo, message: &str, scope: Scope, git_args: &[String]) -> Result<()> {
     repo.commit(message, scope, git_args)?;
     ui::info(ui::green("✅ Committed."));
-    if push {
-        repo.push()
-            .context("the commit was made, but pushing it failed")?;
-        ui::info(ui::green("✅ Pushed."));
+    Ok(())
+}
+
+/// Pushes, first rebasing onto commits that reached the remote from elsewhere
+/// (e.g. edits made on GitHub). With `ask`, the user confirms the rebase.
+fn push(repo: &Repo, ask: bool) -> Result<()> {
+    const NOT_PUSHED: &str = "the commit was made, but not pushed";
+    const SHOWN: usize = 5;
+
+    let incoming = repo.incoming_commits().context(NOT_PUSHED)?;
+    if !incoming.is_empty() {
+        ui::info(format!(
+            "The remote has {} commit(s) you don't have yet:",
+            incoming.len()
+        ));
+        for commit in incoming.iter().take(SHOWN) {
+            ui::info(format!("   {commit}"));
+        }
+        if incoming.len() > SHOWN {
+            ui::info(format!("   … and {} more", incoming.len() - SHOWN));
+        }
+        if ask && !ui::confirm("Rebase your commit on top of them and push?")? {
+            ui::info("Not pushed. When you're ready, run `git pull --rebase` and `git push`.");
+            return Ok(());
+        }
+        repo.rebase_onto_upstream().context(NOT_PUSHED)?;
+        ui::info("🔀 Rebased onto the remote commits.");
     }
+    repo.push().context(NOT_PUSHED)?;
+    ui::info(ui::green("✅ Pushed."));
     Ok(())
 }
 

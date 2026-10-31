@@ -188,6 +188,20 @@ fn read_line(prompt: &str) -> Result<Option<String>> {
     Ok(Some(line.trim().to_owned()))
 }
 
+/// Asks a yes/no question. Enter means yes; end of input means no.
+pub fn confirm(question: &str) -> Result<bool> {
+    loop {
+        let Some(answer) = read_line(&format!("{question} {}", dim("[Y/n] ›")))? else {
+            return Ok(false);
+        };
+        match answer.to_lowercase().as_str() {
+            "" | "y" | "yes" => return Ok(true),
+            "n" | "no" => return Ok(false),
+            _ => eprintln!("Please answer y or n."),
+        }
+    }
+}
+
 /// Lets the user edit `message` in their editor. Returns `None` if they emptied it.
 pub fn edit_message(repo: &Repo, message: &str) -> Result<Option<String>> {
     // COMMIT_EDITMSG is git's own scratch file, so editors apply commit message highlighting.

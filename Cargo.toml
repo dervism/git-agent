@@ -3,6 +3,8 @@ name = "git-agent"
 version = "0.2.0"
 edition = "2024"
 description = "Generate git commit messages from your changes with a local LLM"
+license = "MIT"
+repository = "https://github.com/dervism/git-agent"
 
 [dependencies]
 anyhow = "1"

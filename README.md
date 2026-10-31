@@ -99,3 +99,25 @@ Notes:
   context window.
 - Reasoning blocks (`<think>…</think>`) and code fences around the reply are removed.
 - Set `NO_COLOR` to turn off colored output.
+
+## Contributing
+
+Contributions are welcome! Feel free to open an
+[issue](https://github.com/dervism/git-agent/issues) for bugs and feature ideas, or
+send a pull request. For larger changes, opening an issue first to discuss the
+approach is appreciated.
+
+Before submitting a pull request, please make sure these pass:
+
+```sh
+cargo fmt --check
+cargo clippy --all-targets
+cargo test
+```
+
+The tests create temporary git repositories and don't need a running model server.
+
+## License
+
+git-agent is licensed under the [MIT License](LICENSE). By contributing, you agree
+that your contributions are licensed under the same terms.

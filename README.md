@@ -1,5 +1,7 @@
 # git-agent
 
+[![crates.io](https://img.shields.io/crates/v/git-agent.svg)](https://crates.io/crates/git-agent)
+
 git-agent writes git commit messages for your changes using a local LLM served through
 an OpenAI-compatible API (LM Studio, Ollama, llama.cpp, vLLM, or a hosted provider).
 You review each proposed message, then commit it, edit it, regenerate it, or tell the

@@ -36,6 +36,8 @@ git agent                  # describe staged changes, then review
 git agent --all            # stage everything (including untracked files) first
 git agent -H "fixes #42"   # give the model extra context
 git agent --commit         # commit right away, no review
+git agent --push           # review, then push after committing
+git agent --commit --push  # commit and push, no review
 git agent --raw            # print just the message, e.g. for `| git commit -F -`
 git agent -- --signoff     # pass extra arguments to `git commit`
 ```
@@ -49,6 +51,7 @@ After a message is generated you choose what to do with it:
 | Key | Action |
 | --- | --- |
 | `c` | Commit with this message |
+| `p` | Commit with this message, then push |
 | `e` | Open it in your git editor (`GIT_EDITOR`, `core.editor`, `VISUAL`, `EDITOR`) |
 | `r` | Generate a new message |
 | `f` | Tell the model what to change, e.g. `f shorter, and mention the CLI flags` |
@@ -56,6 +59,13 @@ After a message is generated you choose what to do with it:
 
 If `git commit` fails (for example, because a hook rejects it), the message is saved
 to `.git/GIT_AGENT_MSG` so you can reuse it with `git commit --file .git/GIT_AGENT_MSG`.
+
+Pushing runs a plain `git push`, so it works with GitHub or any other remote and uses
+your existing git credentials. The first time you push a branch that has no
+upstream, git-agent pushes it to `origin` (or your only remote, or `remote.pushDefault`)
+and sets the upstream. If the repository has no remote yet, create one on GitHub with
+`gh repo create --source . --push`. If the push fails, the commit is kept; fix the
+problem and run `git push`.
 
 ## Configuration
 

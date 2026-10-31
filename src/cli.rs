@@ -27,6 +27,10 @@ pub struct GenerateArgs {
     #[arg(short, long, conflicts_with = "raw")]
     pub commit: bool,
 
+    /// Push after committing; a branch's first push also sets its upstream
+    #[arg(short, long, conflicts_with = "raw")]
+    pub push: bool,
+
     /// Print only the message to stdout and exit (for scripts and pipes)
     #[arg(short, long)]
     pub raw: bool,
@@ -104,6 +108,13 @@ mod tests {
         let cli = Cli::try_parse_from(["git-agent", "-c", "--", "--no-verify", "-s"]).unwrap();
         assert!(cli.generate.commit);
         assert_eq!(cli.generate.git_args, ["--no-verify", "-s"]);
+    }
+
+    #[test]
+    fn push_combines_with_commit_but_not_raw() {
+        let cli = Cli::try_parse_from(["git-agent", "-cp"]).unwrap();
+        assert!(cli.generate.commit && cli.generate.push);
+        assert!(Cli::try_parse_from(["git-agent", "--push", "--raw"]).is_err());
     }
 
     #[test]

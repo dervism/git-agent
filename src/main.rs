@@ -80,18 +80,22 @@ async fn generate(args: &GenerateArgs, settings: &SettingArgs) -> Result<()> {
     }
     ui::show_message(&message);
     if args.commit {
-        return commit(&repo, &message, changes.scope, &args.git_args);
+        return commit(&repo, &message, changes.scope, &args.git_args, args.push);
     }
     if !io::stdin().is_terminal() {
         ui::info(ui::dim(
-            "Input is not a terminal, so not asking for review. Use --commit to commit directly.",
+            "Input is not a terminal, so not asking for review. \
+             Use --commit to commit directly (add --push to also push).",
         ));
         return Ok(());
     }
 
     loop {
         let revised = match ui::ask_action()? {
-            Action::Commit => return commit(&repo, &message, changes.scope, &args.git_args),
+            Action::Commit { push } => {
+                let push = push || args.push;
+                return commit(&repo, &message, changes.scope, &args.git_args, push);
+            }
             Action::Quit => {
                 ui::info("Nothing committed.");
                 return Ok(());
@@ -125,9 +129,14 @@ async fn generate_message(client: &llm::Client, conversation: &[llm::Message]) -
     Ok(message)
 }
 
-fn commit(repo: &Repo, message: &str, scope: Scope, git_args: &[String]) -> Result<()> {
+fn commit(repo: &Repo, message: &str, scope: Scope, git_args: &[String], push: bool) -> Result<()> {
     repo.commit(message, scope, git_args)?;
     ui::info(ui::green("✅ Committed."));
+    if push {
+        repo.push()
+            .context("the commit was made, but pushing it failed")?;
+        ui::info(ui::green("✅ Pushed."));
+    }
     Ok(())
 }
 

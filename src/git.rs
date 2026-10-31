@@ -161,6 +161,52 @@ impl Repo {
         let _ = fs::remove_file(&path);
         Ok(())
     }
+
+    /// Pushes the current branch. A branch without an upstream is pushed to the
+    /// default remote and its upstream is set, like `git push --set-upstream`.
+    pub fn push(&self) -> Result<()> {
+        let mut command = self.command(&["push"]);
+        if !self.has_upstream() {
+            let remote = self.push_remote()?;
+            command.args(["--set-upstream", remote.as_str(), "HEAD"]);
+        }
+        let status = command.status().context("failed to run git push")?;
+        if !status.success() {
+            bail!("`git push` failed ({status})");
+        }
+        Ok(())
+    }
+
+    fn has_upstream(&self) -> bool {
+        self.git(&[
+            "rev-parse",
+            "--abbrev-ref",
+            "--symbolic-full-name",
+            "@{upstream}",
+        ])
+        .is_ok()
+    }
+
+    /// `remote.pushDefault` if set, else the only remote, else `origin`.
+    fn push_remote(&self) -> Result<String> {
+        if let Ok(remote) = self.git(&["config", "remote.pushDefault"]) {
+            return Ok(remote.trim().to_owned());
+        }
+        let remotes = self.git(&["remote"])?;
+        let remotes: Vec<&str> = remotes.lines().collect();
+        match remotes.as_slice() {
+            [] => bail!(
+                "there is no remote to push to; add one with `git remote add origin <url>`, \
+                 or create a GitHub repository with `gh repo create --source . --push`"
+            ),
+            [remote] => Ok(remote.to_string()),
+            _ if remotes.contains(&"origin") => Ok("origin".to_owned()),
+            _ => bail!(
+                "the branch has no upstream and there are several remotes; \
+                 push it once with `git push --set-upstream <remote> HEAD`"
+            ),
+        }
+    }
 }
 
 /// Pathspecs that leave `patterns` out of a diff, matched from the repository root.
@@ -264,6 +310,44 @@ mod tests {
         assert!(changes.stat.contains("sub/Cargo.lock"));
         assert!(!changes.diff.contains("Cargo.lock"));
         assert!(changes.diff.contains("main.rs"));
+    }
+
+    #[test]
+    fn push_sets_upstream_then_reuses_it() {
+        let (dir, repo) = setup();
+        let remote = TempDir::new().unwrap();
+        let init = Command::new("git")
+            .args(["init", "--bare", "-q"])
+            .arg(remote.path())
+            .status()
+            .unwrap();
+        assert!(init.success());
+        repo.git(&["remote", "add", "origin", remote.path().to_str().unwrap()])
+            .unwrap();
+
+        repo.push().unwrap();
+        assert!(repo.has_upstream());
+
+        fs::write(dir.path().join("lib.rs"), "fn b() {}\n").unwrap();
+        repo.commit("feat: second", Scope::Tracked, &[]).unwrap();
+        repo.push().unwrap();
+        let pushed = Command::new("git")
+            .arg("-C")
+            .arg(remote.path())
+            .args(["log", "--format=%s", "-1"])
+            .output()
+            .unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&pushed.stdout).trim(),
+            "feat: second"
+        );
+    }
+
+    #[test]
+    fn push_without_remote_explains_how_to_add_one() {
+        let (_dir, repo) = setup();
+        let err = repo.push().unwrap_err();
+        assert!(err.to_string().contains("gh repo create"));
     }
 
     #[test]

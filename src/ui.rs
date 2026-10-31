@@ -21,6 +21,7 @@ const EDIT_HELP: &str = "\
 
 const ACTION_HELP: &str = "\
   c  commit with this message
+  p  commit with this message, then push
   e  edit the message in your editor
   r  generate a new message
   f  tell the model what to change, e.g. `f mention the API change`
@@ -125,7 +126,7 @@ impl Drop for Spinner {
 }
 
 pub enum Action {
-    Commit,
+    Commit { push: bool },
     Edit,
     Regenerate,
     Refine(String),
@@ -136,8 +137,9 @@ pub enum Action {
 pub fn ask_action() -> Result<Action> {
     loop {
         let menu = format!(
-            "{}ommit  {}dit  {}egenerate  {}eedback  {}uit  {} ›",
+            "{}ommit  {}ush  {}dit  {}egenerate  {}eedback  {}uit  {} ›",
             bold("[c]"),
+            bold("[p]"),
             bold("[e]"),
             bold("[r]"),
             bold("[f]"),
@@ -149,7 +151,8 @@ pub fn ask_action() -> Result<Action> {
         };
         let (choice, rest) = input.split_once(' ').unwrap_or((&input, ""));
         match choice.to_lowercase().as_str() {
-            "c" | "commit" | "y" | "yes" => return Ok(Action::Commit),
+            "c" | "commit" | "y" | "yes" => return Ok(Action::Commit { push: false }),
+            "p" | "push" => return Ok(Action::Commit { push: true }),
             "e" | "edit" => return Ok(Action::Edit),
             "r" | "regenerate" => return Ok(Action::Regenerate),
             "f" | "feedback" => {

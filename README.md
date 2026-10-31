@@ -8,7 +8,20 @@ model what to change.
 ## Install
 
 ```sh
-cargo install --path .
+cargo install --path . --locked
+```
+
+This builds an optimized binary in `target/release/` and copies it to `~/.cargo/bin/`
+(or `$CARGO_HOME/bin/`). `--locked` builds with the exact dependency versions in
+`Cargo.lock`; without it, Cargo picks the newest compatible versions. Run the same
+command again to update after pulling changes, and `cargo uninstall git-agent` to
+remove it.
+
+`~/.cargo/bin` must be on your `PATH`. rustup sets this up for you, but if Rust came
+from Homebrew or a Linux package manager, add it yourself, e.g. in `~/.zshrc`:
+
+```sh
+export PATH="$HOME/.cargo/bin:$PATH"
 ```
 
 Because the binary is called `git-agent`, git also runs it as `git agent`.

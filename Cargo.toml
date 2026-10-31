@@ -2,18 +2,21 @@
 name = "git-agent"
 version = "0.2.0"
 edition = "2024"
+rust-version = "1.88"
 description = "Generate git commit messages from your changes with a local LLM"
 license = "MIT"
 repository = "https://github.com/dervism/git-agent"
+keywords = ["git", "commit", "llm", "cli", "ai"]
+categories = ["command-line-utilities", "development-tools"]
 
 [dependencies]
 anyhow = "1"
 clap = { version = "4.5", features = ["derive", "env"] }
-reqwest = { version = "0.11", features = ["json"] }
+reqwest = { version = "0.13", features = ["json"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 tokio = { version = "1", features = ["macros", "rt", "time"] }
-toml = "0.9"
+toml = "1"
 
 [dev-dependencies]
 tempfile = "3"

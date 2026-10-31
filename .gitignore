@@ -1,1 +1,24 @@
+# Build output
 /target
+**/*.rs.bk
+*.pdb
+
+# Temporary files (older git-agent versions wrote .git_commit_msg.tmp)
+*.tmp
+*.orig
+
+# Local environment and secrets
+.env
+.env.*
+
+# Editors and IDEs
+.idea/
+.vscode/
+*.iml
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db

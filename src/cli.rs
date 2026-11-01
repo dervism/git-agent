@@ -129,8 +129,34 @@ pub struct PrArgs {
     pub gh_args: Vec<String>,
 }
 
+/// Options for `git agent split`.
+#[derive(Args, Debug)]
+pub struct SplitArgs {
+    /// Stage all changes, including untracked files, before splitting them
+    #[arg(short, long)]
+    pub all: bool,
+
+    /// Make the planned commits without reviewing the plan or the messages
+    #[arg(short, long)]
+    pub commit: bool,
+
+    /// Push after the last commit
+    #[arg(short, long)]
+    pub push: bool,
+
+    /// Extra context for the model, e.g. what the changes are for
+    #[arg(short = 'H', long, value_name = "TEXT")]
+    pub hint: Option<String>,
+
+    /// Extra arguments for each `git commit`, e.g. `-- --signoff`
+    #[arg(last = true, value_name = "GIT_COMMIT_ARGS")]
+    pub git_args: Vec<String>,
+}
+
 #[derive(Subcommand, Debug)]
 pub enum Command {
+    /// Split the changes into several commits, grouped by the model
+    Split(SplitArgs),
     /// Write a pull request for the current branch, then create it on GitHub with gh
     Pr(PrArgs),
     /// List the models available on the configured server
@@ -218,6 +244,17 @@ mod tests {
         assert!(Cli::try_parse_from(["git-agent", "pr", "--raw", "--create"]).is_err());
         // The commit options belong to plain `git agent`.
         assert!(Cli::try_parse_from(["git-agent", "--all", "pr"]).is_err());
+    }
+
+    #[test]
+    fn split_takes_its_own_options() {
+        let cli =
+            Cli::try_parse_from(["git-agent", "split", "-a", "-c", "--", "--signoff"]).unwrap();
+        let Some(Command::Split(args)) = cli.command else {
+            panic!("expected the split command");
+        };
+        assert!(args.all && args.commit && !args.push);
+        assert_eq!(args.git_args, ["--signoff"]);
     }
 
     #[test]

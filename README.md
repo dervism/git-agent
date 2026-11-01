@@ -74,6 +74,7 @@ git agent --push           # review, then push after committing
 git agent --commit --push  # commit and push, no review
 git agent --raw            # print just the message, e.g. for `| git commit -F -`
 git agent -- --signoff     # pass extra arguments to `git commit`
+git agent split            # split the changes into several commits
 git agent pr               # write a pull request for the branch, then create it
 ```
 
@@ -101,6 +102,62 @@ git-agent shows the proposed message and waits for one of these keys:
 When `git commit` fails, for example because a hook rejects it, git-agent saves the
 message to `.git/GIT_AGENT_MSG`. You can reuse it with
 `git commit --file .git/GIT_AGENT_MSG`.
+
+## Splitting a change into commits
+
+When your changes do several things at once, `git agent split` turns them into
+several commits. The model groups the changes by what they are for, and you review
+its plan and then each commit's message.
+
+```sh
+git agent split                # plan the commits, then review each one
+git agent split --all          # stage everything, including untracked files, first
+git agent split -H "why"       # give the model extra context
+git agent split --commit       # make the commits without any review
+git agent split --push         # push after the last commit
+git agent split -- --signoff   # pass extra arguments to each `git commit`
+```
+
+### How git-agent plans the commits
+
+git-agent splits the changes a commit would include: the staged ones, or all changes
+to tracked files if nothing is staged. It cuts them into parts. A part is one hunk of
+a changed file, or a whole file when the file is new, deleted, renamed or binary, or
+excluded like a lockfile. The model sees the numbered parts and groups them into
+commits, ordered so that each builds on those before it. If it leaves a part out,
+git-agent adds that part to the commit with the rest of its file, or to a last commit,
+so nothing goes missing. When the hunks are too many to show the model one by one, it
+groups whole files instead.
+
+### Reviewing the plan
+
+```text
+── Proposed commits ────────────────────────────────────────────
+1. Introduce LRU caching for configuration loading
+   Cargo.lock, Cargo.toml, README.md, src/cache.rs (new file), src/config.rs (1 of 3 changes)
+2. Refine config parsing logic and documentation
+   src/config.rs (2 of 3 changes)
+────────────────────────────────────────────────────────────────
+[a]ccept  [e]dit  [r]egenerate  [f]eedback  [q]uit  [?] ›
+```
+
+`a` accepts the plan. `e` opens it in your git editor, where each part has a numbered
+line under its commit; move a line to move the part to another commit. `r` asks for a
+new plan, and `f` tells the model what to change, such as
+`f put the feature and its documentation in one commit`.
+
+### Making the commits
+
+git-agent then makes the commits in order. For each one it writes the message from
+that commit's own changes, and you review it like any other message, with two
+differences: `c` commits, and `s` skips the commit and leaves its changes as they
+were. `q` stops; the commits made so far stay. Changes that aren't committed stay
+where they were, staged or not, so skipping or stopping loses nothing.
+
+git-agent doesn't build or test the commits in between, so a commit may not compile
+on its own if the plan separates code that belongs together. Secrets are checked as
+for any commit, and git-agent won't split changes while a merge or rebase is in
+progress.
 
 ## Pushing
 
@@ -304,8 +361,9 @@ warning: the changes need about 24,656 tokens, more than fit in the context, so 
    12 cut short: src/builder/arg.rs (6 of 23 changed lines), src/builder/command.rs (6 of 93 changed lines), and 10 more
 ```
 
-The message may then miss details from the shortened files. For a better message,
-commit in smaller parts: stage some of the files, run `git agent`, and repeat.
+The message may then miss details from the shortened files. For better messages,
+commit in smaller parts: [`git agent split`](#splitting-a-change-into-commits) does
+that for you, or you can stage some of the files, run `git agent`, and repeat.
 Loading the model with a larger context also helps.
 
 ## Configuration

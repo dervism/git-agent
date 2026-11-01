@@ -7,13 +7,15 @@ git-agent already has: model servers, diff shortening and the review menu.
 
 ## Features inspired by IntelliJ
 
-### `git agent split`
+### `git agent split` (DONE)
 
 Splits one large change into several logical commits. The model groups the changed
 files or hunks by purpose and proposes a set of commits, and each commit message goes
 through the same review as a single commit does today. IntelliJ users do this by hand
 with changelists. It is also what git-agent already recommends when a diff doesn't
-fit: commit in smaller parts.
+fit: commit in smaller parts. The plan can be edited, regenerated or revised with
+feedback before any commit is made, and each commit is built in a temporary index,
+so stopping halfway leaves the rest of the changes as they were.
 
 ### `git agent review`
 
@@ -91,21 +93,22 @@ add a secret to the repository, and the `on_secrets` setting can make it only wa
 This matters more with each new feature that sends more data, such as pull request
 descriptions, reviews or a branch's history.
 
-### A `prepare-commit-msg` hook
+### A `prepare-commit-msg` hook (PARKED)
 
 `git agent hook install` installs a hook that fills in the message for commits made
 from any editor or git GUI. That covers the lightweight code editors git-agent is
-meant to work with, without opening a terminal.
+meant to work with, without opening a terminal. Not a priority for now.
 
 ## Where to start
 
 1. `git agent pr` is small and useful, and it reuses nearly everything git-agent
    already has. (DONE)
 2. The commit hook is also small, and it makes the main feature work in every editor.
+   (PARKED)
 3. `git agent split` is the biggest IDE-style feature, and it handles large changes
    better than shortening the diff. It is also harder: staging individual hunks with
    `git apply --cached` is fiddly, and local models must group hunks reliably. It
-   needs a short design first.
+   needs a short design first. (DONE)
 
 The secret check had to come before any feature that sends more data to cloud
 providers. (DONE)

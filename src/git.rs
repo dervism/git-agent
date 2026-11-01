@@ -1,9 +1,11 @@
 //! Wrapper around the `git` command line.
 
 use anyhow::{Context, Result, anyhow, bail};
+use std::collections::HashSet;
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 /// Which changes the message describes, and therefore what gets committed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -41,12 +43,15 @@ pub struct CommitPatch {
 pub struct Repo {
     /// Directory git commands run in.
     workdir: PathBuf,
+    /// An index file to use instead of the repository's own.
+    index: Option<PathBuf>,
 }
 
 impl Repo {
     pub fn open(workdir: impl Into<PathBuf>) -> Result<Self> {
         let repo = Self {
             workdir: workdir.into(),
+            index: None,
         };
         let inside = repo.git(&["rev-parse", "--is-inside-work-tree"]);
         if !inside.is_ok_and(|out| out.trim() == "true") {
@@ -55,9 +60,21 @@ impl Repo {
         Ok(repo)
     }
 
+    /// The same repository with the index file at `index`, so commits can be
+    /// built without touching the real index.
+    pub fn with_index(&self, index: PathBuf) -> Repo {
+        Repo {
+            workdir: self.workdir.clone(),
+            index: Some(index),
+        }
+    }
+
     fn command(&self, args: &[&str]) -> Command {
         let mut command = Command::new("git");
         command.current_dir(&self.workdir).args(args);
+        if let Some(index) = &self.index {
+            command.env("GIT_INDEX_FILE", index);
+        }
         command
     }
 
@@ -112,6 +129,109 @@ impl Repo {
             Scope::Tracked => &[],
         };
         Ok(Some((scope, self.diff(range, exclude)?)))
+    }
+
+    /// The changes in `scope` as a patch that `git apply` can replay: with
+    /// binary files, and with fixed prefixes and context, whatever the user's
+    /// diff settings are.
+    pub fn patch(&self, scope: Scope) -> Result<String> {
+        let mut args = vec![
+            "diff",
+            "--no-color",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--binary",
+            "--unified=3",
+            "--find-renames",
+            "--src-prefix=a/",
+            "--dst-prefix=b/",
+        ];
+        if scope == Scope::Staged {
+            args.push("--cached");
+        }
+        self.git(&args)
+    }
+
+    /// The paths in `scope` whose diffs aren't left out by `exclude`. A
+    /// renamed file is named by its new path.
+    pub fn included_paths(&self, scope: Scope, exclude: &[String]) -> Result<HashSet<String>> {
+        let excludes = exclude_pathspecs(exclude);
+        let mut args = vec!["diff", "--name-only", "--find-renames", "-z"];
+        if scope == Scope::Staged {
+            args.push("--cached");
+        }
+        args.extend(["--", ":/"]);
+        args.extend(excludes.iter().map(String::as_str));
+        let names = self.git(&args)?;
+        Ok(names
+            .split('\0')
+            .filter(|name| !name.is_empty())
+            .map(str::to_owned)
+            .collect())
+    }
+
+    /// Replaces the index with the tree of `tree_ish`, e.g. `HEAD`.
+    pub fn read_tree(&self, tree_ish: &str) -> Result<()> {
+        self.git(&["read-tree", tree_ish]).map(drop)
+    }
+
+    /// Applies `patch` to the index, leaving the work tree alone.
+    pub fn apply_to_index(&self, patch: &str) -> Result<()> {
+        let mut child = self
+            .command(&["apply", "--cached", "--whitespace=nowarn", "-"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .context("failed to run git apply")?;
+        // Dropping stdin closes it, so git sees the end of the patch.
+        let written = child
+            .stdin
+            .take()
+            .context("git apply has no input")?
+            .write_all(patch.as_bytes());
+        let output = child
+            .wait_with_output()
+            .context("failed to wait for git apply")?;
+        if !output.status.success() {
+            bail!(
+                "`git apply --cached` failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+        written.context("failed to send the patch to git apply")
+    }
+
+    /// Resets the index to HEAD, leaving the work tree alone.
+    pub fn reset_index(&self) -> Result<()> {
+        self.git(&["reset", "--quiet"]).map(drop)
+    }
+
+    pub fn has_staged_changes(&self) -> Result<bool> {
+        self.has_diff(&["--cached"])
+    }
+
+    /// The merge, rebase, cherry-pick or revert that is in progress, if any.
+    pub fn operation_in_progress(&self) -> Result<Option<&'static str>> {
+        const OPERATIONS: [(&str, &str); 5] = [
+            ("MERGE_HEAD", "a merge"),
+            ("rebase-merge", "a rebase"),
+            ("rebase-apply", "a rebase"),
+            ("CHERRY_PICK_HEAD", "a cherry-pick"),
+            ("REVERT_HEAD", "a revert"),
+        ];
+        for (name, operation) in OPERATIONS {
+            if self.git_path(name)?.exists() {
+                return Ok(Some(operation));
+            }
+        }
+        Ok(None)
+    }
+
+    /// The last `count` commits as `<hash> <subject>` lines, newest first.
+    pub fn recent_commits(&self, count: usize) -> Result<Vec<String>> {
+        let log = self.git(&["log", "--format=%h %s", &format!("--max-count={count}")])?;
+        Ok(log.lines().map(str::to_owned).collect())
     }
 
     /// The changes HEAD makes since it branched off `base`.

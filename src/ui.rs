@@ -113,12 +113,7 @@ pub fn error(err: &anyhow::Error) {
 }
 
 pub fn show_proposal<T>(review: &Review<T>, text: &str) {
-    const WIDTH: usize = 64;
-    let title = format!("── {} ", review.heading);
-    let title_rule = "─".repeat(WIDTH.saturating_sub(title.chars().count()));
-    println!("\n{}", dim(&format!("{title}{title_rule}")));
-    println!("{text}");
-    println!("{}", dim(&"─".repeat(WIDTH)));
+    show_framed(review.heading, text);
     let first_len = text.lines().next().unwrap_or_default().chars().count();
     if first_len > SUBJECT_LIMIT {
         warn(format!(
@@ -126,6 +121,16 @@ pub fn show_proposal<T>(review: &Review<T>, text: &str) {
             review.first_line
         ));
     }
+}
+
+/// Prints `text` between two rules, the first titled `heading`.
+pub fn show_framed(heading: &str, text: &str) {
+    const WIDTH: usize = 64;
+    let title = format!("── {heading} ");
+    let title_rule = "─".repeat(WIDTH.saturating_sub(title.chars().count()));
+    println!("\n{}", dim(&format!("{title}{title_rule}")));
+    println!("{text}");
+    println!("{}", dim(&"─".repeat(WIDTH)));
 }
 
 /// Shows an animated progress line on stderr until dropped.
@@ -271,6 +276,11 @@ pub fn edit_message(repo: &Repo, message: &str) -> Result<Option<String>> {
     let edited = edit(&path, &format!("{message}\n\n{EDIT_HELP}"))?;
     let edited = strip_comments(&edited);
     Ok((!edited.is_empty()).then_some(edited))
+}
+
+/// Lets the user edit a split plan in their editor, and returns what they saved.
+pub fn edit_plan(repo: &Repo, text: &str) -> Result<String> {
+    edit(&repo.git_path("GIT_AGENT_SPLIT_PLAN")?, text)
 }
 
 /// Lets the user edit a pull request's title and description in their editor.

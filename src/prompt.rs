@@ -27,6 +27,54 @@ Guidelines:
 
 Reply with the title and description only: no introduction, no "Title:" label, no code fences."###;
 
+/// Instructions for grouping a change into commits (`git agent split`). The
+/// messages come later, one commit at a time, from the commit message prompt.
+pub const SPLIT_PROMPT: &str = r#"You split a developer's uncommitted changes into a series of small, logical commits, the way a careful developer would before pushing.
+
+The changes are listed as numbered units. A unit is one hunk of a file, or a whole file. For each unit you see its file and its lines as in a diff: added lines start with "+", removed lines with "-", and unchanged lines around them with a space. Long units are cut short.
+
+Group the units into commits:
+- Each commit does one thing, such as a feature, a fix, a refactoring, a dependency update or documentation.
+- Don't split a feature into its parts: a new module, the code that starts using it, the dependency it needs and its documentation belong in one commit.
+- Keep together what only works together, such as a function and the calls that use its new signature, or a dependency and its lockfile.
+- Put tests with the change they test, unless they stand on their own.
+- Order the commits so each one builds on those before it, for example a refactoring before the feature that needs it.
+- Use as few commits as make sense. If everything belongs together, return a single commit.
+- Every unit goes in exactly one commit.
+
+Reply with JSON only, without any other text, in this form:
+{"commits": [{"title": "Add a cache for parsed configs", "units": [2, 3, 5, 8]}, {"title": "Fix the config path on Windows", "units": [1]}, {"title": "Correct typos in comments", "units": [4, 6, 7]}]}
+
+Each title is a short summary of its commit in the imperative mood."#;
+
+/// The conversation asking for a plan for the numbered `units`.
+pub fn split_messages(units: &str, hint: Option<&str>) -> Vec<Message> {
+    let user = format!("{}Changes:\n{units}", notes(hint));
+    vec![Message::system(SPLIT_PROMPT), Message::user(user)]
+}
+
+/// Continues `base` with the current plan, as JSON, and the user's requested changes.
+pub fn refine_plan(base: &[Message], plan: &str, feedback: &str) -> Vec<Message> {
+    let mut messages = base.to_vec();
+    messages.push(Message::assistant(plan));
+    messages.push(Message::user(format!(
+        "Revise the plan based on this feedback:\n{feedback}\n\n\
+         Reply with the revised plan only, as JSON in the same form."
+    )));
+    messages
+}
+
+/// Continues `base` with a reply that wasn't a readable plan, and why.
+pub fn retry_plan(base: &[Message], reply: &str, problem: &str) -> Vec<Message> {
+    let mut messages = base.to_vec();
+    messages.push(Message::assistant(reply));
+    messages.push(Message::user(format!(
+        "That reply could not be read as a plan ({problem}). Reply with the JSON only, in the \
+         form shown, with every unit in exactly one commit."
+    )));
+    messages
+}
+
 /// How the changes were fitted into the model's context.
 pub struct Fit {
     /// Estimated size of the conversation as sent.
@@ -67,7 +115,7 @@ fn reply_reserve(context_length: usize, max_output_tokens: usize) -> usize {
 
 /// Bytes the user message may take in a context of `context_length` tokens,
 /// with room for a reply of up to `max_output_tokens`.
-fn room(system_prompt: &str, context_length: usize, max_output_tokens: usize) -> usize {
+pub fn room(system_prompt: &str, context_length: usize, max_output_tokens: usize) -> usize {
     let reserve = reply_reserve(context_length, max_output_tokens);
     let budget = context_length.saturating_sub(reserve) * BYTES_PER_TOKEN;
     budget.saturating_sub(system_prompt.trim().len() + FRAMING_BYTES)
@@ -433,6 +481,21 @@ mod tests {
             listed.left_out
         )));
         assert!(listed.text.len() <= 300 + 40);
+    }
+
+    #[test]
+    fn asks_for_a_plan_and_continues_it() {
+        let messages = split_messages("[1] a.rs (+1)\n+x\n", Some("cleanup"));
+        assert_eq!(messages[0].content, SPLIT_PROMPT);
+        assert_eq!(
+            messages[1].content,
+            "Notes from the author:\ncleanup\n\nChanges:\n[1] a.rs (+1)\n+x\n"
+        );
+        let refined = refine_plan(&messages, "{\"commits\": []}", "fewer commits");
+        assert_eq!(refined.len(), 4);
+        assert!(refined[3].content.contains("fewer commits"));
+        let retried = retry_plan(&messages, "oops", "not JSON");
+        assert!(retried[3].content.contains("(not JSON)"));
     }
 
     #[test]

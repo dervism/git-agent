@@ -133,7 +133,7 @@ pub fn head_lines(text: &str, limit: usize) -> &str {
 }
 
 /// Splits a diff into one part per file. Each part starts with "diff --git".
-fn split_files(diff: &str) -> Vec<&str> {
+pub fn split_files(diff: &str) -> Vec<&str> {
     let mut starts: Vec<usize> = diff
         .match_indices("diff --git ")
         .map(|(index, _)| index)
@@ -231,7 +231,7 @@ fn count_changes(diff: &str) -> usize {
 /// even share get all they need and the others split what is left evenly. When
 /// an even share would be too small to be useful, the smallest parts get
 /// `MIN_FILE_BYTES` each until the room runs out, and the rest get nothing.
-fn share(sizes: &[usize], limit: usize) -> Vec<usize> {
+pub fn share(sizes: &[usize], limit: usize) -> Vec<usize> {
     let mut order: Vec<usize> = (0..sizes.len()).collect();
     order.sort_by_key(|&index| sizes[index]);
     let mut shares = vec![0; sizes.len()];

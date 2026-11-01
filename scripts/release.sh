@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Releases git-agent: runs the checks, bumps the version, publishes to crates.io,
-# tags the release commit, pushes it, and creates a GitHub release.
+# tags the release commit, pushes it, creates a GitHub release, and points the
+# Homebrew formula in <owner>/homebrew-tap at the new version.
 #
 #   scripts/release.sh 0.3.0             release version 0.3.0
 #   scripts/release.sh --dry-run 0.3.0   show what would happen, change nothing
@@ -152,10 +153,41 @@ else
     run gh release create "$tag" --title "$tag" --generate-notes --verify-tag
 fi
 
+# The Homebrew formula builds from the tag's source archive, so it needs that
+# archive's URL and checksum.
+repo_url=$(gh repo view --json url --jq .url)
+tap_repo="$(gh repo view --json owner --jq .owner.login)/homebrew-tap"
+formula="Formula/$crate.rb"
+archive="$repo_url/archive/refs/tags/$tag.tar.gz"
+if ! gh repo view "$tap_repo" >/dev/null 2>&1; then
+    step "No Homebrew tap at $tap_repo; skipping the formula"
+else
+    tap_dir=$(mktemp -d)
+    gh repo clone "$tap_repo" "$tap_dir" -- --quiet
+    if grep -qF "\"$archive\"" "$tap_dir/$formula"; then
+        step "The Homebrew formula is already at $version"
+    else
+        step "Updating the Homebrew formula in $tap_repo"
+        if $dry_run; then
+            printf '    (dry run) point %s at %s\n' "$formula" "$archive"
+        else
+            checksum=$(curl --fail --silent --show-error --location "$archive" | shasum -a 256)
+            sed -i.bak \
+                -e "s|^  url \".*\"$|  url \"$archive\"|" \
+                -e "s|^  sha256 \".*\"$|  sha256 \"${checksum%% *}\"|" \
+                "$tap_dir/$formula"
+            rm "${tap_dir:?}/$formula.bak"
+        fi
+        run git -C "$tap_dir" commit --quiet --all --message "$crate $version"
+        run git -C "$tap_dir" push --quiet
+    fi
+    rm -rf "${tap_dir:?}"
+fi
+
 if $dry_run; then
     step "Dry run finished; nothing was changed"
 else
     step "Released $crate $version"
     echo "    https://crates.io/crates/$crate/$version"
-    echo "    $(gh repo view --json url --jq .url)/releases/tag/$tag"
+    echo "    $repo_url/releases/tag/$tag"
 fi

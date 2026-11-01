@@ -55,6 +55,28 @@ Guidelines:
 
 Reply with the commit message only: no introduction, no Markdown headings, no code fences."#;
 
+/// What git-agent does when the changes it would commit, or the commits it
+/// would push or open a pull request for, add what look like secrets. Either
+/// way, the model gets them replaced (see `redact.rs`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, clap::ValueEnum)]
+#[serde(rename_all = "lowercase")]
+pub enum OnSecrets {
+    /// Don't commit, push or create the pull request
+    #[default]
+    Reject,
+    /// List them and carry on
+    Warn,
+}
+
+impl OnSecrets {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            OnSecrets::Reject => "reject",
+            OnSecrets::Warn => "warn",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
@@ -75,6 +97,7 @@ pub struct Config {
     /// The model's context window in tokens. `None` asks the server.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub context_length: Option<usize>,
+    pub on_secrets: OnSecrets,
     pub exclude: Vec<String>,
     pub system_prompt: String,
 }
@@ -89,6 +112,7 @@ impl Default for Config {
             timeout_secs: DEFAULT_TIMEOUT_SECS,
             max_output_tokens: DEFAULT_MAX_OUTPUT_TOKENS,
             context_length: None,
+            on_secrets: OnSecrets::default(),
             exclude: DEFAULT_EXCLUDE.iter().map(|s| s.to_string()).collect(),
             system_prompt: DEFAULT_SYSTEM_PROMPT.to_owned(),
         }
@@ -158,6 +182,9 @@ impl Config {
         }
         if let Some(tokens) = args.max_output_tokens {
             self.max_output_tokens = tokens;
+        }
+        if let Some(on_secrets) = args.on_secrets {
+            self.on_secrets = on_secrets;
         }
         self.model = self.model.take().filter(|model| !model.trim().is_empty());
         self.api_key = self.api_key.take().filter(|key| !key.trim().is_empty());
@@ -297,6 +324,15 @@ max_output_tokens = {max_output_tokens}
 # Overridden by --context-length / GIT_AGENT_CONTEXT_LENGTH.
 {context_length}
 
+# What git-agent does when the changes it would commit, or the commits it would
+# push or open a pull request for, add what look like secrets, such as API keys,
+# private keys or passwords:
+#   "reject"  don't commit, push or create the pull request
+#   "warn"    list them and carry on
+# Either way, the model gets [REDACTED] in their place.
+# Overridden by --on-secrets / GIT_AGENT_ON_SECRETS.
+on_secrets = {on_secrets}
+
 # Files whose content is left out of the diff sent to the model. They still
 # appear in the list of changed files. Patterns without a "/" match the file
 # name in any directory; "*" wildcards are allowed.
@@ -309,6 +345,7 @@ system_prompt = {system_prompt}
         base_url = toml_string(&config.base_url),
         timeout_secs = config.timeout_secs,
         max_output_tokens = config.max_output_tokens,
+        on_secrets = toml_string(config.on_secrets.as_str()),
         local_temperature = LOCAL_TEMPERATURE,
         fallback = crate::models::FALLBACK_CONTEXT_LENGTH,
     )
@@ -339,10 +376,26 @@ mod tests {
             temperature: Some(0.4),
             context_length: Some(32768),
             max_output_tokens: 32000,
+            on_secrets: OnSecrets::Warn,
             exclude: vec!["*.min.js".into(), "docs/generated/**".into()],
             ..config
         };
         assert_eq!(round_trip(&config), config);
+    }
+
+    #[test]
+    fn rejects_secrets_unless_told_to_warn() {
+        assert_eq!(Config::default().on_secrets, OnSecrets::Reject);
+        let config: Config = toml::from_str("on_secrets = \"warn\"").unwrap();
+        assert_eq!(config.on_secrets, OnSecrets::Warn);
+        assert!(toml::from_str::<Config>("on_secrets = \"ignore\"").is_err());
+
+        let mut config = Config::default();
+        config.apply(&SettingArgs {
+            on_secrets: Some(OnSecrets::Warn),
+            ..SettingArgs::default()
+        });
+        assert_eq!(config.on_secrets, OnSecrets::Warn);
     }
 
     #[test]

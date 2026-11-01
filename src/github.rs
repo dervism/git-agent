@@ -1,0 +1,128 @@
+//! Pull requests through the GitHub CLI (`gh`), which brings its own login.
+
+use anyhow::{Context, Result, anyhow, bail};
+use std::io::{self, ErrorKind, Write};
+use std::path::Path;
+use std::process::{Command, Stdio};
+
+/// A pull request to create.
+pub struct PullRequest<'a> {
+    pub title: &'a str,
+    pub body: &'a str,
+    /// The branch it merges into.
+    pub base: &'a str,
+    /// The branch with the changes.
+    pub head: &'a str,
+    pub draft: bool,
+    /// More arguments for `gh pr create`, e.g. `--label bug`.
+    pub extra_args: &'a [String],
+}
+
+fn gh(dir: &Path, args: &[&str]) -> Command {
+    let mut command = Command::new("gh");
+    command.current_dir(dir).args(args);
+    command
+}
+
+fn start_error(err: io::Error) -> anyhow::Error {
+    if err.kind() == ErrorKind::NotFound {
+        anyhow!(
+            "git agent pr creates pull requests with the GitHub CLI, which is not installed; \
+             get it from https://cli.github.com, then run `gh auth login`"
+        )
+    } else {
+        anyhow::Error::new(err).context("failed to run gh")
+    }
+}
+
+/// Runs gh and returns its trimmed stdout, failing with its stderr.
+fn output(dir: &Path, args: &[&str]) -> Result<String> {
+    let output = gh(dir, args).output().map_err(start_error)?;
+    if !output.status.success() {
+        bail!(
+            "`gh {}` failed: {}",
+            args[..2].join(" "),
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
+}
+
+/// The repository's default branch, e.g. `main`.
+pub fn default_branch(dir: &Path) -> Result<String> {
+    let name = output(
+        dir,
+        &[
+            "repo",
+            "view",
+            "--json",
+            "defaultBranchRef",
+            "--jq",
+            ".defaultBranchRef.name",
+        ],
+    )
+    .context("could not ask GitHub for the default branch; name the base branch with --base")?;
+    if name.is_empty() {
+        bail!("GitHub reported no default branch; name the base branch with --base");
+    }
+    Ok(name)
+}
+
+/// The URL of `branch`'s open pull request, if it has one.
+pub fn open_pull_request(dir: &Path, branch: &str) -> Result<Option<String>> {
+    let url = output(
+        dir,
+        &[
+            "pr",
+            "list",
+            "--head",
+            branch,
+            "--state",
+            "open",
+            "--json",
+            "url",
+            "--jq",
+            ".[0].url // empty",
+        ],
+    )?;
+    Ok((!url.is_empty()).then_some(url))
+}
+
+/// Creates the pull request. gh prints its progress and the new pull request's URL.
+pub fn create_pull_request(dir: &Path, pull_request: &PullRequest) -> Result<()> {
+    let mut command = gh(
+        dir,
+        &[
+            "pr",
+            "create",
+            "--title",
+            pull_request.title,
+            "--body-file",
+            "-",
+            "--base",
+            pull_request.base,
+            "--head",
+            pull_request.head,
+        ],
+    );
+    if pull_request.draft {
+        command.arg("--draft");
+    }
+    let mut child = command
+        .args(pull_request.extra_args)
+        .stdin(Stdio::piped())
+        .spawn()
+        .map_err(start_error)?;
+    // Dropping stdin closes it, so gh sees the end of the description.
+    let written = child
+        .stdin
+        .take()
+        .context("gh has no input")?
+        .write_all(pull_request.body.as_bytes());
+    let status = child.wait().context("failed to wait for gh")?;
+    written.context("failed to send the description to gh")?;
+    if !status.success() {
+        bail!("`gh pr create` failed ({status})");
+    }
+    Ok(())
+}

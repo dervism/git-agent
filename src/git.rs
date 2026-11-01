@@ -1,6 +1,6 @@
 //! Wrapper around the `git` command line.
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -16,11 +16,26 @@ pub enum Scope {
 
 #[derive(Debug)]
 pub struct Changes {
-    pub scope: Scope,
     /// `git diff --stat` for every changed file, including excluded ones.
     pub stat: String,
     /// The diff, without excluded files.
     pub diff: String,
+}
+
+/// A commit on a branch.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Commit {
+    pub hash: String,
+    /// The subject, then the body indented: "- subject\n  body".
+    pub message: String,
+}
+
+/// A commit's message and patch, as pushing it would publish them.
+#[derive(Debug)]
+pub struct CommitPatch {
+    pub hash: String,
+    pub message: String,
+    pub patch: String,
 }
 
 pub struct Repo {
@@ -82,8 +97,9 @@ impl Repo {
         self.git(&["add", "--all"]).map(drop)
     }
 
-    /// The changes to describe, or `None` if there are no staged or tracked changes.
-    pub fn changes(&self, exclude: &[String]) -> Result<Option<Changes>> {
+    /// The changes to describe and how to commit them, or `None` if there are
+    /// no staged or tracked changes.
+    pub fn changes(&self, exclude: &[String]) -> Result<Option<(Scope, Changes)>> {
         let scope = if self.has_diff(&["--cached"])? {
             Scope::Staged
         } else if self.has_diff(&[])? {
@@ -91,21 +107,143 @@ impl Repo {
         } else {
             return Ok(None);
         };
+        let range: &[&str] = match scope {
+            Scope::Staged => &["--cached"],
+            Scope::Tracked => &[],
+        };
+        Ok(Some((scope, self.diff(range, exclude)?)))
+    }
 
-        let mut base = vec!["diff", "--no-color", "--no-ext-diff"];
-        if scope == Scope::Staged {
-            base.push("--cached");
-        }
-        let stat = self.git(&[base.as_slice(), &["--stat=120"]].concat())?;
+    /// The changes HEAD makes since it branched off `base`.
+    pub fn branch_changes(&self, base: &str, exclude: &[String]) -> Result<Changes> {
+        self.diff(&[&format!("{base}...HEAD")], exclude)
+    }
+
+    /// The changes `git diff` shows with `range` (e.g. `--cached`), without the
+    /// diffs of files matching `exclude`.
+    fn diff(&self, range: &[&str], exclude: &[String]) -> Result<Changes> {
+        let base = ["diff", "--no-color", "--no-ext-diff"];
+        let stat = self.git(&[&base[..], range, &["--stat=120"]].concat())?;
 
         let excludes = exclude_pathspecs(exclude);
-        let mut diff_args = base;
         // A deleted file's old content says little about the change; its name is enough.
-        diff_args.extend(["--irreversible-delete", "--", ":/"]);
+        let mut diff_args = [&base[..], range, &["--irreversible-delete", "--", ":/"]].concat();
         diff_args.extend(excludes.iter().map(String::as_str));
         let diff = self.git(&diff_args)?;
 
-        Ok(Some(Changes { scope, stat, diff }))
+        Ok(Changes { stat, diff })
+    }
+
+    /// The commits in `range` (`git log` arguments, e.g. `main..HEAD`) with
+    /// their patches, without the diffs of files matching `exclude`.
+    pub fn commit_patches(&self, range: &[&str], exclude: &[String]) -> Result<Vec<CommitPatch>> {
+        let excludes = exclude_pathspecs(exclude);
+        let mut args = vec![
+            "log",
+            "--patch",
+            "--no-color",
+            "--no-ext-diff",
+            "--irreversible-delete",
+            "--format=%x1e%h%x1f%B%x1f",
+        ];
+        args.extend_from_slice(range);
+        args.extend(["--", ":/"]);
+        args.extend(excludes.iter().map(String::as_str));
+        let log = self.git(&args)?;
+        let commits = log.split('\x1e').filter_map(|record| {
+            let mut parts = record.splitn(3, '\x1f');
+            let hash = parts.next()?.trim();
+            (!hash.is_empty()).then(|| CommitPatch {
+                hash: hash.to_owned(),
+                message: parts.next().unwrap_or_default().trim().to_owned(),
+                patch: parts.next().unwrap_or_default().to_owned(),
+            })
+        });
+        Ok(commits.collect())
+    }
+
+    /// The commits a push of HEAD would send: those no remote-tracking branch has.
+    pub fn outgoing_patches(&self, exclude: &[String]) -> Result<Vec<CommitPatch>> {
+        self.commit_patches(&["HEAD", "--not", "--remotes"], exclude)
+    }
+
+    /// The commits on HEAD that `base` lacks, oldest first, without merges.
+    pub fn commits_since(&self, base: &str) -> Result<Vec<Commit>> {
+        let log = self.git(&[
+            "log",
+            "--reverse",
+            "--no-merges",
+            "--format=%x1e%h%n%s%n%b",
+            &format!("{base}..HEAD"),
+        ])?;
+        let commits = log.split('\x1e').filter_map(|record| {
+            let mut lines = record.trim().lines();
+            let hash = lines.next().filter(|hash| !hash.is_empty())?;
+            let mut message = format!("- {}", lines.next().unwrap_or_default());
+            for line in lines {
+                message.push('\n');
+                if !line.trim().is_empty() {
+                    message.push_str("  ");
+                    message.push_str(line.trim_end());
+                }
+            }
+            Some(Commit {
+                hash: hash.to_owned(),
+                message: message.trim_end().to_owned(),
+            })
+        });
+        Ok(commits.collect())
+    }
+
+    /// The checked-out branch.
+    pub fn current_branch(&self) -> Result<String> {
+        let name = self
+            .git(&["symbolic-ref", "--quiet", "--short", "HEAD"])
+            .map_err(|_| anyhow!("HEAD is detached; check out a branch first"))?;
+        Ok(name.trim().to_owned())
+    }
+
+    /// The remote the current branch pulls from, else the one it would push to.
+    pub fn remote(&self) -> Result<String> {
+        let branch = self.current_branch()?;
+        match self.git(&["config", &format!("branch.{branch}.remote")]) {
+            Ok(remote) if remote.trim() != "." => Ok(remote.trim().to_owned()),
+            _ => self.push_remote(),
+        }
+    }
+
+    /// Fetches `branch` from `remote` and returns its remote-tracking ref, e.g.
+    /// `origin/main`, so HEAD can be compared with the remote's latest version.
+    pub fn fetch_branch(&self, remote: &str, branch: &str) -> Result<String> {
+        let tracking = format!("{remote}/{branch}");
+        let refspec = format!("+refs/heads/{branch}:refs/remotes/{tracking}");
+        // Uses the terminal so git can show errors and ask for credentials.
+        let status = self
+            .command(&["fetch", "--quiet", remote, &refspec])
+            .status()
+            .context("failed to run git fetch")?;
+        if !status.success() {
+            bail!("`git fetch {remote} {branch}` failed ({status})");
+        }
+        Ok(tracking)
+    }
+
+    /// Whether the current branch has no upstream, or commits its upstream lacks.
+    pub fn has_unpushed_commits(&self) -> Result<bool> {
+        if !self.has_upstream() {
+            return Ok(true);
+        }
+        let ahead = self.git(&["rev-list", "--max-count=1", "@{upstream}..HEAD"])?;
+        Ok(!ahead.trim().is_empty())
+    }
+
+    /// Whether tracked files have staged or unstaged changes.
+    pub fn has_uncommitted_changes(&self) -> Result<bool> {
+        Ok(self.has_diff(&["--cached"])? || self.has_diff(&[])?)
+    }
+
+    pub fn workdir(&self) -> &Path {
+        &self.workdir
     }
 
     /// Number of untracked, non-ignored paths (directories count once).
@@ -370,13 +508,12 @@ mod tests {
         fs::write(dir.path().join("lib.rs"), "fn b() {}\n").unwrap();
         fs::write(dir.path().join("new.rs"), "fn c() {}\n").unwrap();
 
-        let changes = repo.changes(&[]).unwrap().unwrap();
-        assert_eq!(changes.scope, Scope::Tracked);
+        let (scope, changes) = repo.changes(&[]).unwrap().unwrap();
+        assert_eq!(scope, Scope::Tracked);
         assert!(changes.diff.contains("+fn b() {}"));
         assert_eq!(repo.untracked_count().unwrap(), 1);
 
-        repo.commit("fix: rename a to b", changes.scope, &[])
-            .unwrap();
+        repo.commit("fix: rename a to b", scope, &[]).unwrap();
         assert_eq!(log(&repo).trim(), "fix: rename a to b");
         assert!(repo.changes(&[]).unwrap().is_none());
         assert!(!repo.git_path("GIT_AGENT_MSG").unwrap().exists());
@@ -389,8 +526,8 @@ mod tests {
         fs::write(dir.path().join("staged.rs"), "fn s() {}\n").unwrap();
         repo.git(&["add", "staged.rs"]).unwrap();
 
-        let changes = repo.changes(&[]).unwrap().unwrap();
-        assert_eq!(changes.scope, Scope::Staged);
+        let (scope, changes) = repo.changes(&[]).unwrap().unwrap();
+        assert_eq!(scope, Scope::Staged);
         assert!(changes.diff.contains("staged.rs"));
         assert!(!changes.diff.contains("lib.rs"));
     }
@@ -403,7 +540,7 @@ mod tests {
         fs::write(dir.path().join("main.rs"), "fn main() {}\n").unwrap();
         repo.stage_all().unwrap();
 
-        let changes = repo.changes(&["Cargo.lock".into()]).unwrap().unwrap();
+        let (_, changes) = repo.changes(&["Cargo.lock".into()]).unwrap().unwrap();
         assert!(changes.stat.contains("sub/Cargo.lock"));
         assert!(!changes.diff.contains("Cargo.lock"));
         assert!(changes.diff.contains("main.rs"));
@@ -414,7 +551,7 @@ mod tests {
         let (dir, repo) = setup();
         fs::remove_file(dir.path().join("lib.rs")).unwrap();
 
-        let changes = repo.changes(&[]).unwrap().unwrap();
+        let (_, changes) = repo.changes(&[]).unwrap().unwrap();
         assert!(changes.diff.contains("deleted file"));
         assert!(!changes.diff.contains("fn a()"));
     }
@@ -482,6 +619,78 @@ mod tests {
         assert_eq!(repo.git(&["rev-parse", "HEAD"]).unwrap(), before);
         assert!(!repo.git_path("rebase-merge").unwrap().exists());
         assert!(repo.changes(&[]).unwrap().is_none());
+    }
+
+    #[test]
+    fn describes_a_branch_since_it_left_the_remote_base() {
+        let (dir, repo) = setup();
+        let remote = add_remote(&repo);
+        run(dir.path(), &["switch", "-q", "-c", "feature"]);
+        fs::write(dir.path().join("lib.rs"), "fn b() {}\n").unwrap();
+        repo.commit(
+            "feat: add b\n\nb replaces a.\n\nIt is faster.",
+            Scope::Tracked,
+            &[],
+        )
+        .unwrap();
+        fs::write(dir.path().join("new.rs"), "fn c() {}\n").unwrap();
+        repo.stage_all().unwrap();
+        repo.commit("test: cover c", Scope::Staged, &[]).unwrap();
+        // The base moves on without the branch; its commit is not the branch's.
+        commit_elsewhere(&remote, "LICENSE", "MIT\n", "docs: add license");
+
+        assert_eq!(repo.current_branch().unwrap(), "feature");
+        assert_eq!(repo.remote().unwrap(), "origin");
+        let base = repo.fetch_branch("origin", "main").unwrap();
+        assert_eq!(base, "origin/main");
+        let commits = repo.commits_since(&base).unwrap();
+        let messages: Vec<&str> = commits.iter().map(|c| c.message.as_str()).collect();
+        assert_eq!(
+            messages,
+            [
+                "- feat: add b\n  b replaces a.\n\n  It is faster.",
+                "- test: cover c"
+            ]
+        );
+        assert!(commits.iter().all(|c| c.hash.len() >= 7));
+
+        let changes = repo.branch_changes(&base, &[]).unwrap();
+        assert!(changes.diff.contains("+fn b() {}") && changes.diff.contains("new.rs"));
+        assert!(!changes.diff.contains("LICENSE"));
+        assert!(changes.stat.contains("2 files changed"));
+
+        let patches = repo
+            .commit_patches(&[&format!("{base}..HEAD")], &[])
+            .unwrap();
+        let summary: Vec<_> = patches
+            .iter()
+            .map(|commit| (commit.message.as_str(), commit.patch.contains("+fn c() {}")))
+            .collect();
+        assert_eq!(
+            summary,
+            [
+                ("test: cover c", true),
+                ("feat: add b\n\nb replaces a.\n\nIt is faster.", false)
+            ]
+        );
+        assert!(patches[1].patch.contains("diff --git a/lib.rs b/lib.rs"));
+        assert_eq!(repo.outgoing_patches(&[]).unwrap().len(), 2);
+
+        assert!(repo.has_unpushed_commits().unwrap());
+        repo.push().unwrap();
+        assert!(!repo.has_unpushed_commits().unwrap());
+        assert!(repo.outgoing_patches(&[]).unwrap().is_empty());
+        assert!(!repo.has_uncommitted_changes().unwrap());
+        fs::write(dir.path().join("lib.rs"), "fn d() {}\n").unwrap();
+        assert!(repo.has_uncommitted_changes().unwrap());
+    }
+
+    #[test]
+    fn detached_head_has_no_branch() {
+        let (dir, repo) = setup();
+        run(dir.path(), &["switch", "-q", "--detach"]);
+        let err = repo.current_branch().unwrap_err();
+        assert!(err.to_string().contains("detached"));
     }
 
     #[test]

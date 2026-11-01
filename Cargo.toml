@@ -3,7 +3,7 @@ name = "git-agent"
 version = "0.4.0"
 edition = "2024"
 rust-version = "1.88"
-description = "Generate git commit messages from your changes with a local LLM"
+description = "Generate git commit messages from your changes with a language model"
 license = "MIT"
 repository = "https://github.com/dervism/git-agent"
 keywords = ["git", "commit", "llm", "cli", "ai"]
@@ -13,6 +13,7 @@ categories = ["command-line-utilities", "development-tools"]
 anyhow = "1"
 clap = { version = "4.5", features = ["derive", "env"] }
 inquire = "0.9"
+regex-lite = "0.1.9"
 reqwest = { version = "0.13", features = ["json"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"

@@ -1,5 +1,6 @@
 //! Command-line interface.
 
+use crate::config::OnSecrets;
 use clap::{Args, Parser, Subcommand};
 use std::path::PathBuf;
 
@@ -88,10 +89,50 @@ pub struct SettingArgs {
     /// Sampling temperature, 0.0 to 2.0
     #[arg(short, long, global = true)]
     pub temperature: Option<f32>,
+
+    /// What to do when changes add what look like secrets [default: reject]
+    #[arg(
+        long,
+        global = true,
+        env = "GIT_AGENT_ON_SECRETS",
+        value_name = "ACTION",
+        value_enum
+    )]
+    pub on_secrets: Option<OnSecrets>,
+}
+
+/// Options for `git agent pr`.
+#[derive(Args, Debug)]
+pub struct PrArgs {
+    /// Branch the pull request merges into [default: the repository's default branch]
+    #[arg(short, long, value_name = "BRANCH")]
+    pub base: Option<String>,
+
+    /// Create the pull request as a draft
+    #[arg(short, long, conflicts_with = "raw")]
+    pub draft: bool,
+
+    /// Create the pull request without reviewing it
+    #[arg(short, long, conflicts_with = "raw")]
+    pub create: bool,
+
+    /// Print only the title and description to stdout and exit (for scripts and pipes)
+    #[arg(short, long)]
+    pub raw: bool,
+
+    /// Extra context for the model, e.g. which issue the branch fixes
+    #[arg(short = 'H', long, value_name = "TEXT")]
+    pub hint: Option<String>,
+
+    /// Extra arguments for `gh pr create`, e.g. `-- --label bug`
+    #[arg(last = true, value_name = "GH_ARGS")]
+    pub gh_args: Vec<String>,
 }
 
 #[derive(Subcommand, Debug)]
 pub enum Command {
+    /// Write a pull request for the current branch, then create it on GitHub with gh
+    Pr(PrArgs),
     /// List the models available on the configured server
     Models,
     /// Change the settings in an interactive menu, or create or inspect the config file
@@ -144,6 +185,39 @@ mod tests {
         assert_eq!(cli.settings.model.as_deref(), Some("qwen3"));
         let cli = Cli::try_parse_from(["git-agent", "--context-length", "8192"]).unwrap();
         assert_eq!(cli.settings.context_length, Some(8192));
+        let cli = Cli::try_parse_from(["git-agent", "pr", "--on-secrets", "warn"]).unwrap();
+        assert_eq!(cli.settings.on_secrets, Some(OnSecrets::Warn));
+        assert!(Cli::try_parse_from(["git-agent", "--on-secrets", "ignore"]).is_err());
+    }
+
+    #[test]
+    fn pr_takes_its_own_options_and_settings() {
+        let cli = Cli::try_parse_from([
+            "git-agent",
+            "pr",
+            "--base",
+            "develop",
+            "-d",
+            "-H",
+            "fixes #3",
+            "-m",
+            "qwen3",
+            "--",
+            "--label",
+            "bug",
+        ])
+        .unwrap();
+        let Some(Command::Pr(args)) = cli.command else {
+            panic!("expected the pr command");
+        };
+        assert_eq!(args.base.as_deref(), Some("develop"));
+        assert!(args.draft && !args.create);
+        assert_eq!(args.hint.as_deref(), Some("fixes #3"));
+        assert_eq!(args.gh_args, ["--label", "bug"]);
+        assert_eq!(cli.settings.model.as_deref(), Some("qwen3"));
+        assert!(Cli::try_parse_from(["git-agent", "pr", "--raw", "--create"]).is_err());
+        // The commit options belong to plain `git agent`.
+        assert!(Cli::try_parse_from(["git-agent", "--all", "pr"]).is_err());
     }
 
     #[test]

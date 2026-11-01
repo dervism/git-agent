@@ -6,6 +6,7 @@ git-agent writes git commit messages for your changes with a language model, eit
 one running on your own machine (LM Studio, Ollama, llama.cpp, vLLM) or one from a
 cloud provider such as OpenAI, Anthropic or OpenRouter. You review each proposed
 message, then commit it, edit it, regenerate it, or tell the model what to change.
+`git agent pr` does the same for pull requests on GitHub.
 
 ## Why I made git-agent
 
@@ -16,6 +17,18 @@ use in pipelines or with lightweight code editors. The code was developed using
 Gemma 4 locally, and refactored with Claude.
 
 ## Install
+
+Because the binary is called `git-agent`, git also runs it as `git agent`.
+
+### With Homebrew
+
+```sh
+brew install dervism/tap/git-agent
+```
+
+Homebrew builds git-agent from source, and installs its own Rust for the build if you
+don't have it yet. `brew upgrade git-agent` updates git-agent, and
+`brew uninstall git-agent` removes it.
 
 ### From crates.io
 
@@ -30,8 +43,6 @@ Cargo builds an optimized binary and copies it to `~/.cargo/bin/` (or
 `$CARGO_HOME/bin/`). `--locked` uses the exact dependency versions the release was
 tested with. Run the same command again to update to the latest release, and
 `cargo uninstall git-agent` to remove it.
-
-Because the binary is called `git-agent`, git also runs it as `git agent`.
 
 ### From a local checkout
 
@@ -63,6 +74,7 @@ git agent --push           # review, then push after committing
 git agent --commit --push  # commit and push, no review
 git agent --raw            # print just the message, e.g. for `| git commit -F -`
 git agent -- --signoff     # pass extra arguments to `git commit`
+git agent pr               # write a pull request for the branch, then create it
 ```
 
 ### Which changes are included
@@ -115,6 +127,43 @@ If your commit conflicts with the remote commits, git-agent cancels the rebase a
 leaves your branch as it was. Run `git pull --rebase`, resolve the conflicts, then run
 `git push`. git-agent never force-pushes.
 
+## Pull requests
+
+`git agent pr` writes a title and description for the current branch from its
+commits and its diff, then creates the pull request on GitHub. The pull request
+merges into the repository's default branch unless you name another with `--base`.
+git-agent fetches that branch first, so commits that reached it from elsewhere aren't
+described as yours.
+
+```sh
+git agent pr                  # write the pull request, then review it
+git agent pr --base develop   # merge into develop instead of the default branch
+git agent pr --draft          # create it as a draft
+git agent pr -H "fixes #42"   # give the model extra context
+git agent pr --create         # create it right away, no review
+git agent pr --raw            # print just the title and description
+git agent pr -- --label bug   # pass extra arguments to `gh pr create`
+```
+
+### Reviewing the pull request
+
+The first line of the proposal is the title, and the rest is the description in
+Markdown. The review works like the one for commit messages, except for its first two
+keys: `c` creates the pull request and `d` creates it as a draft. If the branch isn't
+on GitHub yet, or GitHub lacks some of its commits, git-agent pushes it first, the
+same way it pushes after a commit. Uncommitted changes are not part of the pull
+request, and git-agent tells you when you have some.
+
+### What it needs
+
+git-agent creates pull requests with the [GitHub CLI](https://cli.github.com), so it
+uses your existing GitHub login. Install `gh` and run `gh auth login` once. Only
+`--raw` together with `--base` works without it.
+
+If the branch already has an open pull request, git-agent shows its address and
+stops. If `gh pr create` fails, git-agent saves the description to
+`.git/GIT_AGENT_PR.md` and prints the command that creates the pull request from it.
+
 ## Choosing a model
 
 git-agent sends your changes to the model server at `base_url`. By default that is
@@ -134,7 +183,7 @@ git-agent uses.
 
 git-agent works with any provider that has an OpenAI-compatible API, and with
 Anthropic through its own Messages API. Your diffs then leave your machine and go to
-that provider.
+that provider, without the [secrets](#secrets-in-your-changes) git-agent finds in them.
 
 To set one up, run `git agent config`, choose Provider, and pick it from the list:
 OpenAI, Anthropic, OpenRouter, Google Gemini, Mistral, Groq, DeepSeek, xAI, Together
@@ -170,6 +219,48 @@ macOS, and like `--api-key`, it overrides a saved key:
 ```sh
 export GIT_AGENT_API_KEY="your-api-key"
 ```
+
+## Secrets in your changes
+
+Before git-agent sends anything to the model, it looks for secrets in it and replaces
+each one with `[REDACTED]`. That covers the diff and, for pull requests, the commit
+messages. The model still sees that something was there, but the secret itself never
+goes into a prompt, whichever server you use.
+
+### Rejecting or warning
+
+By default, git-agent also refuses to commit or push secrets. When your changes add
+one, it stops before it asks the model and lists what it found:
+
+```text
+error: the changes add what look like secrets, so git-agent didn't commit them:
+   .env:2  DB_PASSWORD value
+   src/client.rs:14  GitHub token
+Take them out of the changes. If they aren't real secrets, add --on-secrets warn, or choose Warn under Secrets in `git agent config`.
+```
+
+Before every push, git-agent checks each commit the push would send, including its
+message, because a secret that a later commit removes is still in the history.
+`git agent pr` checks every commit on the branch the same way before it writes the
+pull request. A secret on a line that your change leaves alone or removes doesn't stop
+anything; git-agent only lists it.
+
+To be warned instead, set `on_secrets = "warn"` in the config file, choose Warn under
+Secrets in `git agent config`, or pass `--on-secrets warn` for one run. git-agent then
+lists the secrets and carries on, and the model still gets `[REDACTED]` in their place.
+
+### What git-agent recognizes
+
+- API keys and tokens in the formats of GitHub, GitLab, Slack, Stripe, AWS, OpenAI,
+  Anthropic, Google, Hugging Face, Groq, xAI, npm and PyPI, and JSON web tokens
+- private keys (`-----BEGIN … PRIVATE KEY-----`)
+- passwords in URLs, such as `postgres://app:s3cret@db.example.com`, and bearer tokens
+- values assigned to names such as `password`, `secret`, `token` or `API_KEY`, in
+  `.env` files, YAML, JSON or code
+
+It leaves placeholders such as `your-api-key` and `changeme` alone, and references
+such as `${API_KEY}` too. A secret in a format git-agent doesn't know can still get
+through.
 
 ## Large changes
 
@@ -233,6 +324,7 @@ git-agent settings · ~/.config/git-agent/config.toml
   Output limit    16,000 tokens (sent only to Anthropic)
   Temperature     automatic: 0.4 on local servers
   Timeout         300 seconds
+  Secrets         reject: don't commit or push them
   Excluded files  common lockfiles
   System prompt   default: Conventional Commits
   Done
@@ -274,6 +366,7 @@ API keys come from `--api-key`, then `GIT_AGENT_API_KEY`, then the macOS keychai
 | `context_length` | `--context-length` | `GIT_AGENT_CONTEXT_LENGTH` | reported by the server, or 4096 |
 | `max_output_tokens` | `--max-output-tokens` | `GIT_AGENT_MAX_OUTPUT_TOKENS` | `16000` |
 | `temperature` | `-t`, `--temperature` | | 0.4 on local servers, else the provider's default |
+| `on_secrets` | `--on-secrets` | `GIT_AGENT_ON_SECRETS` | `reject` ([or `warn`](#rejecting-or-warning)) |
 | `timeout_secs` | | | `300` |
 | `exclude` | | | common lockfiles |
 | `system_prompt` | | | Conventional Commits instructions |

@@ -6,7 +6,7 @@
 use crate::cli::SettingArgs;
 use crate::config::{
     self, Config, DEFAULT_EXCLUDE, DEFAULT_MAX_OUTPUT_TOKENS, DEFAULT_SYSTEM_PROMPT,
-    LOCAL_TEMPERATURE, MIN_CONTEXT_LENGTH, MIN_OUTPUT_TOKENS,
+    LOCAL_TEMPERATURE, MIN_CONTEXT_LENGTH, MIN_OUTPUT_TOKENS, OnSecrets,
 };
 use crate::models::FALLBACK_CONTEXT_LENGTH;
 use crate::providers::{self, PROVIDERS};
@@ -38,12 +38,13 @@ enum Item {
     OutputLimit,
     Temperature,
     Timeout,
+    Secrets,
     Exclude,
     SystemPrompt,
     Done,
 }
 
-const ITEMS: [Item; 10] = [
+const ITEMS: [Item; 11] = [
     Item::Provider,
     Item::Model,
     Item::ApiKey,
@@ -51,6 +52,7 @@ const ITEMS: [Item; 10] = [
     Item::OutputLimit,
     Item::Temperature,
     Item::Timeout,
+    Item::Secrets,
     Item::Exclude,
     Item::SystemPrompt,
     Item::Done,
@@ -66,6 +68,7 @@ impl Item {
             Item::OutputLimit => "Output limit",
             Item::Temperature => "Temperature",
             Item::Timeout => "Timeout",
+            Item::Secrets => "Secrets",
             Item::Exclude => "Excluded files",
             Item::SystemPrompt => "System prompt",
             Item::Done => "Done",
@@ -238,6 +241,10 @@ impl Menu<'_> {
                 None => "automatic: the provider's default".to_owned(),
             },
             Item::Timeout => format!("{} seconds", config.timeout_secs),
+            Item::Secrets => match config.on_secrets {
+                OnSecrets::Reject => "reject: don't commit or push them".to_owned(),
+                OnSecrets::Warn => "warn: list them and carry on".to_owned(),
+            },
             Item::Exclude => match config.exclude.len() {
                 _ if config.exclude == default_exclude() => "common lockfiles".to_owned(),
                 0 => "none".to_owned(),
@@ -294,6 +301,10 @@ impl Menu<'_> {
             Item::Timeout => {
                 let value = timeout_setting(self.config.timeout_secs)?;
                 update(&mut self.config.timeout_secs, value)
+            }
+            Item::Secrets => {
+                let value = on_secrets_setting(self.config.on_secrets)?;
+                update(&mut self.config.on_secrets, value)
             }
             Item::Exclude => {
                 let value = exclude_setting(&self.config.exclude)?;
@@ -453,6 +464,7 @@ fn warn_about_overrides(settings: &SettingArgs) {
         (settings.context_length.is_some(), "context length"),
         (settings.max_output_tokens.is_some(), "output limit"),
         (settings.temperature.is_some(), "temperature"),
+        (settings.on_secrets.is_some(), "secrets setting"),
     ]
     .into_iter()
     .filter_map(|(set, name)| set.then_some(name))
@@ -737,6 +749,27 @@ const EXCLUDE_HELP: &str = "\
 # name in any directory; \"*\" wildcards are allowed, e.g. *.min.js or dist/**.
 # Lines starting with '#' are ignored.
 ";
+
+/// Asks what to do when changes add what look like secrets.
+fn on_secrets_setting(current: OnSecrets) -> Result<Option<OnSecrets>> {
+    ui::info(ui::dim(
+        "   git-agent looks for API keys, private keys and passwords in what it commits and\n   \
+         pushes. Either way, the model gets [REDACTED] in their place.",
+    ));
+    let options = [
+        "Reject: don't commit, push or create the pull request",
+        "Warn: list them and carry on",
+    ];
+    let start = match current {
+        OnSecrets::Reject => 0,
+        OnSecrets::Warn => 1,
+    };
+    Ok(match pick("When changes add secrets:", &options, start)? {
+        Some(0) => Some(OnSecrets::Reject),
+        Some(_) => Some(OnSecrets::Warn),
+        None => None,
+    })
+}
 
 fn exclude_setting(current: &[String]) -> Result<Option<Vec<String>>> {
     let options = [

@@ -152,7 +152,7 @@ fn split_files(diff: &str) -> Vec<&str> {
 }
 
 /// The file's path from its "diff --git a/<path> b/<path>" header.
-fn path(file: &str) -> String {
+pub fn path(file: &str) -> String {
     let header = file.lines().next().unwrap_or_default();
     let names = header.strip_prefix("diff --git ").unwrap_or(header);
     let path = names

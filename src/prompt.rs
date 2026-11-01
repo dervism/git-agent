@@ -2,7 +2,7 @@
 
 use crate::fit::{self, FileFit};
 use crate::git::Changes;
-use crate::llm::Message;
+use crate::server::Message;
 use std::fmt::Write;
 
 /// Rough number of bytes per token. Common tokenizers average 3 to 4 bytes per
@@ -35,21 +35,26 @@ pub fn estimate_tokens(text: &str) -> usize {
     text.len().div_ceil(BYTES_PER_TOKEN)
 }
 
-/// Tokens kept free for the reply, including any reasoning, and for a round of feedback.
-fn reply_reserve(context_length: usize) -> usize {
-    (context_length / 4).clamp(1024, 8192)
+/// Tokens kept free for the reply, including any reasoning, and for a round of
+/// feedback: up to the output limit, but at most a quarter of the context, so a
+/// small context still has room for the changes.
+fn reply_reserve(context_length: usize, max_output_tokens: usize) -> usize {
+    (context_length / 4).min(max_output_tokens).max(1024)
 }
 
 /// The system prompt plus a user message describing `changes`, shortened to
-/// fit a context of `context_length` tokens.
+/// fit a context of `context_length` tokens with room for a reply of up to
+/// `max_output_tokens`.
 pub fn initial_messages(
     system_prompt: &str,
     changes: &Changes,
     hint: Option<&str>,
     context_length: usize,
+    max_output_tokens: usize,
 ) -> (Vec<Message>, Fit) {
     let system_prompt = system_prompt.trim();
-    let budget = context_length.saturating_sub(reply_reserve(context_length)) * BYTES_PER_TOKEN;
+    let reserve = reply_reserve(context_length, max_output_tokens);
+    let budget = context_length.saturating_sub(reserve) * BYTES_PER_TOKEN;
     let room = budget.saturating_sub(system_prompt.len() + FRAMING_BYTES);
     let (user, mut fit) = describe_changes(changes, hint, room);
     fit.prompt_tokens = estimate_tokens(system_prompt) + estimate_tokens(&user);
@@ -157,6 +162,7 @@ pub fn normalize(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::DEFAULT_MAX_OUTPUT_TOKENS as REPLY;
     use crate::git::Scope;
 
     fn changes(diff: &str) -> Changes {
@@ -187,8 +193,13 @@ mod tests {
 
     #[test]
     fn user_message_contains_hint_stat_and_diff() {
-        let (messages, fit) =
-            initial_messages("system", &changes(&diff(1)), Some(" fixes #12 "), 4096);
+        let (messages, fit) = initial_messages(
+            "system",
+            &changes(&diff(1)),
+            Some(" fixes #12 "),
+            4096,
+            REPLY,
+        );
         let user = &messages[1].content;
         assert!(user.starts_with("Notes from the author:\nfixes #12\n"));
         assert!(user.contains("src/main.rs | 2 +-"));
@@ -199,7 +210,7 @@ mod tests {
 
     #[test]
     fn shortens_changes_to_fit_the_context() {
-        let (messages, fit) = initial_messages("s", &changes(&diff(2000)), None, 4096);
+        let (messages, fit) = initial_messages("s", &changes(&diff(2000)), None, 4096, REPLY);
         let user = &messages[1].content;
         assert!(!fit.is_complete());
         assert!(user.contains("shortened to fit"));
@@ -208,7 +219,7 @@ mod tests {
         assert!(fit.prompt_tokens < 4096 - 1024);
         assert!(fit.full_tokens > 4096);
 
-        let (messages, fit) = initial_messages("s", &changes(""), None, 4096);
+        let (messages, fit) = initial_messages("s", &changes(""), None, 4096, REPLY);
         assert!(messages[1].content.contains("only excluded files"));
         assert!(fit.is_complete());
     }
@@ -224,7 +235,7 @@ mod tests {
             stat,
             diff: diff(10),
         };
-        let (messages, fit) = initial_messages("s", &changes, None, 4096);
+        let (messages, fit) = initial_messages("s", &changes, None, 4096, REPLY);
         let user = &messages[1].content;
         assert!(fit.list_lines_left_out > 0 && fit.list_lines_left_out < 3000);
         assert!(user.contains(&format!(
@@ -236,7 +247,7 @@ mod tests {
 
     #[test]
     fn refine_appends_current_message_and_feedback() {
-        let (base, _) = initial_messages("s", &changes("+x\n"), None, 4096);
+        let (base, _) = initial_messages("s", &changes("+x\n"), None, 4096, REPLY);
         let messages = refine_messages(&base, "feat: x", "shorter");
         assert_eq!(messages.len(), 4);
         assert_eq!(messages[2].content, "feat: x");

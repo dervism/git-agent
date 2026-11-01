@@ -68,6 +68,15 @@ pub struct SettingArgs {
     )]
     pub context_length: Option<usize>,
 
+    /// Most tokens the model may write in one reply, thinking included (sent to Anthropic)
+    #[arg(
+        long,
+        global = true,
+        env = "GIT_AGENT_MAX_OUTPUT_TOKENS",
+        value_name = "TOKENS"
+    )]
+    pub max_output_tokens: Option<usize>,
+
     /// Base URL of an OpenAI-compatible API, e.g. http://localhost:11434/v1
     #[arg(long, global = true, env = "GIT_AGENT_BASE_URL", value_name = "URL")]
     pub base_url: Option<String>,
@@ -85,9 +94,11 @@ pub struct SettingArgs {
 pub enum Command {
     /// List the models available on the configured server
     Models,
-    /// Create or inspect the config file
-    #[command(subcommand)]
-    Config(ConfigCommand),
+    /// Change the settings in an interactive menu, or create or inspect the config file
+    Config {
+        #[command(subcommand)]
+        command: Option<ConfigCommand>,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -133,5 +144,21 @@ mod tests {
         assert_eq!(cli.settings.model.as_deref(), Some("qwen3"));
         let cli = Cli::try_parse_from(["git-agent", "--context-length", "8192"]).unwrap();
         assert_eq!(cli.settings.context_length, Some(8192));
+    }
+
+    #[test]
+    fn config_opens_the_menu_without_a_subcommand() {
+        let cli = Cli::try_parse_from(["git-agent", "config"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Config { command: None })
+        ));
+        let cli = Cli::try_parse_from(["git-agent", "config", "show"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Config {
+                command: Some(ConfigCommand::Show)
+            })
+        ));
     }
 }

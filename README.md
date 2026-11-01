@@ -2,10 +2,10 @@
 
 [![crates.io](https://img.shields.io/crates/v/git-agent.svg)](https://crates.io/crates/git-agent)
 
-git-agent writes git commit messages for your changes using a local LLM served through
-an OpenAI-compatible API (LM Studio, Ollama, llama.cpp, vLLM, or a hosted provider).
-You review each proposed message, then commit it, edit it, regenerate it, or tell the
-model what to change.
+git-agent writes git commit messages for your changes with a language model, either
+one running on your own machine (LM Studio, Ollama, llama.cpp, vLLM) or one from a
+cloud provider such as OpenAI, Anthropic or OpenRouter. You review each proposed
+message, then commit it, edit it, regenerate it, or tell the model what to change.
 
 ## Why I made git-agent
 
@@ -119,32 +119,35 @@ leaves your branch as it was. Run `git pull --rebase`, resolve the conflicts, th
 
 git-agent sends your changes to the model server at `base_url`. By default that is
 `http://localhost:1234/v1`, the address of LM Studio running on your own machine.
-For another local server, such as Ollama, or for a cloud provider, change `base_url`
-(see [Configuration](#configuration)).
+To use another local server, such as Ollama, or a cloud provider, choose it in
+[`git agent config`](#changing-settings) or change `base_url` in the config file.
 
 ### Local servers
 
 With a local server, you don't have to configure a model. git-agent asks the server
 which model is loaded and uses that one. If several models are loaded, or none is and
-the server has more than one, git-agent asks you to pick one with `--model` or `model`
-in the config file. `git agent models` lists the server's models and marks the one
+the server has more than one, git-agent asks you to pick one with `git agent config`
+or `--model`. `git agent models` lists the server's models and marks the one
 git-agent uses.
 
 ### Cloud providers
 
-Any provider with an OpenAI-compatible API works. Your diffs then leave your machine
-and go to that provider. Point `base_url` at the provider's endpoint and pass your API
-key in the `GIT_AGENT_API_KEY` environment variable, which keeps it out of the config
-file:
+git-agent works with any provider that has an OpenAI-compatible API, and with
+Anthropic through its own Messages API. Your diffs then leave your machine and go to
+that provider.
 
-```sh
-export GIT_AGENT_API_KEY="your-api-key"
-```
+To set one up, run `git agent config`, choose Provider, and pick it from the list:
+OpenAI, Anthropic, OpenRouter, Google Gemini, Mistral, Groq, DeepSeek, xAI, Together
+AI, Fireworks AI or Cerebras. "Other" takes the address of any other OpenAI-compatible
+API. git-agent asks for your API key, then lists the provider's models for you to pick
+from. You can type to filter the list.
 
-Cloud providers offer many models and nothing is "loaded", so set `model` as well.
-Most providers also don't report a model's context window, so set `context_length`
-too. Without it, git-agent assumes 4,096 tokens and shortens large diffs much more
-than it needs to. In the config file:
+Most providers don't report a model's context window, so the menu asks for it after
+you pick a model. You'll find it on the provider's model page. Without it, git-agent
+assumes 4,096 tokens and shortens large diffs much more than it needs to. Anthropic
+and OpenRouter report it, so the menu doesn't ask for their models.
+
+You can also set the provider in the config file:
 
 ```toml
 base_url = "https://api.example.com/v1"   # the provider's OpenAI-compatible endpoint
@@ -152,15 +155,21 @@ model = "model-id"                        # an ID from `git agent models`
 context_length = 128000                   # from the provider's model documentation
 ```
 
-OpenRouter (`https://openrouter.ai/api/v1`) reports each model's context window, so
-you can leave out `context_length` there.
+### API keys
 
-### Context window
+git-agent never stores API keys in the config file. On macOS, `git agent config`
+saves each key in your keychain, under the name `git-agent` and the provider's host
+(such as `api.openai.com`), and git-agent reads it from there on every run. Each
+provider keeps its own key, so you can switch between them. After you install a new
+version of git-agent, macOS may ask whether git-agent can use the saved key; choose
+Always Allow.
 
-git-agent asks the server how large the model's context window is, so it knows how
-much of your changes it can send. LM Studio, Ollama, llama.cpp, vLLM and OpenRouter
-report it. For other servers, and for models that aren't loaded yet, git-agent
-assumes 4,096 tokens and tells you so. Set `context_length` to give it the real size.
+On other systems, set the `GIT_AGENT_API_KEY` environment variable. It also works on
+macOS, and like `--api-key`, it overrides a saved key:
+
+```sh
+export GIT_AGENT_API_KEY="your-api-key"
+```
 
 ## Large changes
 
@@ -170,6 +179,17 @@ the prompt uses:
 ```text
 🤖 google/gemma-4-e4b (loaded on the server) · prompt about 24,578 of 131,072 context tokens
 ```
+
+### Context window
+
+git-agent asks the server how large the model's context window is, so it knows how
+much of your changes it can send. LM Studio, Ollama, llama.cpp, vLLM, Anthropic and
+OpenRouter report it. For other servers, and for models that aren't loaded yet,
+git-agent assumes 4,096 tokens and tells you so. Set `context_length` to give it the
+real size.
+
+Large prompts take longer to process. To keep them smaller, set `context_length`
+below the model's real context.
 
 ### How git-agent shortens a diff
 
@@ -197,10 +217,41 @@ The message may then miss details from the shortened files. For a better message
 commit in smaller parts: stage some of the files, run `git agent`, and repeat.
 Loading the model with a larger context also helps.
 
-Large prompts take longer to process. To keep them smaller, set `context_length`
-below the model's real context.
-
 ## Configuration
+
+### Changing settings
+
+Run `git agent config` to change settings in a menu:
+
+```text
+git-agent settings · ~/.config/git-agent/config.toml
+? Setting:
+> Provider        LM Studio · http://localhost:1234/v1
+  Model           automatic: the model loaded on the server
+  API key         none (local servers usually need none)
+  Context length  automatic: asked from the server
+  Output limit    16,000 tokens (sent only to Anthropic)
+  Temperature     automatic: 0.4 on local servers
+  Timeout         300 seconds
+  Excluded files  common lockfiles
+  System prompt   default: Conventional Commits
+  Done
+```
+
+Move with the arrow keys and press Enter to change a setting. git-agent saves each
+change to the config file right away. Esc goes back one step, and quits from the main
+menu. Excluded files and the system prompt open in your git editor. The menu writes
+the same commented file as `git agent config init`, so comments you added to the file
+yourself are not kept.
+
+These commands work with the settings too:
+
+```sh
+git agent config            # change settings in a menu
+git agent config init       # write a commented config file with the defaults
+git agent config show       # print the effective settings
+git agent models            # list models on the server; * marks the one git-agent uses
+```
 
 ### Where settings come from
 
@@ -211,11 +262,7 @@ Settings come from these sources, and later ones override earlier ones:
 3. Environment variables
 4. Command-line flags
 
-```sh
-git agent config init       # write a commented config file with the defaults
-git agent config show       # print the effective settings
-git agent models            # list models on the server; * marks the one git-agent uses
-```
+API keys come from `--api-key`, then `GIT_AGENT_API_KEY`, then the macOS keychain.
 
 ### Settings
 
@@ -223,13 +270,32 @@ git agent models            # list models on the server; * marks the one git-age
 | --- | --- | --- | --- |
 | `base_url` | `--base-url` | `GIT_AGENT_BASE_URL` | `http://localhost:1234/v1` |
 | `model` | `-m`, `--model` | `GIT_AGENT_MODEL` | the model loaded on the server |
+| (API key) | `--api-key` | `GIT_AGENT_API_KEY` | the macOS keychain, never the file |
 | `context_length` | `--context-length` | `GIT_AGENT_CONTEXT_LENGTH` | reported by the server, or 4096 |
-| `api_key` | `--api-key` | `GIT_AGENT_API_KEY` | none |
-| `temperature` | `-t`, `--temperature` | | `0.4` |
+| `max_output_tokens` | `--max-output-tokens` | `GIT_AGENT_MAX_OUTPUT_TOKENS` | `16000` |
+| `temperature` | `-t`, `--temperature` | | 0.4 on local servers, else the provider's default |
 | `timeout_secs` | | | `300` |
 | `exclude` | | | common lockfiles |
 | `system_prompt` | | | Conventional Commits instructions |
 | (file location) | `--config` | `GIT_AGENT_CONFIG` | see above |
+
+### Temperature
+
+On local servers, git-agent uses a temperature of 0.4 unless you set another one,
+because a low temperature gives more predictable messages. Many cloud models accept
+only their default temperature and reject requests that set another one, so with a
+cloud provider git-agent sends a temperature only if you set one. When you switch to a
+cloud provider, the menu offers to stop sending it. Anthropic's API takes no
+temperature, so git-agent never sends one there.
+
+### Output limit
+
+Anthropic's API needs a limit on how many tokens the model may write in one reply.
+git-agent asks for at most 16,000, which leaves current models plenty of room to think
+before they write the message. To change it, use "Output limit" in `git agent config`,
+`max_output_tokens` in the config file, or `--max-output-tokens`. Much higher limits
+can make a reply take longer than the timeout. OpenAI-compatible servers use their own
+limit.
 
 ### Using another model for one run
 

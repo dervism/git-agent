@@ -120,23 +120,6 @@ impl Repo {
         Ok(self.workdir.join(path.trim_end_matches(['\n', '\r'])))
     }
 
-    /// Opens `path` in the editor git would use (GIT_EDITOR, core.editor, VISUAL, EDITOR).
-    pub fn edit_file(&self, path: &Path) -> Result<()> {
-        let editor = self.git(&["var", "GIT_EDITOR"])?.trim().to_owned();
-        // Launched the way git does it, so editors configured with arguments work.
-        let status = Command::new("sh")
-            .arg("-c")
-            .arg(format!("{editor} \"$@\""))
-            .arg(&editor)
-            .arg(path)
-            .status()
-            .with_context(|| format!("failed to start editor `{editor}`"))?;
-        if !status.success() {
-            bail!("editor `{editor}` exited with {status}");
-        }
-        Ok(())
-    }
-
     /// Commits with `message`. If git fails (e.g. a hook rejects the commit),
     /// the message is left on disk so it isn't lost.
     pub fn commit(&self, message: &str, scope: Scope, extra_args: &[String]) -> Result<()> {
@@ -255,6 +238,34 @@ impl Repo {
             ),
         }
     }
+}
+
+/// Opens `path` in the editor git would use (GIT_EDITOR, core.editor, VISUAL, EDITOR).
+/// Works outside a repository too, with the user's global git settings.
+pub fn edit_file(path: &Path) -> Result<()> {
+    let output = Command::new("git")
+        .args(["var", "GIT_EDITOR"])
+        .output()
+        .context("failed to run git; is it installed?")?;
+    if !output.status.success() {
+        bail!(
+            "`git var GIT_EDITOR` failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    let editor = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    // Launched the way git does it, so editors configured with arguments work.
+    let status = Command::new("sh")
+        .arg("-c")
+        .arg(format!("{editor} \"$@\""))
+        .arg(&editor)
+        .arg(path)
+        .status()
+        .with_context(|| format!("failed to start editor `{editor}`"))?;
+    if !status.success() {
+        bail!("editor `{editor}` exited with {status}");
+    }
+    Ok(())
 }
 
 /// Pathspecs that leave `patterns` out of a diff, matched from the repository root.

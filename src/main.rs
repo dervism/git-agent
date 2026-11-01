@@ -2,9 +2,12 @@ mod cli;
 mod config;
 mod fit;
 mod git;
-mod llm;
+mod menu;
 mod models;
 mod prompt;
+mod providers;
+mod secrets;
+mod server;
 mod ui;
 
 use anyhow::{Context, Result, bail};
@@ -15,7 +18,7 @@ use fit::Kept;
 use git::{Repo, Scope};
 use models::{ContextSource, Model, Pick};
 use prompt::Fit;
-use std::fs;
+use server::{Message, ModelServer, Server};
 use std::io::{self, IsTerminal};
 use std::process::ExitCode;
 use ui::{Action, thousands};
@@ -26,8 +29,13 @@ async fn main() -> ExitCode {
     let result = match cli.command {
         None => generate(&cli.generate, &cli.settings).await,
         Some(Command::Models) => list_models(&cli.settings).await,
-        Some(Command::Config(ConfigCommand::Init { force })) => init_config(&cli.settings, force),
-        Some(Command::Config(ConfigCommand::Show)) => show_config(&cli.settings),
+        Some(Command::Config { command: None }) => menu::run(&cli.settings).await,
+        Some(Command::Config {
+            command: Some(ConfigCommand::Init { force }),
+        }) => init_config(&cli.settings, force),
+        Some(Command::Config {
+            command: Some(ConfigCommand::Show),
+        }) => show_config(&cli.settings),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
@@ -70,16 +78,20 @@ async fn generate(args: &GenerateArgs, settings: &SettingArgs) -> Result<()> {
         )));
     }
 
-    let client = llm::Client::new(&config)?;
-    let model = models::resolve(&client, &config).await?;
+    let server = Server::connect(&config)?;
+    if config.temperature.is_some() && !server.takes_temperature() {
+        ui::warn("Anthropic's API takes no temperature, so git-agent doesn't send the one you set");
+    }
+    let model = models::resolve(&server, &config).await?;
     let (conversation, fit) = prompt::initial_messages(
         &config.system_prompt,
         &changes,
         args.hint.as_deref(),
         model.context_length,
+        config.max_output_tokens,
     );
     report_fit(&model, &fit);
-    let mut message = generate_message(&client, &model, &conversation).await?;
+    let mut message = generate_message(&server, &model, &conversation).await?;
 
     if args.raw {
         println!("{message}");
@@ -117,12 +129,12 @@ async fn generate(args: &GenerateArgs, settings: &SettingArgs) -> Result<()> {
                 return Ok(());
             }
             Action::Edit => ui::edit_message(&repo, &message),
-            Action::Regenerate => generate_message(&client, &model, &conversation)
+            Action::Regenerate => generate_message(&server, &model, &conversation)
                 .await
                 .map(Some),
             Action::Refine(feedback) => {
                 let refined = prompt::refine_messages(&conversation, &message, &feedback);
-                generate_message(&client, &model, &refined).await.map(Some)
+                generate_message(&server, &model, &refined).await.map(Some)
             }
         };
         // A failed edit or generation keeps the current message so the review can go on.
@@ -234,13 +246,13 @@ fn first_few(items: &[String]) -> String {
 }
 
 async fn generate_message(
-    client: &llm::Client,
+    server: &impl ModelServer,
     model: &Model,
-    conversation: &[llm::Message],
+    conversation: &[Message],
 ) -> Result<String> {
     let reply = {
         let _spinner = ui::Spinner::start(format!("Generating with {}", model.id));
-        client.complete(&model.id, conversation).await?
+        server.complete(&model.id, conversation).await?
     };
     let message = prompt::clean_response(&reply);
     if message.is_empty() {
@@ -287,7 +299,7 @@ fn push(repo: &Repo, ask: bool) -> Result<()> {
 
 async fn list_models(settings: &SettingArgs) -> Result<()> {
     let config = Config::load(settings)?.config;
-    let models = models::list(&llm::Client::new(&config)?).await?;
+    let models = Server::connect(&config)?.models().await?;
     let chosen = match &config.model {
         Some(model) => Some(model.clone()),
         None => models::choose(models.clone()).ok().map(|model| model.id),
@@ -325,8 +337,8 @@ async fn list_models(settings: &SettingArgs) -> Result<()> {
         _ => {}
     }
     ui::info(ui::dim(
-        "* marks the model git-agent uses: the one set with --model, GIT_AGENT_MODEL or \
-         `model` in the config file,\n  or else the one loaded on the server.",
+        "* marks the model git-agent uses: the one set with `git agent config`, --model or \
+         GIT_AGENT_MODEL,\n  or else the one loaded on the server.",
     ));
     Ok(())
 }
@@ -342,11 +354,7 @@ fn init_config(settings: &SettingArgs, force: bool) -> Result<()> {
     }
     let mut config = Config::default();
     config.apply(settings);
-    if let Some(dir) = path.parent() {
-        fs::create_dir_all(dir).with_context(|| format!("failed to create {}", dir.display()))?;
-    }
-    fs::write(&path, config::template(&config))
-        .with_context(|| format!("failed to write {}", path.display()))?;
+    config.save(&path)?;
     ui::info(format!("Wrote {}", path.display()));
     Ok(())
 }
@@ -368,6 +376,15 @@ fn show_config(settings: &SettingArgs) -> Result<()> {
             models::FALLBACK_CONTEXT_LENGTH
         );
     }
-    print!("\n{}", toml::to_string_pretty(&loaded.config.redacted())?);
+    let flag_key = settings
+        .api_key
+        .as_deref()
+        .is_some_and(|key| !key.trim().is_empty());
+    match (flag_key, loaded.config.api_key.is_some()) {
+        (true, _) => println!("# API key: from --api-key or GIT_AGENT_API_KEY."),
+        (false, true) => println!("# API key: saved in the macOS keychain."),
+        (false, false) => println!("# API key: none."),
+    }
+    print!("\n{}", toml::to_string_pretty(&loaded.config)?);
     Ok(())
 }

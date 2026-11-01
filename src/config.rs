@@ -2,8 +2,11 @@
 //!
 //! Later sources win: built-in defaults, then the config file, then
 //! environment variables and command-line flags (both parsed by clap, see `cli.rs`).
+//! API keys never come from the file: they come from a flag, the environment,
+//! or the macOS keychain (see `secrets.rs`).
 
 use crate::cli::SettingArgs;
+use crate::{providers, secrets};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::env;
@@ -12,8 +15,15 @@ use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
 pub const DEFAULT_BASE_URL: &str = "http://localhost:1234/v1";
-pub const DEFAULT_TEMPERATURE: f32 = 0.4;
 pub const DEFAULT_TIMEOUT_SECS: u64 = 300;
+/// Most tokens a model may write in one reply, thinking included. Enough for the
+/// thinking current models do before a commit message, and small enough for a
+/// reply that isn't streamed.
+pub const DEFAULT_MAX_OUTPUT_TOKENS: usize = 16_000;
+/// Smallest output limit: a commit message and a little thinking.
+pub const MIN_OUTPUT_TOKENS: usize = 1024;
+/// git-agent's temperature on local servers: low, for predictable messages.
+pub const LOCAL_TEMPERATURE: f32 = 0.4;
 /// Smallest usable context: the system prompt, a little of the diff, and the reply.
 pub const MIN_CONTEXT_LENGTH: usize = 2048;
 
@@ -52,10 +62,16 @@ pub struct Config {
     /// `None` uses the model loaded on the server.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// From `--api-key`, `GIT_AGENT_API_KEY` or the keychain, never from the file.
+    #[serde(skip)]
     pub api_key: Option<String>,
-    pub temperature: f32,
+    /// `None` means [`LOCAL_TEMPERATURE`] on local servers and the provider's
+    /// default in the cloud (see [`Config::effective_temperature`]).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub temperature: Option<f32>,
     pub timeout_secs: u64,
+    /// Sent to Anthropic, whose API needs a limit. OpenAI-compatible servers use their own.
+    pub max_output_tokens: usize,
     /// The model's context window in tokens. `None` asks the server.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub context_length: Option<usize>,
@@ -69,8 +85,9 @@ impl Default for Config {
             base_url: DEFAULT_BASE_URL.to_owned(),
             model: None,
             api_key: None,
-            temperature: DEFAULT_TEMPERATURE,
+            temperature: None,
             timeout_secs: DEFAULT_TIMEOUT_SECS,
+            max_output_tokens: DEFAULT_MAX_OUTPUT_TOKENS,
             context_length: None,
             exclude: DEFAULT_EXCLUDE.iter().map(|s| s.to_string()).collect(),
             system_prompt: DEFAULT_SYSTEM_PROMPT.to_owned(),
@@ -89,7 +106,7 @@ impl Config {
     pub fn load(args: &SettingArgs) -> Result<Loaded> {
         let path = resolve_path(args);
         let file = match &path {
-            Some(path) => Self::read(path)?,
+            Some(path) => Self::read_file(path)?,
             None => None,
         };
         if file.is_none() && args.config.is_some() {
@@ -98,6 +115,9 @@ impl Config {
         let file_found = file.is_some();
         let mut config = file.unwrap_or_default();
         config.apply(args);
+        if config.api_key.is_none() {
+            config.api_key = secrets::get(&config.base_url)?;
+        }
         config.validate()?;
         Ok(Loaded {
             config,
@@ -106,7 +126,8 @@ impl Config {
         })
     }
 
-    fn read(path: &Path) -> Result<Option<Self>> {
+    /// The settings in the file at `path`, or `None` if there is no file.
+    pub fn read_file(path: &Path) -> Result<Option<Self>> {
         let text = match fs::read_to_string(path) {
             Ok(text) => text,
             Err(err) if err.kind() == ErrorKind::NotFound => return Ok(None),
@@ -130,10 +151,13 @@ impl Config {
             self.api_key = Some(api_key.clone());
         }
         if let Some(temperature) = args.temperature {
-            self.temperature = temperature;
+            self.temperature = Some(temperature);
         }
         if let Some(context_length) = args.context_length {
             self.context_length = Some(context_length);
+        }
+        if let Some(tokens) = args.max_output_tokens {
+            self.max_output_tokens = tokens;
         }
         self.model = self.model.take().filter(|model| !model.trim().is_empty());
         self.api_key = self.api_key.take().filter(|key| !key.trim().is_empty());
@@ -145,27 +169,42 @@ impl Config {
         {
             bail!("context_length must be at least {MIN_CONTEXT_LENGTH} tokens (got {tokens})");
         }
+        if self.max_output_tokens < MIN_OUTPUT_TOKENS {
+            bail!(
+                "max_output_tokens must be at least {MIN_OUTPUT_TOKENS} tokens (got {})",
+                self.max_output_tokens
+            );
+        }
         if !(self.base_url.starts_with("http://") || self.base_url.starts_with("https://")) {
             bail!(
                 "base_url must start with http:// or https:// (got {:?})",
                 self.base_url
             );
         }
-        if !(0.0..=2.0).contains(&self.temperature) {
-            bail!(
-                "temperature must be between 0.0 and 2.0 (got {})",
-                self.temperature
-            );
+        if let Some(temperature) = self.temperature
+            && !(0.0..=2.0).contains(&temperature)
+        {
+            bail!("temperature must be between 0.0 and 2.0 (got {temperature})");
         }
         Ok(())
     }
 
-    /// A copy that is safe to print.
-    pub fn redacted(&self) -> Self {
-        Self {
-            api_key: self.api_key.as_ref().map(|_| "<redacted>".to_owned()),
-            ..self.clone()
+    /// The temperature to send: the configured one, else git-agent's own on a
+    /// local server. Cloud models get their provider's default, which many of
+    /// them require.
+    pub fn effective_temperature(&self) -> Option<f32> {
+        let local = providers::is_local(&self.base_url).then_some(LOCAL_TEMPERATURE);
+        self.temperature.or(local)
+    }
+
+    /// Writes the settings to `path` as a commented file, creating its directory.
+    pub fn save(&self, path: &Path) -> Result<()> {
+        if let Some(dir) = path.parent() {
+            fs::create_dir_all(dir)
+                .with_context(|| format!("failed to create {}", dir.display()))?;
         }
+        fs::write(path, template(self))
+            .with_context(|| format!("failed to write {}", path.display()))
     }
 }
 
@@ -188,7 +227,7 @@ fn default_path() -> Option<PathBuf> {
     Some(config_dir.join("git-agent").join("config.toml"))
 }
 
-/// A commented config file containing `config`'s values. The API key is never written.
+/// A commented config file containing `config`'s values.
 pub fn template(config: &Config) -> String {
     let exclude: String = config
         .exclude
@@ -208,15 +247,21 @@ pub fn template(config: &Config) -> String {
         Some(tokens) => format!("context_length = {tokens}"),
         None => "# context_length = 32768".to_owned(),
     };
+    let temperature = match config.temperature {
+        Some(temperature) => format!("temperature = {temperature}"),
+        None => "# temperature = 0.4".to_owned(),
+    };
     format!(
         r#"# git-agent configuration
 #
-# Command-line flags and environment variables override these values.
+# Change these settings with `git agent config`, or edit this file. Command-line
+# flags and environment variables override these values.
 
 # Base URL of an OpenAI-compatible API, including the /v1 suffix.
 #   LM Studio:  http://localhost:1234/v1
 #   Ollama:     http://localhost:11434/v1
-#   llama.cpp:  http://localhost:8080/v1
+#   OpenAI:     https://api.openai.com/v1
+# `git agent config` lists more providers.
 # Overridden by --base-url / GIT_AGENT_BASE_URL.
 base_url = {base_url}
 
@@ -225,21 +270,29 @@ base_url = {base_url}
 # Overridden by --model / GIT_AGENT_MODEL.
 {model}
 
-# API key sent as a Bearer token. Local servers usually don't need one.
-# Prefer the GIT_AGENT_API_KEY environment variable to storing it here.
-# api_key = ""
+# API keys are never stored in this file. On macOS, `git agent config` saves
+# them in the keychain. Otherwise, set the GIT_AGENT_API_KEY environment variable.
 
 # Sampling temperature from 0.0 to 2.0. Lower values give more predictable
-# messages, higher values more varied ones when regenerating.
-temperature = {temperature}
+# messages. When it isn't set, git-agent uses {local_temperature} on local servers and
+# leaves it to the provider in the cloud, since many cloud models accept only
+# their default. Anthropic's API takes no temperature at all.
+{temperature}
 
 # Seconds to wait for the model to answer.
 timeout_secs = {timeout_secs}
 
+# Most tokens the model may write in one reply, thinking included. git-agent
+# sends it to Anthropic, whose API needs a limit; OpenAI-compatible servers use
+# their own. It is also the most room git-agent keeps free for the reply. Much
+# higher values can make a reply take longer than `timeout_secs`.
+# Overridden by --max-output-tokens / GIT_AGENT_MAX_OUTPUT_TOKENS.
+max_output_tokens = {max_output_tokens}
+
 # The model's context window in tokens. git-agent shortens large diffs to fit
 # it, leaving room for the reply. When it isn't set, git-agent asks the server
-# (LM Studio, Ollama, llama.cpp and vLLM report it) or assumes {fallback}
-# tokens. Set it if your server doesn't report it, or lower it to keep prompts
+# (LM Studio, Ollama, llama.cpp, vLLM, Anthropic and OpenRouter report it) or
+# assumes {fallback} tokens. Set it if your server doesn't report it, or lower it to keep prompts
 # small and fast.
 # Overridden by --context-length / GIT_AGENT_CONTEXT_LENGTH.
 {context_length}
@@ -254,8 +307,9 @@ exclude = [
 system_prompt = {system_prompt}
 "#,
         base_url = toml_string(&config.base_url),
-        temperature = config.temperature,
         timeout_secs = config.timeout_secs,
+        max_output_tokens = config.max_output_tokens,
+        local_temperature = LOCAL_TEMPERATURE,
         fallback = crate::models::FALLBACK_CONTEXT_LENGTH,
     )
 }
@@ -282,11 +336,38 @@ mod tests {
 
         let config = Config {
             model: Some("qwen/qwen3-8b".into()),
+            temperature: Some(0.4),
             context_length: Some(32768),
+            max_output_tokens: 32000,
             exclude: vec!["*.min.js".into(), "docs/generated/**".into()],
             ..config
         };
         assert_eq!(round_trip(&config), config);
+    }
+
+    #[test]
+    fn never_reads_or_writes_api_keys() {
+        assert!(toml::from_str::<Config>("api_key = \"sk-secret\"").is_err());
+        let config = Config {
+            api_key: Some("sk-secret".into()),
+            ..Config::default()
+        };
+        assert!(!template(&config).contains("sk-secret"));
+    }
+
+    #[test]
+    fn local_servers_get_git_agents_temperature() {
+        let cloud = |temperature| Config {
+            base_url: "https://api.openai.com/v1".into(),
+            temperature,
+            ..Config::default()
+        };
+        assert_eq!(
+            Config::default().effective_temperature(),
+            Some(LOCAL_TEMPERATURE)
+        );
+        assert_eq!(cloud(None).effective_temperature(), None);
+        assert_eq!(cloud(Some(0.7)).effective_temperature(), Some(0.7));
     }
 
     #[test]
@@ -312,12 +393,14 @@ mod tests {
             model: Some("other".into()),
             temperature: Some(1.0),
             context_length: Some(8192),
+            max_output_tokens: Some(4096),
             api_key: Some("  ".into()),
             ..SettingArgs::default()
         });
         assert_eq!(config.model.as_deref(), Some("other"));
-        assert_eq!(config.temperature, 1.0);
+        assert_eq!(config.temperature, Some(1.0));
         assert_eq!(config.context_length, Some(8192));
+        assert_eq!(config.max_output_tokens, 4096);
         assert_eq!(config.api_key, None);
         assert_eq!(config.base_url, DEFAULT_BASE_URL);
 
@@ -332,7 +415,7 @@ mod tests {
     #[test]
     fn validates_settings() {
         let bad_temperature = Config {
-            temperature: 3.0,
+            temperature: Some(3.0),
             ..Config::default()
         };
         assert!(bad_temperature.validate().is_err());
@@ -346,6 +429,11 @@ mod tests {
             ..Config::default()
         };
         assert!(tiny_context.validate().is_err());
+        let tiny_output = Config {
+            max_output_tokens: 100,
+            ..Config::default()
+        };
+        assert!(tiny_output.validate().is_err());
         assert!(Config::default().validate().is_ok());
     }
 }

@@ -2,7 +2,7 @@
 //!
 //! The commit message goes to stdout; status, warnings and prompts go to stderr.
 
-use crate::git::Repo;
+use crate::git::{self, Repo};
 use crate::prompt;
 use anyhow::{Context, Result};
 use std::fmt::Display;
@@ -221,7 +221,7 @@ pub fn edit_message(repo: &Repo, message: &str) -> Result<Option<String>> {
     let path = repo.git_path("COMMIT_EDITMSG")?;
     fs::write(&path, format!("{message}\n\n{EDIT_HELP}"))
         .with_context(|| format!("failed to write {}", path.display()))?;
-    repo.edit_file(&path)?;
+    git::edit_file(&path)?;
     let edited =
         fs::read_to_string(&path).with_context(|| format!("failed to read {}", path.display()))?;
     let edited = strip_comments(&edited);

@@ -98,17 +98,3 @@ descriptions, reviews or a branch's history.
 `git agent hook install` installs a hook that fills in the message for commits made
 from any editor or git GUI. That covers the lightweight code editors git-agent is
 meant to work with, without opening a terminal. Not a priority for now.
-
-## Where to start
-
-1. `git agent pr` is small and useful, and it reuses nearly everything git-agent
-   already has. (DONE)
-2. The commit hook is also small, and it makes the main feature work in every editor.
-   (PARKED)
-3. `git agent split` is the biggest IDE-style feature, and it handles large changes
-   better than shortening the diff. It is also harder: staging individual hunks with
-   `git apply --cached` is fiddly, and local models must group hunks reliably. It
-   needs a short design first. (DONE)
-
-The secret check had to come before any feature that sends more data to cloud
-providers. (DONE)

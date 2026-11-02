@@ -917,6 +917,67 @@ impl Repo {
     }
 }
 
+/// Turns hooks off for the commands git-agent runs on its own behalf, such as
+/// a rebase in a temporary worktree; git passes it on to the commands those run.
+const NO_HOOKS: &str = "core.hooksPath=/dev/null";
+
+/// Runs the interactive rebase of the worktree at `dir` with `todo_path` as
+/// its list, and returns the new HEAD. A failed rebase is aborted.
+fn rebase(dir: &Path, base: Option<&str>, todo_path: &Path) -> Result<String> {
+    let mut command = Command::new("git");
+    command.current_dir(dir).args([
+        "-c",
+        NO_HOOKS,
+        "-c",
+        "rebase.updateRefs=false",
+        "rebase",
+        "--interactive",
+        "--empty=keep",
+    ]);
+    match base {
+        Some(base) => command.arg(base),
+        None => command.arg("--root"),
+    };
+    // The "editor" puts git-agent's list in place of the one git wrote.
+    let editor = format!("cp {}", shell_quote(&todo_path.to_string_lossy()));
+    let output = command
+        .env("GIT_SEQUENCE_EDITOR", editor)
+        .env("GIT_EDITOR", "true")
+        .output()
+        .context("failed to run git rebase")?;
+    if !output.status.success() {
+        let _ = Command::new("git")
+            .current_dir(dir)
+            .args(["rebase", "--abort"])
+            .output();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let conflicts: Vec<&str> = stdout
+            .lines()
+            .chain(stderr.lines())
+            .filter(|line| line.starts_with("CONFLICT"))
+            .collect();
+        if conflicts.is_empty() {
+            bail!("`git rebase` failed: {}", stderr.trim());
+        }
+        bail!(
+            "moving the commits as planned runs into conflicts:\n  {}",
+            conflicts.join("\n  ")
+        );
+    }
+    let head = Command::new("git")
+        .current_dir(dir)
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .context("failed to run git rev-parse")?;
+    Ok(String::from_utf8_lossy(&head.stdout).trim().to_owned())
+}
+
+/// `text` quoted for a POSIX shell.
+pub fn shell_quote(text: &str) -> String {
+    format!("'{}'", text.replace('\'', r"'\''"))
+}
+
 /// Opens `path` in the editor git would use (GIT_EDITOR, core.editor, VISUAL, EDITOR).
 /// Works outside a repository too, with the user's global git settings.
 pub fn edit_file(path: &Path) -> Result<()> {

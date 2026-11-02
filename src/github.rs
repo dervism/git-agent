@@ -1,9 +1,18 @@
-//! Pull requests through the GitHub CLI (`gh`), which brings its own login.
+//! Pull requests and issues through the GitHub CLI (`gh`), which brings its own login.
 
 use anyhow::{Context, Result, anyhow, bail};
 use std::io::{self, ErrorKind, Write};
 use std::path::Path;
 use std::process::{Command, Stdio};
+
+/// A GitHub issue, as `gh issue view` reports it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Issue {
+    pub number: u64,
+    pub title: String,
+    pub body: String,
+    pub labels: Vec<String>,
+}
 
 /// A pull request to create.
 pub struct PullRequest<'a> {
@@ -27,8 +36,8 @@ fn gh(dir: &Path, args: &[&str]) -> Command {
 fn start_error(err: io::Error) -> anyhow::Error {
     if err.kind() == ErrorKind::NotFound {
         anyhow!(
-            "git agent pr creates pull requests with the GitHub CLI, which is not installed; \
-             get it from https://cli.github.com, then run `gh auth login`"
+            "git-agent works with GitHub through the GitHub CLI, which is not installed; get it \
+             from https://cli.github.com, then run `gh auth login`"
         )
     } else {
         anyhow::Error::new(err).context("failed to run gh")
@@ -66,6 +75,38 @@ pub fn default_branch(dir: &Path) -> Result<String> {
         bail!("GitHub reported no default branch; name the base branch with --base");
     }
     Ok(name)
+}
+
+/// The issue `reference` names: a number, or an issue's URL.
+pub fn issue(dir: &Path, reference: &str) -> Result<Issue> {
+    let json = output(
+        dir,
+        &[
+            "issue",
+            "view",
+            reference,
+            "--json",
+            "number,title,body,labels",
+        ],
+    )?;
+    parse_issue(&json).with_context(|| format!("could not read issue {reference} from gh"))
+}
+
+fn parse_issue(json: &str) -> Result<Issue> {
+    let value: serde_json::Value = serde_json::from_str(json)?;
+    let text = |key: &str| value[key].as_str().unwrap_or_default().to_owned();
+    let labels = value["labels"].as_array().map_or_else(Vec::new, |labels| {
+        labels
+            .iter()
+            .filter_map(|label| label["name"].as_str().map(str::to_owned))
+            .collect()
+    });
+    Ok(Issue {
+        number: value["number"].as_u64().context("no issue number")?,
+        title: text("title"),
+        body: text("body"),
+        labels,
+    })
 }
 
 /// The URL of `branch`'s open pull request, if it has one.
@@ -125,4 +166,24 @@ pub fn create_pull_request(dir: &Path, pull_request: &PullRequest) -> Result<()>
         bail!("`gh pr create` failed ({status})");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reads_an_issue() {
+        let json = r#"{"body":"It hangs.","labels":[{"id":"x","name":"bug"},{"name":"auth"}],"number":42,"title":"Login times out"}"#;
+        assert_eq!(
+            parse_issue(json).unwrap(),
+            Issue {
+                number: 42,
+                title: "Login times out".into(),
+                body: "It hangs.".into(),
+                labels: vec!["bug".into(), "auth".into()],
+            }
+        );
+        assert!(parse_issue("{}").is_err());
+    }
 }

@@ -1,0 +1,183 @@
+---
+// Adapted from Tailwind Plus marketing-v4/sections/bento-grids/03-two-row-bento-grid-with-three-column-second-row.
+// Each screenshot is replaced by a small, moving picture of the command.
+import BentoCard from './BentoCard.astro'
+import Icon from './Icon.astro'
+
+const keys = [
+  ['c', 'commit'],
+  ['p', 'push'],
+  ['e', 'edit'],
+  ['r', 'regenerate'],
+  ['f', 'feedback'],
+  ['q', 'quit'],
+] as const
+const pullRequest = [
+  { text: 'feat(export): add CSV export', tone: 'font-medium text-white' },
+  { text: ' ', tone: '' },
+  { text: 'Adds CSV export for order lists, with an optional', tone: 'text-gray-300' },
+  { text: 'header row.', tone: 'text-gray-300' },
+  { text: ' ', tone: '' },
+  { text: '## Changes', tone: 'text-brand-300' },
+  { text: '- export_csv writes rows as CSV', tone: 'text-gray-400' },
+  { text: '- an optional header becomes the first line', tone: 'text-gray-400' },
+  { text: '- the README documents the export', tone: 'text-gray-400' },
+]
+const plan = [
+  {
+    title: 'Introduce LRU caching for configuration loading',
+    files: ['Cargo.toml', 'src/cache.rs', 'src/config.rs 1/3', 'README.md'],
+  },
+  { title: 'Refine config parsing logic and documentation', files: ['src/config.rs 2/3'] },
+]
+---
+
+<section id="features" aria-labelledby="features-heading" class="bg-white py-24 sm:py-32 dark:bg-gray-900">
+  <div class="mx-auto max-w-2xl px-6 lg:max-w-7xl lg:px-8">
+    <h2 id="features-heading" data-reveal class="text-base/7 font-semibold text-brand-600 dark:text-brand-300">
+      Features
+    </h2>
+    <p
+      data-reveal
+      style="--reveal-delay: 80ms"
+      class="mt-2 max-w-lg text-4xl font-semibold tracking-tight text-pretty text-gray-950 sm:text-5xl dark:text-white"
+    >
+      From the first commit to the pull request
+    </p>
+    <div class="mt-10 grid grid-cols-1 gap-4 sm:mt-16 lg:grid-cols-6 lg:grid-rows-2">
+      <BentoCard corner="top-left" eyebrow="Commit" title="Messages you review first">
+        <div
+          class="absolute inset-x-8 top-8 bottom-0 overflow-hidden rounded-t-xl bg-gray-950/70 p-6 font-mono text-[12px]/6 ring-1 ring-white/10"
+        >
+          <div class="text-gray-600">── Proposed commit message ──────────</div>
+          <div class="font-medium text-white">fix(parser): handle empty input</div>
+          <div>&nbsp;</div>
+          <div class="text-gray-400">Return an empty list when the input has no lines,</div>
+          <div class="text-gray-400">instead of failing on the first read.</div>
+          <div class="text-gray-600">─────────────────────────────────────</div>
+          <div class="mt-5 flex flex-wrap gap-2">
+            {
+              keys.map(([key, word], index) => (
+                <span
+                  class="animate-key rounded-md px-2 py-0.5 text-gray-400 ring-1 ring-white/10"
+                  style={`animation-delay: ${index * 1.2}s`}
+                >
+                  <span class="font-semibold">[{key}]</span>
+                  {word.slice(1)}
+                </span>
+              ))
+            }
+          </div>
+        </div>
+        <Fragment slot="description">
+          git-agent describes the staged changes and waits. Commit, push, edit the message in your editor, regenerate
+          it, or tell the model what to change.
+        </Fragment>
+      </BentoCard>
+
+      <BentoCard corner="top-right" eyebrow="Pull requests" title="Written from the branch, opened with gh" delay={100}>
+        <div
+          class="absolute top-8 right-0 bottom-0 left-8 overflow-hidden rounded-tl-xl bg-gray-950/70 shadow-2xl outline outline-white/10"
+        >
+          <div class="flex bg-gray-900 outline outline-white/5">
+            <div class="-mb-px flex text-sm/6 font-medium text-gray-400">
+              <div class="border-r border-b border-r-white/10 border-b-white/20 bg-white/5 px-4 py-2 text-white">
+                Proposed pull request
+              </div>
+              <div class="border-r border-gray-600/10 px-4 py-2">gh pr create</div>
+            </div>
+          </div>
+          <div class="px-6 pt-5 pb-14 font-mono text-[12px]/6 whitespace-pre">
+            {
+              pullRequest.map((line, index) => (
+                <div data-reveal style={`--reveal-delay: ${300 + index * 90}ms`} class={line.tone}>
+                  {line.text}
+                </div>
+              ))
+            }
+          </div>
+        </div>
+        <Fragment slot="description">
+          A title and description from the branch’s commits and diff. git-agent pushes the branch if GitHub lacks its
+          commits, then creates the pull request, as a draft if you like.
+        </Fragment>
+      </BentoCard>
+
+      <BentoCard corner="bottom-left" eyebrow="Branch" title="Named after the work" delay={0}>
+        <div class="flex h-full flex-col items-center justify-center gap-y-5 px-8 font-mono text-[13px]/6">
+          <div class="w-full max-w-xs rounded-lg bg-gray-950/70 px-4 py-2.5 text-gray-300 ring-1 ring-white/10">
+            <span class="text-brand-400">❯</span> git agent branch fix login timeout<span
+              class="ml-px inline-block h-4 w-2 translate-y-0.5 animate-blink bg-gray-300"></span>
+          </div>
+          <Icon name="ArrowRight" class="size-5 rotate-90 text-gray-600" />
+          <div
+            class="animate-float rounded-full bg-gray-200 px-4 py-1.5 font-semibold text-gray-900 shadow-[0_0_40px_-6px_var(--color-brand-300)]"
+          >
+            fix/login-timeout
+          </div>
+          <p class="text-center font-sans text-xs/5 text-gray-500">
+            Or <span class="font-mono text-gray-300">feature/PROJ-12-avatars</span> style, if that’s yours
+          </p>
+        </div>
+        <Fragment slot="description">
+          Describe the work, name a GitHub issue, or let your uncommitted changes speak for it. The name follows your
+          repository’s pattern.
+        </Fragment>
+      </BentoCard>
+
+      <BentoCard corner="bottom-middle" eyebrow="Split" title="One change, several commits" delay={100}>
+        <div class="flex h-full flex-col justify-center gap-y-4 px-8">
+          {
+            plan.map((commit, index) => (
+              <div
+                data-reveal
+                style={`--reveal-delay: ${250 + index * 200}ms`}
+                class="rounded-xl bg-gray-950/60 p-4 ring-1 ring-white/10"
+              >
+                <p class="text-sm/6 font-medium text-white">
+                  <span class="mr-2 text-gray-500">{index + 1}.</span>
+                  {commit.title}
+                </p>
+                <div class="mt-3 flex flex-wrap gap-1.5">
+                  {commit.files.map((file) => (
+                    <span class="rounded-md bg-white/5 px-2 py-0.5 font-mono text-[11px]/5 text-gray-400 ring-1 ring-white/10">
+                      {file}
+                    </span>
+                  ))}
+                </div>
+              </div>
+            ))
+          }
+        </div>
+        <Fragment slot="description">
+          The model groups hunks and files by what they are for. You review the plan, and each commit gets a message of
+          its own.
+        </Fragment>
+      </BentoCard>
+
+      <BentoCard corner="bottom-right" eyebrow="Tidy" title="A clean history before you push" delay={200}>
+        <div class="flex h-full flex-col justify-center px-8 font-mono text-[12.5px]/7">
+          <div class="rounded-xl bg-gray-950/60 p-5 ring-1 ring-white/10">
+            <div class="text-gray-300"><span class="inline-block w-16 text-gray-500">keep</span>feat: add csv export</div>
+            <div class="relative h-7">
+              <span class="inline-block w-16 text-brand-300">reword</span>
+              <span class="absolute left-16 animate-swap-out text-gray-500 line-through decoration-gray-600">wip</span>
+              <span class="absolute left-16 animate-swap-in font-medium text-white">feat(export): add a header row</span>
+            </div>
+            <div class="text-gray-400">
+              <span class="inline-block w-16 text-brand-300">fold</span><span class="text-gray-600">↳ </span>fix typo
+            </div>
+            <div class="text-gray-300">
+              <span class="inline-block w-16 text-gray-500">keep</span>docs: document the export
+            </div>
+          </div>
+          <p class="mt-4 text-center font-sans text-xs text-gray-500">6 commits become 4, with the same files</p>
+        </div>
+        <Fragment slot="description">
+          A commit named wip gets a real message, and fixes fold into the commits they fix. Only commits that aren’t
+          pushed yet are touched.
+        </Fragment>
+      </BentoCard>
+    </div>
+  </div>
+</section>

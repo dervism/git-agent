@@ -1,0 +1,46 @@
+---
+// Adapted from Tailwind Plus marketing-v4/sections/cta-sections/03-centered-on-dark-panel.
+import { url } from '../lib/paths'
+---
+
+<div class="bg-white dark:bg-gray-900">
+  <div class="mx-auto max-w-7xl py-24 sm:px-6 sm:py-32 lg:px-8">
+    <div
+      data-reveal
+      class="relative isolate overflow-hidden bg-gray-900 px-6 py-24 text-center shadow-2xl sm:rounded-3xl sm:px-16 dark:bg-gray-800 dark:shadow-none dark:after:pointer-events-none dark:after:absolute dark:after:inset-0 dark:after:inset-ring dark:after:inset-ring-white/10 dark:after:sm:rounded-3xl"
+    >
+      <h2 class="text-4xl font-semibold tracking-tight text-balance text-white sm:text-5xl">
+        Your next commit, <span class="text-sheen animate-shimmer">described for you</span>
+      </h2>
+      <p class="mx-auto mt-6 max-w-xl text-lg/8 text-pretty text-gray-300">
+        Free and open source under the MIT license. Bring the model you already run, or connect a cloud provider in
+        the settings menu.
+      </p>
+      <div class="mt-10 flex items-center justify-center gap-x-6">
+        <a
+          href={url('#install')}
+          class="rounded-md bg-white px-3.5 py-2.5 text-sm font-semibold text-gray-900 shadow-xs hover:bg-gray-100 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-white dark:bg-gray-200 dark:text-gray-900 dark:shadow-[0_0_40px_-8px_var(--color-brand-300)] dark:hover:bg-white dark:focus-visible:outline-white"
+        >
+          Install git-agent
+        </a>
+        <a href={url('docs/')} class="group text-sm/6 font-semibold text-white">
+          Read the documentation
+          <span aria-hidden="true" class="inline-block transition-transform group-hover:translate-x-1">→</span>
+        </a>
+      </div>
+      <svg
+        viewBox="0 0 1024 1024"
+        aria-hidden="true"
+        class="absolute top-1/2 left-1/2 -z-10 size-256 -translate-x-1/2 animate-drift mask-[radial-gradient(closest-side,white,transparent)]"
+      >
+        <circle r="512" cx="512" cy="512" fill="url(#cta-glow)" fill-opacity="0.7"></circle>
+        <defs>
+          <radialGradient id="cta-glow">
+            <stop stop-color="#4A5C6A"></stop>
+            <stop offset="1" stop-color="#253745"></stop>
+          </radialGradient>
+        </defs>
+      </svg>
+    </div>
+  </div>
+</div>

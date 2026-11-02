@@ -1,0 +1,215 @@
+---
+// The documentation: the repository's README, with a sidebar of its sections.
+import { execFileSync } from 'node:child_process'
+import { getEntry, render } from 'astro:content'
+import Layout from '../layouts/Layout.astro'
+import Header from '../components/Header.astro'
+import Footer from '../components/Footer.astro'
+import DocsNav from '../components/DocsNav.astro'
+import Icon from '../components/Icon.astro'
+import { crate, navigation, readmeSource, repository, version } from '../content/site'
+
+const readme = await getEntry('readme', 'readme')
+if (!readme) throw new Error('the README was not found next to the site')
+const { Content, headings } = await render(readme)
+
+// When the README last changed, if git can tell.
+let updated: string | undefined
+try {
+  // `:/` names the path from the top of the repository, wherever the build runs.
+  updated = execFileSync('git', ['log', '-1', '--format=%cs', '--', ':/README.md'], {
+    encoding: 'utf8',
+  }).trim()
+} catch {
+  updated = undefined
+}
+---
+
+<Layout
+  title="Documentation · git-agent"
+  description="How to install, use and configure git-agent: commit messages, branches, splits, tidy-ups, pull requests, explanations, models, secrets and settings."
+>
+  <Header navigation={navigation} repository={repository} current="docs/" />
+  <div aria-hidden="true" class="fixed inset-x-0 top-0 z-[60] h-0.5">
+    <div
+      data-progress
+      class="h-full origin-left scale-x-0 bg-linear-to-r from-brand-400 via-gray-200 to-white shadow-[0_0_12px_var(--color-brand-300)]"
+    >
+    </div>
+  </div>
+
+  <main id="top" class="relative isolate bg-white dark:bg-gray-900">
+    <div aria-hidden="true" class="pointer-events-none absolute inset-x-0 top-0 -z-10 h-[36rem] overflow-hidden">
+      <div class="grid-lines absolute inset-0"></div>
+      <div class="absolute -top-48 left-1/4 size-[40rem] animate-drift rounded-full bg-brand-700/25 blur-[120px]"></div>
+      <div class="absolute inset-x-0 bottom-0 h-40 bg-linear-to-t from-gray-900"></div>
+    </div>
+
+    <div class="mx-auto max-w-7xl px-6 pt-36 pb-16 sm:pt-44 lg:px-8">
+      <p data-reveal class="text-base/7 font-semibold text-brand-600 dark:text-brand-300">Documentation</p>
+      <h1
+        data-reveal
+        style="--reveal-delay: 80ms"
+        class="mt-2 max-w-3xl text-5xl font-semibold tracking-tight text-balance text-gray-900 sm:text-6xl dark:text-white"
+      >
+        Everything git-agent does, <span class="text-sheen animate-shimmer">and how to set it up</span>
+      </h1>
+      <div
+        data-reveal
+        style="--reveal-delay: 160ms"
+        class="mt-8 flex flex-wrap items-center gap-x-6 gap-y-3 text-sm/6 text-gray-500"
+      >
+        <span
+          class="rounded-full bg-brand-500/10 px-3 py-0.5 font-mono font-semibold text-brand-300 ring-1 ring-brand-400/25 ring-inset"
+        >
+          v{version}
+        </span>
+        {updated && <span>Updated {updated}</span>}
+        <a href={readmeSource} class="group inline-flex items-center gap-x-1.5 font-semibold text-gray-300 hover:text-white">
+          Edit on GitHub
+          <Icon name="ArrowRight" class="size-4 transition-transform group-hover:translate-x-0.5" />
+        </a>
+      </div>
+    </div>
+
+    <div class="mx-auto max-w-7xl px-6 pb-24 lg:grid lg:grid-cols-[15rem_minmax(0,1fr)] lg:gap-x-16 lg:px-8">
+      <aside class="hidden lg:block">
+        <div
+          data-sidebar
+          class="sticky top-28 max-h-[calc(100dvh-8rem)] overflow-y-auto overscroll-contain pr-2 pb-10"
+        >
+          <DocsNav headings={headings} label="Documentation" />
+        </div>
+      </aside>
+
+      <div class="min-w-0">
+        <details
+          class="group/contents sticky top-[5.25rem] z-30 mb-10 rounded-2xl bg-gray-900/80 ring-1 ring-white/10 backdrop-blur-xl lg:hidden"
+        >
+          <summary
+            class="flex cursor-pointer list-none items-center justify-between px-4 py-3 text-sm/6 font-semibold text-white [&::-webkit-details-marker]:hidden"
+          >
+            Contents
+            <Icon name="ChevronRight" class="size-5 text-gray-400 transition-transform group-open/contents:rotate-90" />
+          </summary>
+          <div class="max-h-[60dvh] overflow-y-auto px-4 pt-2 pb-5">
+            <DocsNav headings={headings} label="Contents" />
+          </div>
+        </details>
+
+        <article data-docs class="docs prose max-w-3xl prose-invert">
+          <Content />
+        </article>
+
+        <div
+          class="mt-20 flex max-w-3xl flex-wrap items-center justify-between gap-6 rounded-2xl bg-gray-800/50 px-6 py-5 ring-1 ring-white/10"
+        >
+          <p class="text-sm/6 text-gray-400">
+            This page is the project’s README. Something missing or unclear? Edit it on GitHub.
+          </p>
+          <div class="flex items-center gap-x-5">
+            <a href={readmeSource} class="text-sm/6 font-semibold text-white">
+              Edit the README <span aria-hidden="true">→</span>
+            </a>
+            <a href="#top" class="text-sm/6 font-semibold text-gray-400 hover:text-white">Back to top</a>
+          </div>
+        </div>
+      </div>
+    </div>
+  </main>
+  <Footer repository={repository} crate={crate} version={version} />
+</Layout>
+
+<script>
+  const article = document.querySelector<HTMLElement>('[data-docs]')!
+  const headings = [...article.querySelectorAll<HTMLElement>('h2[id], h3[id]')]
+  const links = [...document.querySelectorAll<HTMLAnchorElement>('[data-toc]')]
+  const sections = [...document.querySelectorAll<HTMLElement>('[data-toc-section]')]
+  const progress = document.querySelector<HTMLElement>('[data-progress]')!
+  const contents = document.querySelector('details')
+
+  // A link to each heading, shown on hover.
+  for (const heading of headings) {
+    const anchor = document.createElement('a')
+    anchor.href = `#${heading.id}`
+    anchor.className = 'heading-anchor'
+    anchor.setAttribute('aria-label', `Link to ${heading.textContent}`)
+    anchor.textContent = '#'
+    heading.append(anchor)
+  }
+
+  // A copy button and the language on each code block.
+  for (const pre of article.querySelectorAll<HTMLPreElement>('pre')) {
+    const frame = document.createElement('div')
+    frame.className = 'code-frame'
+    pre.replaceWith(frame)
+    frame.append(pre)
+    const language = pre.dataset.language
+    if (language && language !== 'plaintext' && language !== 'text') {
+      const label = document.createElement('span')
+      label.className = 'code-language'
+      label.textContent = language
+      frame.append(label)
+    }
+    const copy = document.createElement('button')
+    copy.type = 'button'
+    copy.className = 'code-copy'
+    copy.textContent = 'Copy'
+    copy.addEventListener('click', async () => {
+      await navigator.clipboard.writeText(pre.innerText.replace(/\n$/, ''))
+      copy.textContent = 'Copied'
+      copy.dataset.copied = ''
+      setTimeout(() => {
+        copy.textContent = 'Copy'
+        delete copy.dataset.copied
+      }, 1600)
+    })
+    frame.append(copy)
+  }
+
+  // The sidebar follows the reading position, and the bar at the top fills up.
+  const sidebar = document.querySelector<HTMLElement>('[data-sidebar]')
+  let shown: string | undefined
+  let frame = 0
+  const update = () => {
+    frame = 0
+    const scrollable = document.documentElement.scrollHeight - window.innerHeight
+    progress.style.transform = `scaleX(${scrollable > 0 ? Math.min(window.scrollY / scrollable, 1) : 0})`
+
+    let current: HTMLElement | undefined
+    let section: HTMLElement | undefined
+    for (const heading of headings) {
+      if (heading.getBoundingClientRect().top > 150) break
+      current = heading
+      if (heading.tagName === 'H2') section = heading
+    }
+    const open = section?.id ?? headings[0]?.id
+    for (const link of links) link.toggleAttribute('data-current', link.dataset.toc === current?.id)
+    for (const item of sections) item.toggleAttribute('data-open', item.dataset.tocSection === open)
+    if (current?.id !== shown) {
+      shown = current?.id
+      // Keep the current link in view in the sidebar, once its section has unfolded.
+      // Only the sidebar scrolls, so a scroll the reader started isn't interrupted.
+      const link = sidebar?.querySelector<HTMLElement>(`[data-toc="${shown}"]`)
+      if (sidebar && link) {
+        setTimeout(() => {
+          const area = sidebar.getBoundingClientRect()
+          const place = link.getBoundingClientRect()
+          if (place.top < area.top + 48 || place.bottom > area.bottom - 48) {
+            const top = sidebar.scrollTop + place.top - area.top - area.height / 3
+            sidebar.scrollTo({ top, behavior: 'smooth' })
+          }
+        }, 320)
+      }
+    }
+  }
+  const schedule = () => {
+    if (!frame) frame = requestAnimationFrame(update)
+  }
+  window.addEventListener('scroll', schedule, { passive: true })
+  window.addEventListener('resize', schedule)
+  update()
+
+  // On phones, picking a section closes the contents.
+  for (const link of links) link.addEventListener('click', () => contents?.removeAttribute('open'))
+</script>

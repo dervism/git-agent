@@ -1,0 +1,47 @@
+---
+import Layout from '../layouts/Layout.astro'
+import Header from '../components/Header.astro'
+import Hero from '../components/Hero.astro'
+import Providers from '../components/Providers.astro'
+import Features from '../components/Features.astro'
+import Explain from '../components/Explain.astro'
+import Safety from '../components/Safety.astro'
+import Install from '../components/Install.astro'
+import Cta from '../components/Cta.astro'
+import Footer from '../components/Footer.astro'
+import Divider from '../components/Divider.astro'
+import {
+  crate,
+  explainFeatures,
+  explainSamples,
+  installMethods,
+  navigation,
+  providers,
+  quickStart,
+  repository,
+  safetyFeatures,
+  scenes,
+  version,
+} from '../content/site'
+---
+
+<Layout
+  title="git-agent · Let a language model do your git chores"
+  description="git-agent writes commit messages, names branches, splits and tidies commits, and opens pull requests, with a local or cloud language model. You review every proposal."
+>
+  <Header navigation={navigation} repository={repository} />
+  <main>
+    <Hero version={version} repository={repository} scenes={scenes} />
+    <Providers providers={providers} />
+    <Divider />
+    <Features />
+    <Divider />
+    <Explain features={explainFeatures} samples={explainSamples} />
+    <Divider />
+    <Safety features={safetyFeatures} />
+    <Divider />
+    <Install methods={installMethods} steps={quickStart} />
+    <Cta />
+  </main>
+  <Footer repository={repository} crate={crate} version={version} />
+</Layout>

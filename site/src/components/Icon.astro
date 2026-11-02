@@ -1,0 +1,15 @@
+---
+import { icons, type IconName } from '../lib/icons'
+
+interface Props {
+  readonly name: IconName
+  readonly class?: string
+}
+
+const { name, class: className } = Astro.props
+const { paths, ...svg } = icons[name] as (typeof icons)[IconName] & { paths: readonly Record<string, string>[] }
+---
+
+<svg {...svg} aria-hidden="true" data-slot="icon" class={className}>
+  {paths.map((path) => <path {...path} />)}
+</svg>

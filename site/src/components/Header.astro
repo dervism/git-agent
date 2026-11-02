@@ -1,0 +1,125 @@
+---
+// Adapted from Tailwind Plus marketing-v4/elements/headers/02-constrained.
+// Headless UI's Dialog is a native <dialog>; the header turns to glass once the page scrolls.
+import Icon from './Icon.astro'
+import Logo from './Logo.astro'
+import { url } from '../lib/paths'
+import type { Link } from '../content/site'
+
+interface Props {
+  readonly navigation: readonly Link[]
+  readonly repository: string
+  /** The href of the page being shown, marked as current. */
+  readonly current?: string
+}
+
+const { navigation, repository, current } = Astro.props
+---
+
+<header
+  data-header
+  class="fixed inset-x-0 top-0 z-50 border-b border-transparent bg-white/0 transition-[background-color,border-color,backdrop-filter] duration-500 data-scrolled:border-white/5 data-scrolled:bg-gray-900/70 data-scrolled:backdrop-blur-xl dark:bg-transparent dark:data-scrolled:bg-gray-900/70"
+>
+  <nav aria-label="Global" class="mx-auto flex max-w-7xl items-center justify-between p-6 lg:px-8">
+    <div class="flex lg:flex-1">
+      <a href={url('#top')} class="-m-1.5 flex items-center gap-x-3 p-1.5">
+        <span class="sr-only">git-agent</span>
+        <Logo class="h-8 w-auto" />
+        <span aria-hidden="true" class="font-mono text-sm/6 font-semibold tracking-tight text-gray-900 dark:text-white">
+          git-agent
+        </span>
+      </a>
+    </div>
+    <div class="flex lg:hidden">
+      <button
+        type="button"
+        data-menu-open
+        class="-m-2.5 inline-flex items-center justify-center rounded-md p-2.5 text-gray-700 dark:text-gray-400"
+      >
+        <span class="sr-only">Open main menu</span>
+        <Icon name="Bars3Outline" class="size-6" />
+      </button>
+    </div>
+    <div class="hidden lg:flex lg:gap-x-12">
+      {
+        navigation.map((item) => (
+          <a
+            href={url(item.href)}
+            aria-current={item.href === current ? 'page' : undefined}
+            class="relative text-sm/6 font-semibold text-gray-900 transition-colors after:absolute after:inset-x-0 after:-bottom-1.5 after:h-px after:bg-linear-to-r after:from-transparent after:via-gray-300 after:to-transparent after:opacity-0 after:transition-opacity hover:text-gray-600 aria-[current=page]:after:opacity-100 dark:text-white dark:hover:text-gray-300"
+          >
+            {item.name}
+          </a>
+        ))
+      }
+    </div>
+    <div class="hidden lg:flex lg:flex-1 lg:justify-end">
+      <a href={repository} class="text-sm/6 font-semibold text-gray-900 dark:text-white">
+        GitHub <span aria-hidden="true">&rarr;</span>
+      </a>
+    </div>
+  </nav>
+  <dialog
+    data-menu
+    aria-label="Menu"
+    class="m-0 h-full max-h-none w-full max-w-none bg-transparent p-0 backdrop:bg-gray-950/60 backdrop:backdrop-blur-sm lg:hidden"
+  >
+    <div
+      class="fixed inset-y-0 right-0 z-50 w-full overflow-y-auto bg-white p-6 transition-transform duration-300 ease-out starting:translate-x-full sm:max-w-sm sm:ring-1 sm:ring-gray-900/10 dark:bg-gray-900 dark:sm:ring-gray-100/10"
+    >
+      <div class="flex items-center justify-between">
+        <a href={url('#top')} data-menu-link class="-m-1.5 flex items-center gap-x-3 p-1.5">
+          <span class="sr-only">git-agent</span>
+          <Logo class="h-8 w-auto" />
+        </a>
+        <button type="button" data-menu-close class="-m-2.5 rounded-md p-2.5 text-gray-700 dark:text-gray-400">
+          <span class="sr-only">Close menu</span>
+          <Icon name="XMarkOutline" class="size-6" />
+        </button>
+      </div>
+      <div class="mt-6 flow-root">
+        <div class="-my-6 divide-y divide-gray-500/10 dark:divide-white/10">
+          <div class="space-y-2 py-6">
+            {
+              navigation.map((item) => (
+                <a
+                  href={url(item.href)}
+                  aria-current={item.href === current ? 'page' : undefined}
+                  data-menu-link
+                  class="-mx-3 block rounded-lg px-3 py-2 text-base/7 font-semibold text-gray-900 hover:bg-gray-50 dark:text-white dark:hover:bg-white/5"
+                >
+                  {item.name}
+                </a>
+              ))
+            }
+          </div>
+          <div class="py-6">
+            <a
+              href={repository}
+              class="-mx-3 block rounded-lg px-3 py-2.5 text-base/7 font-semibold text-gray-900 hover:bg-gray-50 dark:text-white dark:hover:bg-white/5"
+            >
+              GitHub
+            </a>
+          </div>
+        </div>
+      </div>
+    </div>
+  </dialog>
+</header>
+
+<script>
+  const header = document.querySelector<HTMLElement>('[data-header]')
+  const menu = document.querySelector<HTMLDialogElement>('[data-menu]')
+
+  const onScroll = () => header?.toggleAttribute('data-scrolled', window.scrollY > 12)
+  onScroll()
+  window.addEventListener('scroll', onScroll, { passive: true })
+
+  document.querySelector('[data-menu-open]')?.addEventListener('click', () => menu?.showModal())
+  document.querySelector('[data-menu-close]')?.addEventListener('click', () => menu?.close())
+  document.querySelectorAll('[data-menu-link]').forEach((link) => link.addEventListener('click', () => menu?.close()))
+  // A click on the backdrop lands on the dialog itself.
+  menu?.addEventListener('click', (event) => {
+    if (event.target === menu) menu.close()
+  })
+</script>

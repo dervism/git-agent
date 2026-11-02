@@ -1,0 +1,75 @@
+---
+// Adapted from Tailwind Plus application-ui-v4/navigation/vertical-navigation/05-with-secondary-navigation.
+// Its group labels hold the README's sections; the current one is marked on scroll
+// (data-current), and its subsections open beneath it (data-open).
+import type { MarkdownHeading } from 'astro'
+import { docsGroups } from '../content/site'
+
+interface Props {
+  readonly headings: readonly MarkdownHeading[]
+  readonly label: string
+}
+
+const { headings, label } = Astro.props
+
+interface Section {
+  readonly heading: MarkdownHeading
+  readonly children: MarkdownHeading[]
+}
+
+const sections: Section[] = []
+for (const heading of headings) {
+  if (heading.depth === 2) sections.push({ heading, children: [] })
+  else if (heading.depth === 3) sections.at(-1)?.children.push(heading)
+}
+const grouped = new Set(docsGroups.flatMap((group) => group.sections))
+const groups = [
+  ...docsGroups.map((group) => ({
+    name: group.name,
+    sections: group.sections.flatMap((slug) => sections.filter((section) => section.heading.slug === slug)),
+  })),
+  { name: 'More', sections: sections.filter((section) => !grouped.has(section.heading.slug)) },
+].filter((group) => group.sections.length > 0)
+---
+
+<nav aria-label={label} class="flex flex-1 flex-col">
+  <ul role="list" class="flex flex-1 flex-col gap-y-7">
+    {
+      groups.map((group) => (
+        <li>
+          <div class="text-xs/6 font-semibold text-gray-400 dark:text-gray-500">{group.name}</div>
+          <ul role="list" class="-mx-2 mt-2 space-y-1">
+            {group.sections.map(({ heading, children }) => (
+              <li data-toc-section={heading.slug}>
+                <a
+                  href={`#${heading.slug}`}
+                  data-toc={heading.slug}
+                  class="group flex gap-x-3 rounded-md p-2 text-sm/6 font-semibold text-gray-700 transition-colors duration-200 hover:bg-gray-50 hover:text-brand-600 data-current:bg-gray-50 data-current:text-brand-600 dark:text-gray-300 dark:hover:bg-white/5 dark:hover:text-white dark:data-current:bg-white/5 dark:data-current:text-white"
+                >
+                  {heading.text}
+                </a>
+                {children.length > 0 && (
+                  <div data-toc-children class="grid transition-[grid-template-rows] duration-300 ease-out">
+                    <ul role="list" class="ml-4 overflow-hidden border-l border-gray-200 dark:border-white/10">
+                      {children.map((child) => (
+                        <li>
+                          <a
+                            href={`#${child.slug}`}
+                            data-toc={child.slug}
+                            class="-ml-px block border-l border-transparent py-1 pl-4 text-[13px]/6 text-gray-500 transition-colors duration-200 hover:border-gray-400 hover:text-gray-900 data-current:border-brand-600 data-current:text-brand-600 dark:hover:border-gray-500 dark:hover:text-gray-200 dark:data-current:border-gray-200 dark:data-current:text-white"
+                          >
+                            {child.text}
+                          </a>
+                        </li>
+                      ))}
+                    </ul>
+                  </div>
+                )}
+              </li>
+            ))}
+          </ul>
+        </li>
+      ))
+    }
+  </ul>
+</nav>

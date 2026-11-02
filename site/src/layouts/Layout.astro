@@ -1,0 +1,62 @@
+---
+import '../styles/global.css'
+
+interface Props {
+  readonly title: string
+  readonly description: string
+}
+
+const { title, description } = Astro.props
+const base = import.meta.env.BASE_URL.replace(/\/?$/, '/')
+---
+
+<!doctype html>
+<html lang="en" class="dark">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="generator" content={Astro.generator} />
+    <title>{title}</title>
+    <meta name="description" content={description} />
+    <meta name="theme-color" content="#06141B" />
+    <meta property="og:type" content="website" />
+    <meta property="og:title" content={title} />
+    <meta property="og:description" content={description} />
+    <link rel="icon" type="image/svg+xml" href={`${base}favicon.svg`} />
+    <script is:inline>
+      document.documentElement.classList.add('js')
+    </script>
+  </head>
+  <body class="bg-white text-gray-600 dark:bg-gray-900 dark:text-gray-300">
+    <slot />
+    <div
+      aria-hidden="true"
+      class="grain pointer-events-none fixed inset-0 z-[70] opacity-[0.035] mix-blend-overlay"
+    >
+    </div>
+    <script>
+      // Reveal sections as they scroll into view.
+      const reveal = new IntersectionObserver(
+        (entries) => {
+          for (const entry of entries) {
+            if (entry.isIntersecting) {
+              entry.target.classList.add('is-visible')
+              reveal.unobserve(entry.target)
+            }
+          }
+        },
+        { rootMargin: '0px 0px -8% 0px', threshold: 0.12 },
+      )
+      document.querySelectorAll('[data-reveal]').forEach((element) => reveal.observe(element))
+
+      // Light that follows the pointer across cards.
+      document.querySelectorAll<HTMLElement>('[data-spotlight]').forEach((card) => {
+        card.addEventListener('pointermove', (event) => {
+          const box = card.getBoundingClientRect()
+          card.style.setProperty('--x', `${event.clientX - box.left}px`)
+          card.style.setProperty('--y', `${event.clientY - box.top}px`)
+        })
+      })
+    </script>
+  </body>
+</html>

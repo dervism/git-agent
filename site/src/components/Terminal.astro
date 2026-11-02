@@ -1,0 +1,181 @@
+---
+// The code window from the Tailwind Plus hero, playing git-agent sessions.
+// Its file tabs became one tab per session.
+import type { Scene } from '../content/site'
+
+interface Props {
+  readonly scenes: readonly Scene[]
+}
+
+const { scenes } = Astro.props
+const first = scenes[0]
+---
+
+<div data-terminal data-scenes={JSON.stringify(scenes)}>
+  <div class="flex bg-gray-800/40 ring-1 ring-white/5">
+    <div role="tablist" aria-label="Example sessions" class="-mb-px flex text-sm/6 font-medium text-gray-400">
+      {
+        scenes.map((scene, index) => (
+          <button
+            type="button"
+            role="tab"
+            data-tab={index}
+            aria-selected={index === 0 ? 'true' : 'false'}
+            class="border-r border-gray-600/10 px-4 py-2 font-mono transition-colors duration-300 hover:text-gray-200 aria-selected:border-b aria-selected:border-r-white/10 aria-selected:border-b-white/20 aria-selected:bg-white/5 aria-selected:text-white"
+          >
+            {scene.tab}
+          </button>
+        ))
+      }
+    </div>
+  </div>
+  <div class="px-6 pt-6 pb-14">
+    <div
+      data-screen
+      aria-live="polite"
+      class="h-[23rem] overflow-hidden font-mono text-[12.5px]/6 whitespace-pre text-gray-300 sm:h-[26rem]"
+    >
+      {/* Without JavaScript, the first session is shown complete. */}
+      <div><span class="text-brand-400">❯</span> <span class="text-white">{first.command}</span></div>
+      {first.output.map((line) => <div>{line.text || ' '}</div>)}
+    </div>
+  </div>
+</div>
+
+<script>
+  import type { Scene, TerminalLine } from '../content/site'
+
+  const tones: Record<NonNullable<TerminalLine['tone']> | 'plain', string> = {
+    plain: 'text-gray-300',
+    muted: 'text-gray-500',
+    accent: 'text-brand-300',
+    bright: 'font-medium text-white',
+    success: 'text-gray-100',
+    rule: 'text-gray-600',
+    menu: 'text-gray-400',
+  }
+  const spinner = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏']
+  const reducedMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches
+
+  for (const root of document.querySelectorAll<HTMLElement>('[data-terminal]')) {
+    const scenes: Scene[] = JSON.parse(root.dataset.scenes ?? '[]')
+    const screen = root.querySelector<HTMLElement>('[data-screen]')!
+    const tabs = [...root.querySelectorAll<HTMLButtonElement>('[data-tab]')]
+    let run = 0
+    let current = 0
+    let visible = false
+
+    const sleep = (ms: number, token: number) =>
+      new Promise<void>((resolve, reject) =>
+        setTimeout(() => (token === run ? resolve() : reject(new Error('cancelled'))), ms),
+      )
+
+    const line = (text: string, tone: keyof typeof tones = 'plain') => {
+      const element = document.createElement('div')
+      element.className = `${tones[tone]} transition-opacity duration-300`
+      element.textContent = text || ' '
+      screen.append(element)
+      return element
+    }
+
+    const prompt = () => {
+      const element = document.createElement('div')
+      element.innerHTML =
+        '<span class="text-brand-400">❯</span> <span class="text-white" data-typed></span><span class="ml-px inline-block h-4 w-2 translate-y-0.5 animate-blink bg-gray-300" data-caret></span>'
+      screen.append(element)
+      return element
+    }
+
+    const select = (index: number) =>
+      tabs.forEach((tab, at) => tab.setAttribute('aria-selected', String(at === index)))
+
+    const showStatic = (scene: Scene) => {
+      screen.replaceChildren()
+      const head = prompt()
+      head.querySelector('[data-typed]')!.textContent = scene.command
+      head.querySelector('[data-caret]')!.remove()
+      scene.output.forEach((entry) => line(entry.text, entry.tone))
+      if (scene.answer) screen.lastElementChild!.append(` ${scene.answer}`)
+      scene.after.forEach((entry) => line(entry.text, entry.tone))
+    }
+
+    const play = async (scene: Scene, token: number) => {
+      screen.replaceChildren()
+      const head = prompt()
+      const typed = head.querySelector('[data-typed]')!
+      await sleep(500, token)
+      for (const char of scene.command) {
+        typed.textContent += char
+        await sleep(38 + Math.random() * 55, token)
+      }
+      await sleep(420, token)
+      head.querySelector('[data-caret]')!.remove()
+
+      const thinking = line('', 'muted')
+      const started = performance.now()
+      for (let frame = 0; frame < 16; frame++) {
+        const seconds = Math.floor((performance.now() - started) / 1000)
+        thinking.textContent = `${spinner[frame % spinner.length]} Generating with google/gemma-4-e4b ${seconds}s`
+        await sleep(90, token)
+      }
+      thinking.remove()
+
+      for (const entry of scene.output) {
+        const element = line(entry.text, entry.tone)
+        element.style.opacity = '0'
+        requestAnimationFrame(() => (element.style.opacity = '1'))
+        await sleep(entry.text ? 70 : 30, token)
+      }
+      if (scene.answer) {
+        await sleep(900, token)
+        screen.lastElementChild!.append(` ${scene.answer}`)
+        await sleep(450, token)
+      }
+      for (const entry of scene.after) {
+        line(entry.text, entry.tone)
+        await sleep(160, token)
+      }
+      await sleep(3600, token)
+    }
+
+    const loop = async (start: number) => {
+      const token = ++run
+      current = start
+      try {
+        while (token === run) {
+          select(current)
+          await play(scenes[current], token)
+          current = (current + 1) % scenes.length
+        }
+      } catch {
+        // A newer run took over.
+      }
+    }
+
+    tabs.forEach((tab, index) =>
+      tab.addEventListener('click', () => {
+        if (reducedMotion) {
+          select(index)
+          showStatic(scenes[index])
+        } else {
+          loop(index)
+        }
+      }),
+    )
+
+    if (reducedMotion) {
+      showStatic(scenes[0])
+      continue
+    }
+    // Play only while the terminal is on screen, picking up where it left off.
+    new IntersectionObserver(([entry]) => {
+      if (entry.isIntersecting && !visible) {
+        visible = true
+        loop(current)
+      } else if (!entry.isIntersecting && visible) {
+        visible = false
+        run++
+      }
+    }).observe(root)
+  }
+</script>

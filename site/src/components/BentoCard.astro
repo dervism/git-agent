@@ -1,0 +1,80 @@
+---
+// One card of Tailwind Plus marketing-v4/sections/bento-grids/03, with its
+// screenshot replaced by a live visual (the default slot).
+
+type Corner = 'top-left' | 'top-right' | 'bottom-left' | 'bottom-middle' | 'bottom-right'
+
+interface Props {
+  readonly corner: Corner
+  readonly eyebrow: string
+  readonly title: string
+  readonly delay?: number
+}
+
+const { corner, eyebrow, title, delay = 0 } = Astro.props
+
+// The block rounds each card's outer corners differently; these are its class strings.
+const shapes: Record<Corner, { span: string; background: string; content: string; outline: string }> = {
+  'top-left': {
+    span: 'lg:col-span-3',
+    background: 'absolute inset-0 rounded-lg bg-white max-lg:rounded-t-4xl lg:rounded-tl-4xl dark:bg-gray-800',
+    content:
+      'relative flex h-full flex-col overflow-hidden rounded-[calc(var(--radius-lg)+1px)] max-lg:rounded-t-[calc(2rem+1px)] lg:rounded-tl-[calc(2rem+1px)]',
+    outline:
+      'pointer-events-none absolute inset-0 rounded-lg shadow-sm outline outline-black/5 max-lg:rounded-t-4xl lg:rounded-tl-4xl dark:outline-white/15',
+  },
+  'top-right': {
+    span: 'lg:col-span-3',
+    background: 'absolute inset-0 rounded-lg bg-white lg:rounded-tr-4xl dark:bg-gray-800',
+    content:
+      'relative flex h-full flex-col overflow-hidden rounded-[calc(var(--radius-lg)+1px)] lg:rounded-tr-[calc(2rem+1px)]',
+    outline:
+      'pointer-events-none absolute inset-0 rounded-lg shadow-sm outline outline-black/5 lg:rounded-tr-4xl dark:outline-white/15',
+  },
+  'bottom-left': {
+    span: 'lg:col-span-2',
+    background: 'absolute inset-0 rounded-lg bg-white lg:rounded-bl-4xl dark:bg-gray-800',
+    content:
+      'relative flex h-full flex-col overflow-hidden rounded-[calc(var(--radius-lg)+1px)] lg:rounded-bl-[calc(2rem+1px)]',
+    outline:
+      'pointer-events-none absolute inset-0 rounded-lg shadow-sm outline outline-black/5 lg:rounded-bl-4xl dark:outline-white/15',
+  },
+  'bottom-middle': {
+    span: 'lg:col-span-2',
+    background: 'absolute inset-0 rounded-lg bg-white dark:bg-gray-800',
+    content: 'relative flex h-full flex-col overflow-hidden rounded-[calc(var(--radius-lg)+1px)]',
+    outline: 'pointer-events-none absolute inset-0 rounded-lg shadow-sm outline outline-black/5 dark:outline-white/15',
+  },
+  'bottom-right': {
+    span: 'lg:col-span-2',
+    background:
+      'absolute inset-0 rounded-lg bg-white max-lg:rounded-b-4xl lg:rounded-br-4xl dark:bg-gray-800',
+    content:
+      'relative flex h-full flex-col overflow-hidden rounded-[calc(var(--radius-lg)+1px)] max-lg:rounded-b-[calc(2rem+1px)] lg:rounded-br-[calc(2rem+1px)]',
+    outline:
+      'pointer-events-none absolute inset-0 rounded-lg shadow-sm outline outline-black/5 max-lg:rounded-b-4xl lg:rounded-br-4xl dark:outline-white/15',
+  },
+}
+const shape = shapes[corner]
+---
+
+<div
+  data-reveal
+  style={`--reveal-delay: ${delay}ms`}
+  class:list={['group relative transition-transform duration-500 ease-out hover:-translate-y-1', shape.span]}
+>
+  <div class={shape.background}></div>
+  <div data-spotlight class={shape.content}>
+    <div class="relative h-80 overflow-hidden">
+      <slot />
+    </div>
+    <div class="p-10 pt-4">
+      <h3 class="text-sm/4 font-semibold text-brand-600 dark:text-brand-300">{eyebrow}</h3>
+      <p class="mt-2 text-lg font-medium tracking-tight text-gray-950 dark:text-white">{title}</p>
+      <p class="mt-2 max-w-lg text-sm/6 text-gray-600 dark:text-gray-400">
+        <slot name="description" />
+      </p>
+    </div>
+  </div>
+  <div class={shape.outline}></div>
+</div>

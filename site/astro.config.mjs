@@ -1,4 +1,7 @@
 // @ts-check
+// SPDX-FileCopyrightText: 2026 Dervis Mansuroglu
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 import { defineConfig } from 'astro/config'
 import { unified } from '@astrojs/markdown-remark'
 import tailwindcss from '@tailwindcss/vite'

@@ -1,0 +1,76 @@
+git-agent website
+Copyright (C) 2026 Dervis Mansuroglu
+
+The website in this directory is free software: you can redistribute it and/or
+modify it under the terms of the GNU General Public License as published by the
+Free Software Foundation, either version 3 of the License, or (at your option)
+any later version.
+
+It is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY;
+without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR
+PURPOSE. See the GNU General Public License for more details. You should have
+received a copy of it in the file LICENSE; if not, see
+<https://www.gnu.org/licenses/>.
+
+The git-agent application in the rest of the repository is licensed separately,
+under the MIT License (see ../LICENSE).
+
+Each file names its license in an SPDX-License-Identifier line at its top. The
+parts below are not covered by the GNU General Public License.
+
+
+1. src/blocks/                                  LicenseRef-TailwindPlus
+
+   These files are adapted from Tailwind Plus components and templates
+   (https://tailwindcss.com/plus), copyright Tailwind Labs Inc. Dervis
+   Mansuroglu uses them under a personal Tailwind Plus license, as part of this
+   website only.
+
+   No license to these files is granted to anyone. Do not copy, modify or
+   redistribute them, on their own or as part of anything else, such as a
+   component library, UI kit, design system, template, starter kit, plugin, AI
+   skill or dataset. To use Tailwind Plus components, get your own license from
+   Tailwind Labs: https://tailwindcss.com/plus/license
+
+
+2. src/design/components/Logo.astro             LicenseRef-AllRightsReserved
+   public/favicon.svg
+
+   The git-agent logo. Copyright (C) 2026 Dervis Mansuroglu. All rights
+   reserved.
+
+
+3. src/design/icons.ts                          MIT
+
+   Icons from Heroicons (https://heroicons.com), under the MIT License:
+
+   MIT License
+
+   Copyright (c) Tailwind Labs, Inc.
+
+   Permission is hereby granted, free of charge, to any person obtaining a copy
+   of this software and associated documentation files (the "Software"), to deal
+   in the Software without restriction, including without limitation the rights
+   to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+   copies of the Software, and to permit persons to whom the Software is
+   furnished to do so, subject to the following conditions:
+
+   The above copyright notice and this permission notice shall be included in
+   all copies or substantial portions of the Software.
+
+   THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+   IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+   FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+   AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+   LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+   OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+   SOFTWARE.
+
+
+4. Fonts                                        OFL-1.1
+
+   Inter (copyright 2016 The Inter Project Authors) and JetBrains Mono
+   (copyright 2020 The JetBrains Mono Project Authors), under the SIL Open Font
+   License 1.1. They are installed from npm (@fontsource-variable/inter and
+   @fontsource-variable/jetbrains-mono) and served with the built site; their
+   license texts come with those packages.

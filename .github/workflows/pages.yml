@@ -1,5 +1,6 @@
 # Builds the website in site/ and publishes it to GitHub Pages. The docs page
-# is the README, so a change to the README rebuilds the site too.
+# is the README, and the site shows the version from Cargo.toml, so a change to
+# either rebuilds the site too.
 name: Website
 
 on:
@@ -8,6 +9,7 @@ on:
     paths:
       - "site/**"
       - "README.md"
+      - "Cargo.toml"
       - ".github/workflows/pages.yml"
   workflow_dispatch:
 

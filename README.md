@@ -693,5 +693,7 @@ The tests create temporary git repositories and don't need a running model serve
 
 ## License
 
-git-agent is licensed under the [MIT License](LICENSE). By contributing, you agree
-that your contributions are licensed under the same terms.
+git-agent is licensed under the [MIT License](LICENSE). The website in `site/` has its own
+license, the GPL-3.0-or-later, with exceptions listed in `site/NOTICE`; among them, the parts
+adapted from Tailwind Plus are not open source. By contributing, you agree that your
+contributions are licensed under the terms of the part you change.

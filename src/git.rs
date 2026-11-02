@@ -1381,6 +1381,104 @@ mod tests {
     }
 
     #[test]
+    fn creates_a_branch_that_takes_the_changes_along() {
+        let (dir, repo) = setup();
+        let remote = add_remote(&repo);
+        commit_elsewhere(&remote, "LICENSE", "MIT\n", "docs: add license");
+        run(dir.path(), &["fetch", "-q"]);
+        run(dir.path(), &["branch", "-q", "fix/old"]);
+        // Each once, though main is also origin/main.
+        let mut names = repo.branch_names().unwrap();
+        names.sort();
+        assert_eq!(names, ["fix/old", "main"]);
+        assert!(repo.is_valid_branch_name("feat/add-cache"));
+        assert!(!repo.is_valid_branch_name("feat/add cache"));
+        assert!(!repo.is_valid_branch_name("-x"));
+
+        fs::write(dir.path().join("lib.rs"), "fn b() {}\n").unwrap();
+        repo.create_branch("feat/b", Some("origin/main")).unwrap();
+        assert_eq!(repo.current_branch().unwrap(), "feat/b");
+        // It starts from the remote's latest commit, and the change came along.
+        assert!(dir.path().join("LICENSE").exists());
+        assert!(repo.has_uncommitted_changes().unwrap());
+        // It doesn't track origin/main, so its first push makes origin/feat/b.
+        assert!(!repo.has_upstream());
+        repo.commit("feat: b", Scope::Tracked, &[]).unwrap();
+        repo.push().unwrap();
+        let pushed = run(remote.path(), &["log", "--format=%s", "-1", "feat/b"]);
+        assert_eq!(pushed.trim(), "feat: b");
+        assert_eq!(repo.branch_names().unwrap().len(), 3);
+        assert!(repo.create_branch("feat/b", None).is_err());
+    }
+
+    #[test]
+    fn rewrites_commits_without_touching_the_work_tree() {
+        let (dir, repo) = setup();
+        let _remote = add_remote(&repo);
+        let write = |name: &str, content: &str| fs::write(dir.path().join(name), content).unwrap();
+        write("lib.rs", "fn a() {}\nfn b() {}\n");
+        repo.commit("feat: add b", Scope::Tracked, &[]).unwrap();
+        write("notes.md", "notes\n");
+        repo.stage_all().unwrap();
+        repo.commit("wip", Scope::Staged, &[]).unwrap();
+        write("lib.rs", "fn a() {}\nfn b() { }\n");
+        repo.commit("fix typo", Scope::Tracked, &[]).unwrap();
+        // Uncommitted work that the rewrite must leave alone.
+        write("lib.rs", "fn a() {}\nfn b() { }\nfn c() {}\n");
+        write("draft.txt", "draft\n");
+
+        let unpushed = repo.unpushed().unwrap();
+        assert_eq!(unpushed.len(), 3);
+        assert_eq!(repo.commits_after("HEAD~3").unwrap(), unpushed);
+        assert!(repo.has_remotes().unwrap());
+        assert!(!repo.has_merges("HEAD~3..HEAD").unwrap());
+        let old = repo.resolve("HEAD").unwrap().unwrap();
+        let base = repo.resolve("HEAD~3").unwrap().unwrap();
+
+        let message = std::path::absolute(dir.path().join("message.txt")).unwrap();
+        fs::write(&message, "docs: add notes\n").unwrap();
+        let todo = format!(
+            "pick {} feat: add b\nfixup {} fix typo\npick {} wip\nexec git commit --amend --quiet \
+             --no-verify --allow-empty --file {}\n",
+            unpushed[0],
+            unpushed[2],
+            unpushed[1],
+            shell_quote(&message.to_string_lossy())
+        );
+        let new = repo.rewrite(&old, Some(&base), &todo).unwrap();
+        assert_eq!(repo.tree(&new).unwrap(), repo.tree(&old).unwrap());
+        // Nothing moved yet.
+        assert_eq!(repo.resolve("HEAD").unwrap().unwrap(), old);
+        repo.move_head(&old, &new, "git-agent tidy").unwrap();
+        let log = repo.git(&["log", "--format=%s", "-3"]).unwrap();
+        assert_eq!(log, "docs: add notes\nfeat: add b\ninit\n");
+        assert!(repo.has_uncommitted_changes().unwrap());
+        assert_eq!(
+            fs::read_to_string(dir.path().join("lib.rs")).unwrap(),
+            "fn a() {}\nfn b() { }\nfn c() {}\n"
+        );
+        assert!(dir.path().join("draft.txt").exists());
+        assert!(repo.git(&["worktree", "list"]).unwrap().lines().count() == 1);
+        // A stale `old` doesn't move the branch.
+        assert!(repo.move_head(&old, &new, "again").is_err());
+
+        // A plan that conflicts leaves everything as it was: renaming c
+        // before adding it can't work.
+        let head = repo.resolve("HEAD").unwrap().unwrap();
+        repo.commit("feat: c", Scope::Tracked, &[]).unwrap();
+        write("lib.rs", "fn a() {}\nfn b() { }\nfn c2() {}\n");
+        repo.commit("refactor: rename c", Scope::Tracked, &[])
+            .unwrap();
+        let commits = repo.commits_after(&head).unwrap();
+        let tip = repo.resolve("HEAD").unwrap().unwrap();
+        let swapped = format!("pick {}\npick {}\n", commits[1], commits[0]);
+        let err = repo.rewrite(&tip, Some(&head), &swapped).unwrap_err();
+        assert!(err.to_string().contains("conflicts"), "{err}");
+        assert_eq!(repo.resolve("HEAD").unwrap().unwrap(), tip);
+        assert!(repo.git(&["worktree", "list"]).unwrap().lines().count() == 1);
+    }
+
+    #[test]
     fn detached_head_has_no_branch() {
         let (dir, repo) = setup();
         run(dir.path(), &["switch", "-q", "--detach"]);

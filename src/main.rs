@@ -181,6 +181,8 @@ async fn main() -> ExitCode {
         None => generate(&cli.generate, &cli.settings).await,
         Some(Command::Split(args)) => split_changes(&args, &cli.settings).await,
         Some(Command::Pr(args)) => pull_request(&args, &cli.settings).await,
+        Some(Command::Branch(args)) => new_branch(&args, &cli.settings).await,
+        Some(Command::Tidy(args)) => tidy_commits(&args, &cli.settings).await,
         Some(Command::Why(args)) => explain_lines(&args, &cli.settings).await,
         Some(Command::Explain(args)) => explain_commits(&args, &cli.settings).await,
         Some(Command::Models) => list_models(&cli.settings).await,
@@ -295,6 +297,7 @@ async fn generate(args: &GenerateArgs, settings: &SettingArgs) -> Result<()> {
         &model,
         &conversation,
         edit,
+        separated,
     )
     .await?;
     let Some((and_push, message)) = reviewed else {
@@ -470,7 +473,12 @@ impl Splitter<'_> {
         let (plan, notes) = match split::parse_plan(&reply, self.files, self.units) {
             Ok(parsed) => parsed,
             Err(err) => {
-                let retry = prompt::retry_plan(conversation, &reply, &format!("{err:#}"));
+                let retry = prompt::retry_plan(
+                    conversation,
+                    &reply,
+                    &format!("{err:#}"),
+                    "with every unit in exactly one commit",
+                );
                 let reply = generate_message(self.server, self.model, &retry).await?;
                 split::parse_plan(&reply, self.files, self.units)
                     .context("the model didn't reply with a plan git-agent could read")?
@@ -507,7 +515,11 @@ impl Splitter<'_> {
     }
 
     fn edit_plan(&self, plan: &Plan) -> Result<Option<Plan>> {
-        let text = ui::edit_plan(self.repo, &split::to_text(plan, self.files, self.units))?;
+        let text = ui::edit_plan(
+            self.repo,
+            "GIT_AGENT_SPLIT_PLAN",
+            &split::to_text(plan, self.files, self.units),
+        )?;
         let (edited, notes) = split::from_text(&text, self.files, self.units);
         for note in notes {
             ui::warn(note);
@@ -567,7 +579,7 @@ impl Splitter<'_> {
             if !fit.is_complete() {
                 report_fit(self.model, &fit, "message", None);
             }
-            let message = generate_message(self.server, self.model, &conversation).await?;
+            let message = commit_message(self.server, self.model, &conversation).await?;
             ui::show_proposal(&SPLIT_COMMIT_REVIEW, &message);
             let (make, message) = if self.args.commit {
                 (true, message)
@@ -580,6 +592,7 @@ impl Splitter<'_> {
                     self.model,
                     &conversation,
                     edit,
+                    separated,
                 )
                 .await?;
                 match reviewed {
@@ -711,6 +724,7 @@ async fn pull_request(args: &PrArgs, settings: &SettingArgs) -> Result<()> {
             &model,
             &conversation,
             edit,
+            Ok,
         )
         .await?;
         let Some(reviewed) = reviewed else {

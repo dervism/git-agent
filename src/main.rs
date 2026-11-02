@@ -44,6 +44,7 @@ const COMMIT_REVIEW: Review<bool> = Review {
     first_line: "subject line",
     noun: "message",
     what: "commit message",
+    edit: "edit the message in your editor",
     accept: &[
         Choice {
             word: "commit",
@@ -65,6 +66,7 @@ const PULL_REQUEST_REVIEW: Review<bool> = Review {
     first_line: "title",
     noun: "pull request",
     what: "pull request title and description",
+    edit: "edit the pull request in your editor",
     accept: &[
         Choice {
             word: "create",
@@ -86,6 +88,7 @@ const PLAN_REVIEW: Review<()> = Review {
     first_line: "first line",
     noun: "plan",
     what: "plan",
+    edit: "edit the plan in your editor",
     accept: &[Choice {
         word: "accept",
         help: "make the commits one by one, reviewing each message",
@@ -100,6 +103,7 @@ const SPLIT_COMMIT_REVIEW: Review<bool> = Review {
     first_line: "subject line",
     noun: "message",
     what: "commit message",
+    edit: "edit the message in your editor",
     accept: &[
         Choice {
             word: "commit",

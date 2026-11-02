@@ -1,0 +1,136 @@
+/*
+ * SPDX-FileCopyrightText: 2026 Dervis Mansuroglu
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ */
+
+/*
+ * Utilities and behaviors the components share. Surfaces first, then motion.
+ */
+
+/* Silver headline text with a slow sheen. */
+@utility text-sheen {
+  background-image: linear-gradient(
+    100deg,
+    var(--color-gray-200) 20%,
+    #ffffff 40%,
+    var(--color-gray-400) 60%,
+    var(--color-gray-200) 80%
+  );
+  background-size: 200% auto;
+  background-clip: text;
+  color: transparent;
+}
+
+/* Film grain over the page, so the dark gradients don't band. */
+@utility grain {
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='160' height='160'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='.9' numOctaves='2' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)' opacity='.5'/%3E%3C/svg%3E");
+}
+
+/* A faint grid that fades out toward the edges. */
+@utility grid-lines {
+  background-image:
+    linear-gradient(to right, rgb(255 255 255 / 0.04) 1px, transparent 1px),
+    linear-gradient(to bottom, rgb(255 255 255 / 0.04) 1px, transparent 1px);
+  background-size: 64px 64px;
+  mask-image: radial-gradient(ellipse at center, black 30%, transparent 75%);
+}
+
+/* Inline code and small labels: a quiet chip. */
+@utility chip {
+  border-radius: var(--radius-md);
+  background-color: color-mix(in oklab, white 5%, transparent);
+  font-family: var(--font-mono);
+  color: var(--color-gray-200);
+  box-shadow: inset 0 0 0 1px rgb(255 255 255 / 0.1);
+}
+
+/* An inset, darker area inside a card: mock terminals, plan items. Pair it
+   with a rounded-* utility; the surfaces leave the radius to their use. */
+@utility well {
+  background-color: color-mix(in oklab, var(--color-gray-950) 60%, transparent);
+  box-shadow: inset 0 0 0 1px rgb(255 255 255 / 0.1);
+}
+
+/* A raised glass surface: the install panel, call-outs. */
+@utility panel {
+  background-color: color-mix(in oklab, var(--color-gray-800) 55%, transparent);
+  box-shadow:
+    inset 0 0 0 1px rgb(255 255 255 / 0.1),
+    0 40px 120px -40px rgb(0 0 0 / 0.9);
+}
+
+/* The lit gradient a code window sits on. */
+@utility bg-stage {
+  background-image: linear-gradient(
+    to bottom right,
+    var(--color-gray-600),
+    var(--color-gray-700),
+    var(--color-gray-800)
+  );
+}
+
+/* Scroll reveal. Hidden only once the script runs, so the page reads without JS. */
+.js [data-reveal] {
+  opacity: 0;
+  transform: translateY(28px);
+  filter: blur(8px);
+  transition:
+    opacity 0.9s cubic-bezier(0.16, 1, 0.3, 1),
+    transform 0.9s cubic-bezier(0.16, 1, 0.3, 1),
+    filter 0.9s cubic-bezier(0.16, 1, 0.3, 1);
+  transition-delay: var(--reveal-delay, 0ms);
+}
+.js [data-reveal].is-visible {
+  opacity: 1;
+  transform: none;
+  filter: none;
+}
+
+/* A soft light that follows the pointer across a card. */
+[data-spotlight] {
+  --x: 50%;
+  --y: 50%;
+}
+[data-spotlight]::after {
+  content: "";
+  position: absolute;
+  inset: 1px;
+  border-radius: inherit;
+  pointer-events: none;
+  background: radial-gradient(
+    420px circle at var(--x) var(--y),
+    rgb(204 208 207 / 0.08),
+    transparent 60%
+  );
+  opacity: 0;
+  transition: opacity 0.4s ease;
+}
+[data-spotlight]:hover::after {
+  opacity: 1;
+}
+
+/* Sidebar subsections stay folded until their section is reached. */
+.js [data-toc-children] {
+  grid-template-rows: 0fr;
+}
+.js [data-open] > [data-toc-children] {
+  grid-template-rows: 1fr;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  html {
+    scroll-behavior: auto;
+  }
+  .js [data-reveal] {
+    opacity: 1;
+    transform: none;
+    filter: none;
+    transition: none;
+  }
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+  }
+}

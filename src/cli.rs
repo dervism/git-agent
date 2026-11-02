@@ -153,6 +153,43 @@ pub struct SplitArgs {
     pub git_args: Vec<String>,
 }
 
+/// Options for `git agent branch`.
+#[derive(Args, Debug)]
+pub struct BranchArgs {
+    /// What the branch is for, or a GitHub issue number or URL
+    /// [default: the uncommitted changes]
+    #[arg(value_name = "DESCRIPTION")]
+    pub description: Vec<String>,
+
+    /// Where the branch starts, e.g. origin/main [default: HEAD]
+    #[arg(long, value_name = "COMMIT")]
+    pub from: Option<String>,
+
+    /// Create the branch without reviewing its name
+    #[arg(short, long, conflicts_with = "raw")]
+    pub create: bool,
+
+    /// Print only the name to stdout and exit (for scripts and pipes)
+    #[arg(short, long)]
+    pub raw: bool,
+}
+
+/// Options for `git agent tidy`.
+#[derive(Args, Debug)]
+pub struct TidyArgs {
+    /// Tidy the commits after this one [default: the commits that aren't pushed]
+    #[arg(long, value_name = "COMMIT")]
+    pub base: Option<String>,
+
+    /// Tidy the commits without reviewing the plan or the new messages
+    #[arg(long)]
+    pub apply: bool,
+
+    /// Extra context for the model, e.g. what the commits are for
+    #[arg(short = 'H', long, value_name = "TEXT")]
+    pub hint: Option<String>,
+}
+
 /// Options for `git agent why`.
 #[derive(Args, Debug)]
 pub struct WhyArgs {
@@ -196,6 +233,10 @@ pub enum Command {
     Split(SplitArgs),
     /// Write a pull request for the current branch, then create it on GitHub with gh
     Pr(PrArgs),
+    /// Name a new branch after a description, an issue or your changes, then create it
+    Branch(BranchArgs),
+    /// Reword unclear messages and fold fixes into their commits, before you push
+    Tidy(TidyArgs),
     /// Explain why lines of code are the way they are, from their history
     Why(WhyArgs),
     /// Explain a commit, a range of commits, a branch or the last pull
@@ -296,6 +337,41 @@ mod tests {
         };
         assert!(args.all && args.commit && !args.push);
         assert_eq!(args.git_args, ["--signoff"]);
+    }
+
+    #[test]
+    fn branch_takes_a_description_without_quotes() {
+        let cli = Cli::try_parse_from([
+            "git-agent",
+            "branch",
+            "fix",
+            "login",
+            "timeout",
+            "--from",
+            "origin/main",
+        ])
+        .unwrap();
+        let Some(Command::Branch(args)) = cli.command else {
+            panic!("expected the branch command");
+        };
+        assert_eq!(args.description, ["fix", "login", "timeout"]);
+        assert_eq!(args.from.as_deref(), Some("origin/main"));
+        let cli = Cli::try_parse_from(["git-agent", "branch", "-c"]).unwrap();
+        assert!(
+            matches!(cli.command, Some(Command::Branch(args)) if args.create && args.description.is_empty())
+        );
+        assert!(Cli::try_parse_from(["git-agent", "branch", "-c", "-r", "42"]).is_err());
+    }
+
+    #[test]
+    fn tidy_takes_a_base_and_applies_without_review() {
+        let cli =
+            Cli::try_parse_from(["git-agent", "tidy", "--base", "HEAD~3", "--apply"]).unwrap();
+        let Some(Command::Tidy(args)) = cli.command else {
+            panic!("expected the tidy command");
+        };
+        assert_eq!(args.base.as_deref(), Some("HEAD~3"));
+        assert!(args.apply && args.hint.is_none());
     }
 
     #[test]

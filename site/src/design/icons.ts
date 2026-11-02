@@ -1,5 +1,8 @@
-// Heroicons v2 (MIT), from @heroicons/react, as plain SVG data.
-// Generated; regenerate rather than edit by hand.
+// SPDX-FileCopyrightText: Tailwind Labs, Inc. (Heroicons)
+// SPDX-License-Identifier: MIT
+
+// Heroicons v2, as plain SVG data, extracted from @heroicons/react. To add an
+// icon, copy its paths from that package.
 
 export interface IconPath {
   readonly d: string

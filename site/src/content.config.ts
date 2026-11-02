@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Dervis Mansuroglu
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 import { defineCollection } from 'astro:content'
 import { glob } from 'astro/loaders'
 

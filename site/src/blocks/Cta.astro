@@ -1,5 +1,17 @@
 ---
+// SPDX-FileCopyrightText: Tailwind Labs Inc. (Tailwind Plus)
+// SPDX-FileCopyrightText: 2026 Dervis Mansuroglu
+// SPDX-License-Identifier: LicenseRef-TailwindPlus
+//
+// Adapted from Tailwind Plus (https://tailwindcss.com/plus) and used under a
+// personal Tailwind Plus license, as part of this website only. This file is
+// not covered by the site's GPL, and no license to it is granted: do not copy,
+// modify or redistribute it, on its own or as part of anything else, such as a
+// component library, template, plugin, AI skill or dataset. See site/NOTICE.
+
 // Adapted from Tailwind Plus marketing-v4/sections/cta-sections/03-centered-on-dark-panel.
+import Button from './Button.astro'
+import Sheen from '../design/components/Sheen.astro'
 import { url } from '../lib/paths'
 ---
 
@@ -10,23 +22,15 @@ import { url } from '../lib/paths'
       class="relative isolate overflow-hidden bg-gray-900 px-6 py-24 text-center shadow-2xl sm:rounded-3xl sm:px-16 dark:bg-gray-800 dark:shadow-none dark:after:pointer-events-none dark:after:absolute dark:after:inset-0 dark:after:inset-ring dark:after:inset-ring-white/10 dark:after:sm:rounded-3xl"
     >
       <h2 class="text-4xl font-semibold tracking-tight text-balance text-white sm:text-5xl">
-        Your next commit, <span class="text-sheen animate-shimmer">described for you</span>
+        Your next commit, <Sheen>described for you</Sheen>
       </h2>
       <p class="mx-auto mt-6 max-w-xl text-lg/8 text-pretty text-gray-300">
         Free and open source under the MIT license. Bring the model you already run, or connect a cloud provider in
         the settings menu.
       </p>
       <div class="mt-10 flex items-center justify-center gap-x-6">
-        <a
-          href={url('#install')}
-          class="rounded-md bg-white px-3.5 py-2.5 text-sm font-semibold text-gray-900 shadow-xs hover:bg-gray-100 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-white dark:bg-gray-200 dark:text-gray-900 dark:shadow-[0_0_40px_-8px_var(--color-brand-300)] dark:hover:bg-white dark:focus-visible:outline-white"
-        >
-          Install git-agent
-        </a>
-        <a href={url('docs/')} class="group text-sm/6 font-semibold text-white">
-          Read the documentation
-          <span aria-hidden="true" class="inline-block transition-transform group-hover:translate-x-1">→</span>
-        </a>
+        <Button href={url('#install')}>Install git-agent</Button>
+        <Button href={url('docs/')} variant="link">Read the documentation</Button>
       </div>
       <svg
         viewBox="0 0 1024 1024"

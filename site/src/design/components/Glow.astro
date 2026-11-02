@@ -1,0 +1,19 @@
+---
+// SPDX-FileCopyrightText: 2026 Dervis Mansuroglu
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+// A large, blurred light that drifts slowly behind a section. Place it with
+// `class` (position and size), inside a positioned, isolated parent.
+
+interface Props {
+  readonly tone?: 'brand' | 'gray' | 'deep'
+  readonly speed?: 'normal' | 'slow'
+  readonly class?: string
+}
+
+const { tone = 'brand', speed = 'normal', class: className } = Astro.props
+const tones = { brand: 'bg-brand-700/25', gray: 'bg-gray-600/30', deep: 'bg-brand-800/25' }
+const speeds = { normal: 'animate-drift', slow: 'animate-drift-slow' }
+---
+
+<div aria-hidden="true" class:list={['absolute rounded-full blur-[120px]', tones[tone], speeds[speed], className]}></div>

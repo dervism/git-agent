@@ -1,0 +1,28 @@
+---
+// SPDX-FileCopyrightText: 2026 Dervis Mansuroglu
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+// A page section: the vertical rhythm and the page background. The content
+// brings its own container, as the Tailwind Plus sections do. The `background`
+// slot is for glows and grids behind it.
+
+interface Props {
+  readonly id?: string
+  readonly labelledby?: string
+  /** `normal` is the rhythm of most sections; `tight` suits a strip like the provider marquee. */
+  readonly rhythm?: 'normal' | 'tight'
+  readonly class?: string
+}
+
+const { id, labelledby, rhythm = 'normal', class: className } = Astro.props
+const padding = { normal: 'py-24 sm:py-32', tight: 'py-16 sm:py-20' }[rhythm]
+---
+
+<section
+  id={id}
+  aria-labelledby={labelledby}
+  class:list={['relative isolate bg-white dark:bg-gray-900', padding, className]}
+>
+  <slot name="background" />
+  <slot />
+</section>

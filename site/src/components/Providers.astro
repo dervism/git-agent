@@ -1,5 +1,10 @@
 ---
+// SPDX-FileCopyrightText: 2026 Dervis Mansuroglu
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 // The servers and providers git-agent works with, as a slow marquee.
+import Section from '../design/components/Section.astro'
+
 interface Props {
   readonly providers: readonly string[]
 }
@@ -7,7 +12,7 @@ interface Props {
 const { providers } = Astro.props
 ---
 
-<section aria-labelledby="providers-heading" class="bg-white py-16 sm:py-20 dark:bg-gray-900">
+<Section labelledby="providers-heading" rhythm="tight">
   <div class="mx-auto max-w-7xl px-6 lg:px-8">
     <h2
       id="providers-heading"
@@ -37,4 +42,4 @@ const { providers } = Astro.props
       </div>
     </div>
   </div>
-</section>
+</Section>

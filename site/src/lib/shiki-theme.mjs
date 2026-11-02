@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Dervis Mansuroglu
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 // A Shiki theme drawn from the site's palette, for code blocks in the docs.
 export default {
   name: 'git-agent',

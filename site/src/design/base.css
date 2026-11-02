@@ -1,0 +1,19 @@
+/*
+ * SPDX-FileCopyrightText: 2026 Dervis Mansuroglu
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ */
+
+/* Page defaults. */
+
+@layer base {
+  html {
+    scroll-behavior: smooth;
+    scroll-padding-top: 6rem;
+    font-feature-settings: "cv11", "ss01", "ss03";
+    -webkit-font-smoothing: antialiased;
+  }
+  ::selection {
+    background: var(--color-brand-500);
+    color: white;
+  }
+}

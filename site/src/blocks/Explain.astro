@@ -1,8 +1,23 @@
 ---
+// SPDX-FileCopyrightText: Tailwind Labs Inc. (Tailwind Plus)
+// SPDX-FileCopyrightText: 2026 Dervis Mansuroglu
+// SPDX-License-Identifier: LicenseRef-TailwindPlus
+//
+// Adapted from Tailwind Plus (https://tailwindcss.com/plus) and used under a
+// personal Tailwind Plus license, as part of this website only. This file is
+// not covered by the site's GPL, and no license to it is granted: do not copy,
+// modify or redistribute it, on its own or as part of anything else, such as a
+// component library, template, plugin, AI skill or dataset. See site/NOTICE.
+
 // Adapted from Tailwind Plus marketing-v4/sections/feature-sections/16.with-code-example-panel.
-// The code window's file tabs switch between sample answers.
-import Icon from './Icon.astro'
-import type { Feature, TerminalLine } from '../content/site'
+// The code window's tabs switch between sample answers.
+import CodeWindow from './CodeWindow.astro'
+import Glow from '../design/components/Glow.astro'
+import Icon from '../design/components/Icon.astro'
+import Section from '../design/components/Section.astro'
+import SectionHeading from './SectionHeading.astro'
+import { tone, type TerminalLine } from '../design/terminal'
+import type { Feature } from '../content/site'
 
 interface Props {
   readonly features: readonly Feature[]
@@ -10,49 +25,27 @@ interface Props {
 }
 
 const { features, samples } = Astro.props
-const tones: Record<NonNullable<TerminalLine['tone']> | 'plain', string> = {
-  plain: 'text-gray-300',
-  muted: 'text-gray-500',
-  accent: 'text-brand-300',
-  bright: 'font-medium text-white',
-  success: 'text-gray-100',
-  rule: 'text-gray-600',
-  menu: 'text-gray-400',
-}
 ---
 
-<section
-  id="explain"
-  aria-labelledby="explain-heading"
-  class="relative isolate overflow-hidden bg-white py-24 sm:py-32 dark:bg-gray-900"
->
+<Section id="explain" labelledby="explain-heading" class="overflow-hidden">
   <div
+    slot="background"
     aria-hidden="true"
     class="absolute inset-0 -z-10 [mask-image:linear-gradient(to_bottom,transparent,black_30%,black_70%,transparent)]"
   >
-    <div
-      class="absolute top-1/2 left-2/3 size-[44rem] -translate-x-1/2 -translate-y-1/2 animate-drift-slow rounded-full bg-brand-800/25 blur-[140px]"
-    >
-    </div>
+    <Glow tone="deep" speed="slow" class="top-1/2 left-2/3 size-[44rem] -translate-x-1/2 -translate-y-1/2 blur-[140px]" />
   </div>
   <div class="mx-auto max-w-7xl md:px-6 lg:px-8">
     <div class="grid grid-cols-1 gap-x-8 gap-y-16 sm:gap-y-20 lg:grid-cols-2 lg:items-start">
       <div class="px-6 md:px-0 lg:pt-4 lg:pr-4">
         <div class="mx-auto max-w-2xl lg:mx-0 lg:max-w-lg">
-          <h2 id="explain-heading" data-reveal class="text-base/7 font-semibold text-brand-600 dark:text-brand-300">
-            Understand the history
-          </h2>
-          <p
-            data-reveal
-            style="--reveal-delay: 80ms"
-            class="mt-2 text-4xl font-semibold tracking-tight text-balance text-gray-900 sm:text-5xl dark:text-white"
-          >
+          <SectionHeading eyebrow="Understand the history" id="explain-heading">
             Ask your repository why
-          </p>
-          <p data-reveal style="--reveal-delay: 160ms" class="mt-6 text-lg/8 text-gray-700 dark:text-gray-300">
-            Two commands read the code and the history git already has, and answer in plain words. Neither changes
-            anything in the repository.
-          </p>
+            <Fragment slot="lead">
+              Two commands read the code and the history git already has, and answer in plain words. Neither changes
+              anything in the repository.
+            </Fragment>
+          </SectionHeading>
           <dl class="mt-10 max-w-xl space-y-8 text-base/7 text-gray-600 lg:max-w-none dark:text-gray-400">
             {
               features.map((feature, index) => (
@@ -70,7 +63,7 @@ const tones: Record<NonNullable<TerminalLine['tone']> | 'plain', string> = {
       </div>
       <div data-reveal style="--reveal-delay: 200ms" class="sm:px-6 lg:px-0">
         <div
-          class="relative isolate overflow-hidden bg-brand-500 px-6 pt-8 sm:mx-auto sm:max-w-2xl sm:rounded-3xl sm:pt-16 sm:pr-0 sm:pl-16 lg:mx-0 lg:max-w-none dark:bg-linear-to-br dark:from-gray-600 dark:via-gray-700 dark:to-gray-800"
+          class="relative isolate overflow-hidden bg-brand-500 px-6 pt-8 sm:mx-auto sm:max-w-2xl sm:rounded-3xl sm:pt-16 sm:pr-0 sm:pl-16 lg:mx-0 lg:max-w-none dark:bg-stage"
         >
           <div
             aria-hidden="true"
@@ -78,33 +71,18 @@ const tones: Record<NonNullable<TerminalLine['tone']> | 'plain', string> = {
           >
           </div>
           <div class="mx-auto max-w-2xl sm:mx-0 sm:max-w-none">
-            <div data-samples class="w-screen overflow-hidden rounded-tl-xl bg-gray-900 ring-1 ring-white/10">
-              <div class="flex bg-gray-800/40 ring-1 ring-white/5">
-                <div role="tablist" aria-label="Examples" class="-mb-px flex text-sm/6 font-medium text-gray-400">
-                  {
-                    samples.map((sample, index) => (
-                      <button
-                        type="button"
-                        role="tab"
-                        id={`sample-tab-${index}`}
-                        aria-controls={`sample-${index}`}
-                        aria-selected={index === 0 ? 'true' : 'false'}
-                        data-sample-tab={index}
-                        class="border-r border-gray-600/10 px-4 py-2 font-mono transition-colors duration-300 hover:text-gray-200 aria-selected:border-b aria-selected:border-r-white/10 aria-selected:border-b-white/20 aria-selected:bg-white/5 aria-selected:text-white"
-                      >
-                        {sample.tab}
-                      </button>
-                    ))
-                  }
-                </div>
-              </div>
+            <CodeWindow
+              tabs={samples.map((sample) => sample.tab)}
+              interactive
+              label="Examples"
+              class="w-screen ring-1 ring-white/10"
+              data-samples=""
+            >
               <div class="relative px-6 pt-6 pb-14">
                 {
                   samples.map((sample, index) => (
                     <div
                       role="tabpanel"
-                      id={`sample-${index}`}
-                      aria-labelledby={`sample-tab-${index}`}
                       data-sample={index}
                       class:list={[
                         'font-mono text-[12.5px]/6 whitespace-pre transition duration-500',
@@ -112,13 +90,13 @@ const tones: Record<NonNullable<TerminalLine['tone']> | 'plain', string> = {
                       ]}
                     >
                       {sample.lines.map((line) => (
-                        <div class={tones[line.tone ?? 'plain']}>{line.text || ' '}</div>
+                        <div class={tone(line)}>{line.text || ' '}</div>
                       ))}
                     </div>
                   ))
                 }
               </div>
-            </div>
+            </CodeWindow>
           </div>
           <div
             aria-hidden="true"
@@ -129,12 +107,12 @@ const tones: Record<NonNullable<TerminalLine['tone']> | 'plain', string> = {
       </div>
     </div>
   </div>
-</section>
+</Section>
 
 <script>
   // Crossfade between the samples; the panel shown is in the flow, the rest sit on top of it.
   for (const root of document.querySelectorAll<HTMLElement>('[data-samples]')) {
-    const tabs = [...root.querySelectorAll<HTMLButtonElement>('[data-sample-tab]')]
+    const tabs = [...root.querySelectorAll<HTMLButtonElement>('[data-window-tab]')]
     const panels = [...root.querySelectorAll<HTMLElement>('[data-sample]')]
     const hidden = ['pointer-events-none', 'absolute', 'inset-x-6', 'top-6', 'translate-y-2', 'opacity-0', 'blur-sm']
     tabs.forEach((tab, index) =>

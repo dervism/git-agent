@@ -1,0 +1,30 @@
+---
+// SPDX-FileCopyrightText: Tailwind Labs Inc. (Tailwind Plus)
+// SPDX-FileCopyrightText: 2026 Dervis Mansuroglu
+// SPDX-License-Identifier: LicenseRef-TailwindPlus
+//
+// Adapted from Tailwind Plus (https://tailwindcss.com/plus) and used under a
+// personal Tailwind Plus license, as part of this website only. This file is
+// not covered by the site's GPL, and no license to it is granted: do not copy,
+// modify or redistribute it, on its own or as part of anything else, such as a
+// component library, template, plugin, AI skill or dataset. See site/NOTICE.
+
+// A small pill in the accent color: "New in 0.8", a version.
+
+interface Props {
+  readonly mono?: boolean
+  readonly class?: string
+}
+
+const { mono = false, class: className } = Astro.props
+---
+
+<span
+  class:list={[
+    'rounded-full bg-brand-50 px-3 py-1 text-sm/6 font-semibold whitespace-nowrap text-brand-600 ring-1 ring-brand-600/20 ring-inset dark:bg-brand-500/10 dark:text-brand-300 dark:ring-brand-400/25',
+    mono && 'font-mono',
+    className,
+  ]}
+>
+  <slot />
+</span>

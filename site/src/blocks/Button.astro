@@ -1,0 +1,38 @@
+---
+// SPDX-FileCopyrightText: Tailwind Labs Inc. (Tailwind Plus)
+// SPDX-FileCopyrightText: 2026 Dervis Mansuroglu
+// SPDX-License-Identifier: LicenseRef-TailwindPlus
+//
+// Adapted from Tailwind Plus (https://tailwindcss.com/plus) and used under a
+// personal Tailwind Plus license, as part of this website only. This file is
+// not covered by the site's GPL, and no license to it is granted: do not copy,
+// modify or redistribute it, on its own or as part of anything else, such as a
+// component library, template, plugin, AI skill or dataset. See site/NOTICE.
+
+// A call to action. `primary` is the silver button with a soft glow; `link`
+// is a text link with an arrow that moves on hover.
+
+interface Props {
+  readonly href: string
+  readonly variant?: 'primary' | 'link'
+  readonly class?: string
+}
+
+const { href, variant = 'primary', class: className } = Astro.props
+const styles = {
+  primary:
+    'rounded-md bg-brand-600 px-3.5 py-2.5 text-sm font-semibold text-white shadow-xs transition hover:bg-brand-500 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-brand-600 dark:bg-gray-200 dark:text-gray-900 dark:shadow-[0_0_40px_-8px_var(--color-brand-300)] dark:hover:bg-white dark:focus-visible:outline-gray-200',
+  link: 'group text-sm/6 font-semibold text-gray-900 dark:text-white',
+}
+---
+
+<a href={href} class:list={[styles[variant], className]}>
+  <slot />
+  {
+    variant === 'link' && (
+      <span aria-hidden="true" class="ml-1 inline-block transition-transform group-hover:translate-x-1">
+        →
+      </span>
+    )
+  }
+</a>

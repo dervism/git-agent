@@ -1,0 +1,56 @@
+---
+// SPDX-FileCopyrightText: Tailwind Labs Inc. (Tailwind Plus)
+// SPDX-FileCopyrightText: 2026 Dervis Mansuroglu
+// SPDX-License-Identifier: LicenseRef-TailwindPlus
+//
+// Adapted from Tailwind Plus (https://tailwindcss.com/plus) and used under a
+// personal Tailwind Plus license, as part of this website only. This file is
+// not covered by the site's GPL, and no license to it is granted: do not copy,
+// modify or redistribute it, on its own or as part of anything else, such as a
+// component library, template, plugin, AI skill or dataset. See site/NOTICE.
+
+// The heading of a section, as the Tailwind Plus sections set it: a small
+// accent eyebrow, a large title, and an optional lead paragraph (the `lead`
+// slot). The title is the default slot, so part of it can be a <Sheen>.
+//
+// In a section the eyebrow is the <h2> and the title a <p>, as in the blocks;
+// at the top of a page (`level="h1"`) the title is the <h1>.
+
+interface Props {
+  readonly eyebrow: string
+  /** The id of the heading element, for aria-labelledby. */
+  readonly id?: string
+  readonly level?: 'h1' | 'h2'
+  readonly align?: 'left' | 'center'
+  /** How wide the heading may run. */
+  readonly width?: '2xl' | '3xl'
+  readonly class?: string
+}
+
+const { eyebrow, id, level = 'h2', align = 'left', width = '2xl', class: className } = Astro.props
+const Eyebrow = level === 'h2' ? 'h2' : 'p'
+const Title = level === 'h2' ? 'p' : 'h1'
+const centered = align === 'center'
+const titleSize = level === 'h1' ? 'text-5xl sm:text-6xl' : 'text-4xl sm:text-5xl'
+---
+
+<div class:list={[{ '2xl': 'max-w-2xl', '3xl': 'max-w-3xl' }[width], centered && 'mx-auto text-center', className]}>
+  <Eyebrow id={level === 'h2' ? id : undefined} data-reveal class="text-base/7 font-semibold text-brand-600 dark:text-brand-300">
+    {eyebrow}
+  </Eyebrow>
+  <Title
+    id={level === 'h1' ? id : undefined}
+    data-reveal
+    style="--reveal-delay: 80ms"
+    class:list={['mt-2 font-semibold tracking-tight text-balance text-gray-900 dark:text-white', titleSize]}
+  >
+    <slot />
+  </Title>
+  {
+    Astro.slots.has('lead') && (
+      <p data-reveal style="--reveal-delay: 160ms" class="mt-6 text-lg/8 text-gray-700 dark:text-gray-300">
+        <slot name="lead" />
+      </p>
+    )
+  }
+</div>

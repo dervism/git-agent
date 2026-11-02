@@ -1,12 +1,19 @@
 ---
+// SPDX-FileCopyrightText: 2026 Dervis Mansuroglu
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 // The documentation: the repository's README, with a sidebar of its sections.
 import { execFileSync } from 'node:child_process'
 import { getEntry, render } from 'astro:content'
 import Layout from '../layouts/Layout.astro'
-import Header from '../components/Header.astro'
-import Footer from '../components/Footer.astro'
-import DocsNav from '../components/DocsNav.astro'
-import Icon from '../components/Icon.astro'
+import Header from '../blocks/Header.astro'
+import Footer from '../blocks/Footer.astro'
+import DocsNav from '../blocks/DocsNav.astro'
+import Badge from '../blocks/Badge.astro'
+import Glow from '../design/components/Glow.astro'
+import Icon from '../design/components/Icon.astro'
+import SectionHeading from '../blocks/SectionHeading.astro'
+import Sheen from '../design/components/Sheen.astro'
 import { crate, navigation, readmeSource, repository, version } from '../content/site'
 
 const readme = await getEntry('readme', 'readme')
@@ -41,29 +48,20 @@ try {
   <main id="top" class="relative isolate bg-white dark:bg-gray-900">
     <div aria-hidden="true" class="pointer-events-none absolute inset-x-0 top-0 -z-10 h-[36rem] overflow-hidden">
       <div class="grid-lines absolute inset-0"></div>
-      <div class="absolute -top-48 left-1/4 size-[40rem] animate-drift rounded-full bg-brand-700/25 blur-[120px]"></div>
+      <Glow class="-top-48 left-1/4 size-[40rem]" />
       <div class="absolute inset-x-0 bottom-0 h-40 bg-linear-to-t from-gray-900"></div>
     </div>
 
     <div class="mx-auto max-w-7xl px-6 pt-36 pb-16 sm:pt-44 lg:px-8">
-      <p data-reveal class="text-base/7 font-semibold text-brand-600 dark:text-brand-300">Documentation</p>
-      <h1
-        data-reveal
-        style="--reveal-delay: 80ms"
-        class="mt-2 max-w-3xl text-5xl font-semibold tracking-tight text-balance text-gray-900 sm:text-6xl dark:text-white"
-      >
-        Everything git-agent does, <span class="text-sheen animate-shimmer">and how to set it up</span>
-      </h1>
+      <SectionHeading eyebrow="Documentation" level="h1" width="3xl">
+        Everything git-agent does, <Sheen>and how to set it up</Sheen>
+      </SectionHeading>
       <div
         data-reveal
         style="--reveal-delay: 160ms"
         class="mt-8 flex flex-wrap items-center gap-x-6 gap-y-3 text-sm/6 text-gray-500"
       >
-        <span
-          class="rounded-full bg-brand-500/10 px-3 py-0.5 font-mono font-semibold text-brand-300 ring-1 ring-brand-400/25 ring-inset"
-        >
-          v{version}
-        </span>
+        <Badge mono>v{version}</Badge>
         {updated && <span>Updated {updated}</span>}
         <a href={readmeSource} class="group inline-flex items-center gap-x-1.5 font-semibold text-gray-300 hover:text-white">
           Edit on GitHub
@@ -101,9 +99,7 @@ try {
           <Content />
         </article>
 
-        <div
-          class="mt-20 flex max-w-3xl flex-wrap items-center justify-between gap-6 rounded-2xl bg-gray-800/50 px-6 py-5 ring-1 ring-white/10"
-        >
+        <div class="panel mt-20 flex max-w-3xl flex-wrap items-center justify-between gap-6 rounded-2xl px-6 py-5">
           <p class="text-sm/6 text-gray-400">
             This page is the project’s README. Something missing or unclear? Edit it on GitHub.
           </p>

@@ -1,0 +1,22 @@
+/*
+ * SPDX-FileCopyrightText: 2026 Dervis Mansuroglu
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ */
+
+/*
+ * The git-agent design system. Every page imports this file, and only this one.
+ * See README.md next to it for the tokens, utilities and components.
+ */
+
+@import "tailwindcss";
+@import "@fontsource-variable/inter";
+@import "@fontsource-variable/jetbrains-mono";
+@plugin "@tailwindcss/typography";
+
+/* The site is always dark; the blocks' dark: variants carry the design. */
+@custom-variant dark (&:where(.dark, .dark *));
+
+@import "./tokens.css";
+@import "./base.css";
+@import "./utilities.css";
+@import "./prose.css";

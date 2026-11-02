@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Dervis Mansuroglu
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 // Markdown plugins for rendering the repository's README as the docs page.
 
 const repository = 'https://github.com/dervism/git-agent/blob/master/'

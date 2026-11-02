@@ -1,0 +1,16 @@
+---
+// SPDX-FileCopyrightText: 2026 Dervis Mansuroglu
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+// Inline code or a short label in a quiet chip: a command, a file name.
+
+interface Props {
+  readonly size?: 'sm' | 'md'
+  readonly class?: string
+}
+
+const { size = 'md', class: className } = Astro.props
+const sizes = { sm: 'px-2 py-0.5 text-[11px]/5 text-gray-400', md: 'px-2 py-1 text-sm' }
+---
+
+<code class:list={['chip inline-block', sizes[size], className]}><slot /></code>

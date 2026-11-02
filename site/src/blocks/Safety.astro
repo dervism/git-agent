@@ -1,0 +1,101 @@
+---
+// SPDX-FileCopyrightText: Tailwind Labs Inc. (Tailwind Plus)
+// SPDX-FileCopyrightText: 2026 Dervis Mansuroglu
+// SPDX-License-Identifier: LicenseRef-TailwindPlus
+//
+// Adapted from Tailwind Plus (https://tailwindcss.com/plus) and used under a
+// personal Tailwind Plus license, as part of this website only. This file is
+// not covered by the site's GPL, and no license to it is granted: do not copy,
+// modify or redistribute it, on its own or as part of anything else, such as a
+// component library, template, plugin, AI skill or dataset. See site/NOTICE.
+
+// Adapted from Tailwind Plus marketing-v4/sections/feature-sections/20.simple-3x2-grid,
+// with the newest safeguard, the untracked-file check, featured above the grid.
+import Badge from './Badge.astro'
+import CodeWindow from './CodeWindow.astro'
+import Icon from '../design/components/Icon.astro'
+import Section from '../design/components/Section.astro'
+import SectionHeading from './SectionHeading.astro'
+import { tone, type TerminalLine } from '../design/terminal'
+import type { Feature } from '../content/site'
+
+interface Props {
+  readonly features: readonly Feature[]
+  readonly featured: {
+    readonly title: string
+    readonly description: string
+    readonly points: readonly string[]
+    readonly output: readonly TerminalLine[]
+  }
+}
+
+const { features, featured } = Astro.props
+---
+
+<Section id="safety" labelledby="safety-heading">
+  <div class="mx-auto max-w-7xl px-6 lg:px-8">
+    <SectionHeading eyebrow="Safe by default" id="safety-heading">
+      Careful with your code, keys and history
+      <Fragment slot="lead">
+        git-agent works through plain git commands and asks before anything leaves your machine or rewrites what you
+        have.
+      </Fragment>
+    </SectionHeading>
+
+    <div
+      id="untracked"
+      data-reveal
+      style="--reveal-delay: 120ms"
+      class="panel mt-16 grid scroll-mt-28 grid-cols-1 overflow-hidden rounded-3xl lg:grid-cols-[minmax(0,5fr)_minmax(0,6fr)]"
+    >
+      <div class="p-8 sm:p-10">
+        <Badge>New</Badge>
+        <h3 class="mt-5 text-2xl font-semibold tracking-tight text-balance text-white">{featured.title}</h3>
+        <p class="mt-4 text-base/7 text-gray-400">{featured.description}</p>
+        <ul role="list" class="mt-6 space-y-3 text-sm/6 text-gray-300">
+          {
+            featured.points.map((point) => (
+              <li class="flex gap-x-3">
+                <Icon name="Check" class="mt-0.5 size-5 shrink-0 text-brand-300" />
+                {point}
+              </li>
+            ))
+          }
+        </ul>
+      </div>
+      <div class="relative isolate flex items-end pt-4 pl-8 sm:pl-10 lg:pt-10">
+        <div aria-hidden="true" class="bg-stage absolute inset-0 -z-10 opacity-40"></div>
+        <CodeWindow tabs={['git agent --all']} class="w-full shadow-2xl ring-1 ring-white/10">
+          <div class="overflow-x-auto px-5 pt-5 pb-8 font-mono text-[12px]/6 whitespace-pre">
+            {
+              featured.output.map((line, index) => (
+                <div data-reveal style={`--reveal-delay: ${250 + index * 70}ms`} class={tone(line)}>
+                  {line.text || ' '}
+                </div>
+              ))
+            }
+          </div>
+        </CodeWindow>
+      </div>
+    </div>
+
+    <dl
+      class="mx-auto mt-16 grid max-w-2xl grid-cols-1 gap-8 text-base/7 text-gray-600 sm:grid-cols-2 lg:mx-0 lg:max-w-none lg:grid-cols-3 lg:gap-x-16 dark:text-gray-400"
+    >
+      {
+        features.map((feature, index) => (
+          <div data-reveal style={`--reveal-delay: ${(index % 3) * 100}ms`} class="group relative pl-9">
+            <dt class="inline font-semibold text-gray-900 dark:text-white">
+              <Icon
+                name={feature.icon}
+                class="absolute top-1 left-1 size-5 text-brand-600 transition-transform duration-500 group-hover:scale-125 dark:text-brand-400"
+              />
+              {feature.name}
+            </dt>{' '}
+            <dd class="inline">{feature.description}</dd>
+          </div>
+        ))
+      }
+    </dl>
+  </div>
+</Section>

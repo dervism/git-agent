@@ -1,46 +1,49 @@
 ---
+// SPDX-FileCopyrightText: Tailwind Labs Inc. (Tailwind Plus)
+// SPDX-FileCopyrightText: 2026 Dervis Mansuroglu
+// SPDX-License-Identifier: LicenseRef-TailwindPlus
+//
+// Adapted from Tailwind Plus (https://tailwindcss.com/plus) and used under a
+// personal Tailwind Plus license, as part of this website only. This file is
+// not covered by the site's GPL, and no license to it is granted: do not copy,
+// modify or redistribute it, on its own or as part of anything else, such as a
+// component library, template, plugin, AI skill or dataset. See site/NOTICE.
+
 // Adapted from Tailwind Plus marketing-v4/sections/heroes/04-split-with-code-example.
 // The logo moved to the header; the code window plays git-agent sessions.
-import Icon from './Icon.astro'
-import Terminal from './Terminal.astro'
+import Badge from './Badge.astro'
+import Button from './Button.astro'
+import Glow from '../design/components/Glow.astro'
+import Icon from '../design/components/Icon.astro'
+import Sheen from '../design/components/Sheen.astro'
+import Terminal from '../components/Terminal.astro'
 import type { Scene } from '../content/site'
 
 interface Props {
-  readonly version: string
+  readonly news: { readonly label: string; readonly text: string; readonly href: string }
   readonly repository: string
   readonly scenes: readonly Scene[]
 }
 
-const { version, repository, scenes } = Astro.props
-const minor = version.split('.').slice(0, 2).join('.')
+const { news, repository, scenes } = Astro.props
 ---
 
 <div id="top" class="bg-white dark:bg-gray-900">
   <div class="relative isolate overflow-hidden bg-linear-to-b from-brand-100/20 dark:from-brand-950/40">
     <div aria-hidden="true" class="pointer-events-none absolute inset-0 -z-20">
       <div class="grid-lines absolute inset-0"></div>
-      <div
-        class="absolute -top-40 left-[-10%] size-[42rem] animate-drift rounded-full bg-brand-700/25 blur-[120px]"
-      >
-      </div>
-      <div
-        class="absolute top-1/3 right-[-15%] size-[36rem] animate-drift-slow rounded-full bg-gray-600/30 blur-[120px]"
-      >
-      </div>
+      <Glow class="-top-40 left-[-10%] size-[42rem]" />
+      <Glow tone="gray" speed="slow" class="top-1/3 right-[-15%] size-[36rem]" />
     </div>
     <div class="mx-auto max-w-7xl pt-36 pb-24 sm:pt-40 sm:pb-32 lg:grid lg:grid-cols-2 lg:gap-x-8 lg:px-8 lg:py-48">
       <div class="px-6 lg:px-0 lg:pt-4">
         <div class="mx-auto max-w-2xl">
           <div class="max-w-lg">
             <div data-reveal>
-              <a href="#features" class="inline-flex space-x-6">
-                <span
-                  class="rounded-full bg-brand-50 px-3 py-1 text-sm/6 font-semibold whitespace-nowrap text-brand-600 ring-1 ring-brand-600/20 ring-inset dark:bg-brand-500/10 dark:text-brand-300 dark:ring-brand-400/25"
-                >
-                  New in {minor}
-                </span>
+              <a href={news.href} class="inline-flex space-x-6">
+                <Badge>{news.label}</Badge>
                 <span class="inline-flex items-center space-x-2 text-sm/6 font-medium text-gray-600 dark:text-gray-300">
-                  <span>Name branches and tidy commits</span>
+                  <span>{news.text}</span>
                   <Icon name="ChevronRight" class="size-5 text-gray-400 dark:text-gray-500" />
                 </span>
               </a>
@@ -50,7 +53,7 @@ const minor = version.split('.').slice(0, 2).join('.')
               style="--reveal-delay: 80ms"
               class="mt-10 text-5xl font-semibold tracking-tight text-pretty text-gray-900 sm:text-7xl dark:text-white"
             >
-              Let a language model do your <span class="text-sheen animate-shimmer">git chores</span>
+              Let a language model do your <Sheen>git chores</Sheen>
             </h1>
             <p
               data-reveal
@@ -62,17 +65,8 @@ const minor = version.split('.').slice(0, 2).join('.')
               lands.
             </p>
             <div data-reveal style="--reveal-delay: 240ms" class="mt-10 flex items-center gap-x-6">
-              <a
-                href="#install"
-                class="rounded-md bg-brand-600 px-3.5 py-2.5 text-sm font-semibold text-white shadow-xs transition hover:bg-brand-500 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-brand-600 dark:bg-gray-200 dark:text-gray-900 dark:shadow-[0_0_40px_-8px_var(--color-brand-300)] dark:hover:bg-white dark:focus-visible:outline-gray-200"
-              >
-                Install git-agent
-              </a>
-              <a href={repository} class="group text-sm/6 font-semibold text-gray-900 dark:text-white">
-                View on GitHub <span aria-hidden="true" class="inline-block transition-transform group-hover:translate-x-1"
-                  >→</span
-                >
-              </a>
+              <Button href="#install">Install git-agent</Button>
+              <Button href={repository} variant="link">View on GitHub</Button>
             </div>
           </div>
         </div>
@@ -89,7 +83,7 @@ const minor = version.split('.').slice(0, 2).join('.')
         </div>
         <div class="shadow-lg md:rounded-3xl dark:shadow-[0_40px_120px_-30px_rgb(0_0_0/0.8)]">
           <div
-            class="bg-brand-500 [clip-path:inset(0)] md:[clip-path:inset(0_round_var(--radius-3xl))] dark:bg-linear-to-br dark:from-gray-600 dark:via-gray-700 dark:to-gray-800"
+            class="bg-brand-500 [clip-path:inset(0)] md:[clip-path:inset(0_round_var(--radius-3xl))] dark:bg-stage"
           >
             <div
               aria-hidden="true"
@@ -98,9 +92,7 @@ const minor = version.split('.').slice(0, 2).join('.')
             </div>
             <div class="relative px-6 pt-8 sm:pt-16 md:pr-0 md:pl-16">
               <div class="mx-auto max-w-2xl md:mx-0 md:max-w-none">
-                <div class="w-screen overflow-hidden rounded-tl-xl bg-gray-900">
-                  <Terminal scenes={scenes} />
-                </div>
+                <Terminal scenes={scenes} class="w-screen" />
               </div>
               <div
                 aria-hidden="true"

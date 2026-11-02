@@ -60,16 +60,20 @@ pull request is usually the step after a push, which git-agent already does. If 
 lacks some of the branch's commits, they are pushed first, and the review can create
 the pull request as a draft.
 
-### `git agent branch "fix login timeout"`
+### `git agent branch "fix login timeout"` (DONE)
 
 Creates a branch named after a description, here `fix/login-timeout`, or after an
-issue number looked up with `gh`.
+issue number looked up with `gh`. Without a description, it names the branch after the
+uncommitted changes, which come along to it. Names follow the pattern of the
+repository's existing branches.
 
-### `git agent tidy`
+### `git agent tidy` (DONE)
 
 Cleans up commits before they are pushed. It rewords messages like "wip" and "fix
 typo", and folds fixups into the commits they fix. It only touches commits that aren't
-on the remote yet, so git-agent still never force-pushes.
+on the remote yet, so git-agent still never force-pushes. The commits are rewritten in
+a temporary worktree, and the branch only moves if the result ends with the same files
+as before.
 
 ### `git agent undo` and `git agent rescue`
 

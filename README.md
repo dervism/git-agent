@@ -378,10 +378,10 @@ git agent explain -q "anything breaking?"  # ask something specific
 
 A merge commit is explained through the commits it merged. `--branch` compares the
 branch with the remote's default branch, such as `origin/main`, unless you name
-another with `--base`. `--pull` finds the last `git pull` that changed the current
-branch in the branch's reflog. After a pull with rebase, your own commits are new
-copies on top of the ones that arrived; git-agent leaves them out, so only the
-commits that arrived are explained.
+another with `--base`. `--pull` looks in the current branch's reflog for the last
+`git pull` that changed it. A pull with rebase puts new copies of your own commits on
+top of the ones that arrived; git-agent leaves the copies out and explains only what
+arrived.
 
 The model gets the commit messages and the diff of everything the commits change
 together. A long range is shortened the same way as a large commit (see
@@ -458,8 +458,9 @@ export GIT_AGENT_API_KEY="your-api-key"
 
 Before git-agent sends anything to the model, it looks for secrets in it and replaces
 each one with `[REDACTED]`. That covers the diff, the commit messages of pull requests
-and explained commits, and the code and history that `git agent why` sends. The model still sees that something was there, but the secret itself never
-goes into a prompt, whichever server you use.
+and explained commits, and the code and history that `git agent why` sends. The model
+still sees that something was there, but the secret itself never goes into a prompt,
+whichever server you use.
 
 ### Rejecting or warning
 

@@ -133,6 +133,25 @@ pub fn show_framed(heading: &str, text: &str) {
     println!("{}", dim(&"─".repeat(WIDTH)));
 }
 
+/// Prints the model's answer: framed under `heading` in a terminal, and as it
+/// is when the output goes to a file or a pipe.
+pub fn show_answer(heading: &str, text: &str) {
+    if io::stdout().is_terminal() {
+        show_framed(heading, text);
+    } else {
+        println!("{text}");
+    }
+}
+
+/// Asks for a follow-up question. `None` when the user is done.
+pub fn ask_follow_up() -> Result<Option<String>> {
+    let question = read_line(&format!(
+        "Follow-up question {} ›",
+        dim("(Enter to finish)")
+    ))?;
+    Ok(question.filter(|question| !question.is_empty()))
+}
+
 /// Shows an animated progress line on stderr until dropped.
 ///
 /// Relies on a single-threaded runtime, so the animation cannot draw while it is being cleared.

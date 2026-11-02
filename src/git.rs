@@ -28,8 +28,33 @@ pub struct Changes {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Commit {
     pub hash: String,
+    pub author: String,
+    /// The author date, e.g. 2025-10-02.
+    pub date: String,
     /// The subject, then the body indented: "- subject\n  body".
     pub message: String,
+}
+
+/// The short form of a commit, for naming it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Summary {
+    pub hash: String,
+    pub short: String,
+    pub author: String,
+    /// The author date, e.g. 2025-10-02.
+    pub date: String,
+    pub subject: String,
+}
+
+/// A `git pull` that changed the current branch, from the branch's reflog.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Pull {
+    /// The branch before the pull.
+    pub before: String,
+    /// The branch right after it.
+    pub after: String,
+    /// When it happened, e.g. "2 hours ago".
+    pub when: String,
 }
 
 /// A commit's message and patch, as pushing it would publish them.
@@ -40,11 +65,46 @@ pub struct CommitPatch {
     pub patch: String,
 }
 
+/// git's built-in diff drivers for common languages, by file extension. With
+/// them, `git blame -L :name` and `git log -L` find functions inside classes
+/// and impl blocks, and hunk headers name the enclosing function.
+const FUNCTION_DRIVERS: &str = "\
+*.rs diff=rust
+*.py diff=python
+*.go diff=golang
+*.java diff=java
+*.kt diff=kotlin
+*.kts diff=kotlin
+*.cs diff=csharp
+*.c diff=cpp
+*.h diff=cpp
+*.cc diff=cpp
+*.cpp diff=cpp
+*.cxx diff=cpp
+*.hpp diff=cpp
+*.m diff=objc
+*.mm diff=objc
+*.rb diff=ruby
+*.php diff=php
+*.pl diff=perl
+*.pm diff=perl
+*.sh diff=bash
+*.bash diff=bash
+*.ex diff=elixir
+*.exs diff=elixir
+*.css diff=css
+*.html diff=html
+*.md diff=markdown
+*.tex diff=tex
+";
+
 pub struct Repo {
     /// Directory git commands run in.
     workdir: PathBuf,
     /// An index file to use instead of the repository's own.
     index: Option<PathBuf>,
+    /// An attributes file to use instead of the user's own.
+    attributes: Option<PathBuf>,
 }
 
 impl Repo {
@@ -52,6 +112,7 @@ impl Repo {
         let repo = Self {
             workdir: workdir.into(),
             index: None,
+            attributes: None,
         };
         let inside = repo.git(&["rev-parse", "--is-inside-work-tree"]);
         if !inside.is_ok_and(|out| out.trim() == "true") {
@@ -66,12 +127,54 @@ impl Repo {
         Repo {
             workdir: self.workdir.clone(),
             index: Some(index),
+            attributes: self.attributes.clone(),
         }
+    }
+
+    /// The same repository with the attributes file at `attributes` in place
+    /// of the user's own (see [`Repo::write_function_attributes`]).
+    pub fn with_attributes(&self, attributes: PathBuf) -> Repo {
+        Repo {
+            workdir: self.workdir.clone(),
+            index: self.index.clone(),
+            attributes: Some(attributes),
+        }
+    }
+
+    /// Writes an attributes file to `path` that sets git's built-in diff
+    /// drivers for common languages, followed by the user's own attributes,
+    /// which take precedence, as do the repository's `.gitattributes`.
+    pub fn write_function_attributes(&self, path: &Path) -> Result<()> {
+        let mut text = FUNCTION_DRIVERS.to_owned();
+        if let Some(own) = self.user_attributes()
+            && let Ok(own) = fs::read_to_string(own)
+        {
+            text.push_str(&own);
+        }
+        fs::write(path, text).with_context(|| format!("failed to write {}", path.display()))
+    }
+
+    /// The user's attributes file: `core.attributesFile`, else git's default.
+    fn user_attributes(&self) -> Option<PathBuf> {
+        if let Ok(path) = self.git(&["config", "--path", "--get", "core.attributesFile"]) {
+            return Some(PathBuf::from(path.trim()));
+        }
+        let config = std::env::var_os("XDG_CONFIG_HOME")
+            .filter(|dir| !dir.is_empty())
+            .map(PathBuf::from)
+            .or_else(|| std::env::var_os("HOME").map(|home| Path::new(&home).join(".config")))?;
+        Some(config.join("git/attributes"))
     }
 
     fn command(&self, args: &[&str]) -> Command {
         let mut command = Command::new("git");
-        command.current_dir(&self.workdir).args(args);
+        command.current_dir(&self.workdir);
+        if let Some(attributes) = &self.attributes {
+            command
+                .arg("-c")
+                .arg(format!("core.attributesFile={}", attributes.display()));
+        }
+        command.args(args);
         if let Some(index) = &self.index {
             command.env("GIT_INDEX_FILE", index);
         }
@@ -289,16 +392,26 @@ impl Repo {
 
     /// The commits on HEAD that `base` lacks, oldest first, without merges.
     pub fn commits_since(&self, base: &str) -> Result<Vec<Commit>> {
-        let log = self.git(&[
+        self.commits(&[&format!("{base}..HEAD")])
+    }
+
+    /// The commits `git log` lists for `revisions` (e.g. `main..HEAD`), oldest
+    /// first, without merges.
+    pub fn commits(&self, revisions: &[&str]) -> Result<Vec<Commit>> {
+        let mut args = vec![
             "log",
             "--reverse",
             "--no-merges",
-            "--format=%x1e%h%n%s%n%b",
-            &format!("{base}..HEAD"),
-        ])?;
+            "--format=%x1e%h%n%an%n%as%n%s%n%b",
+        ];
+        args.extend_from_slice(revisions);
+        args.push("--");
+        let log = self.git(&args)?;
         let commits = log.split('\x1e').filter_map(|record| {
             let mut lines = record.trim().lines();
             let hash = lines.next().filter(|hash| !hash.is_empty())?;
+            let author = lines.next().unwrap_or_default();
+            let date = lines.next().unwrap_or_default();
             let mut message = format!("- {}", lines.next().unwrap_or_default());
             for line in lines {
                 message.push('\n');
@@ -309,10 +422,189 @@ impl Repo {
             }
             Some(Commit {
                 hash: hash.to_owned(),
+                author: author.to_owned(),
+                date: date.to_owned(),
                 message: message.trim_end().to_owned(),
             })
         });
         Ok(commits.collect())
+    }
+
+    /// The changes between two commits, or what `git diff` shows for a range
+    /// such as `main...feature`, without the diffs of files matching `exclude`.
+    pub fn changes_between(&self, revisions: &[&str], exclude: &[String]) -> Result<Changes> {
+        self.diff(revisions, exclude)
+    }
+
+    /// The full hash of the commit `revision` names, or `None` if it names none.
+    pub fn resolve(&self, revision: &str) -> Result<Option<String>> {
+        if revision.starts_with('-') {
+            return Ok(None);
+        }
+        let output = self
+            .command(&["rev-parse", "--verify", "--quiet"])
+            .arg(format!("{revision}^{{commit}}"))
+            .output()
+            .context("failed to run git; is it installed?")?;
+        let hash = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+        Ok((output.status.success() && !hash.is_empty()).then_some(hash))
+    }
+
+    /// The parents of `commit`: none for a first commit, two or more for a merge.
+    pub fn parents(&self, commit: &str) -> Result<Vec<String>> {
+        let line = self.git(&["rev-list", "--parents", "--max-count=1", commit])?;
+        Ok(line.split_whitespace().skip(1).map(str::to_owned).collect())
+    }
+
+    /// The hash of the empty tree, which a first commit is compared with.
+    pub fn empty_tree(&self) -> Result<String> {
+        // `output()` gives git an empty stdin.
+        let hash = self.git(&["hash-object", "-t", "tree", "--stdin"])?;
+        Ok(hash.trim().to_owned())
+    }
+
+    /// The short hash, author, date and subject of each of `hashes`.
+    pub fn summaries(&self, hashes: &[&str]) -> Result<Vec<Summary>> {
+        if hashes.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut args = vec![
+            "show",
+            "--no-patch",
+            "--format=%H%x1f%h%x1f%an%x1f%as%x1f%s",
+        ];
+        args.extend_from_slice(hashes);
+        args.push("--");
+        let shown = self.git(&args)?;
+        let summaries = shown.lines().filter_map(|line| {
+            let mut parts = line.split('\x1f');
+            let mut next = || parts.next().unwrap_or_default().to_owned();
+            let summary = Summary {
+                hash: next(),
+                short: next(),
+                author: next(),
+                date: next(),
+                subject: next(),
+            };
+            (!summary.hash.is_empty()).then_some(summary)
+        });
+        Ok(summaries.collect())
+    }
+
+    /// Whether `branch` is a local branch.
+    pub fn is_branch(&self, branch: &str) -> bool {
+        self.git(&[
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            &format!("refs/heads/{branch}"),
+        ])
+        .is_ok()
+    }
+
+    /// The branch new branches most likely start from: the remote's default
+    /// branch (e.g. `origin/main`), else `main` or `master`.
+    pub fn default_base(&self) -> Result<String> {
+        let remote = self.remote().or_else(|_| self.push_remote()).ok();
+        let mut candidates = Vec::new();
+        if let Some(remote) = &remote {
+            let head = format!("refs/remotes/{remote}/HEAD");
+            if let Ok(name) = self.git(&["symbolic-ref", "--quiet", "--short", &head]) {
+                return Ok(name.trim().to_owned());
+            }
+            candidates.extend([format!("{remote}/main"), format!("{remote}/master")]);
+        }
+        candidates.extend(["main".to_owned(), "master".to_owned()]);
+        candidates
+            .into_iter()
+            .find(|candidate| self.resolve(candidate).is_ok_and(|hash| hash.is_some()))
+            .context("could not tell which branch to compare with; name it with --base")
+    }
+
+    /// The last `git pull` that changed `branch`, if its reflog has one.
+    pub fn last_pull(&self, branch: &str) -> Result<Option<Pull>> {
+        let reflog = self.git(&[
+            "log",
+            "--walk-reflogs",
+            "--date=relative",
+            "--format=%H%x1f%gd%x1f%gs",
+            &format!("refs/heads/{branch}"),
+            "--",
+        ])?;
+        let entries: Vec<Vec<&str>> = reflog
+            .lines()
+            .map(|line| line.split('\x1f').collect())
+            .collect();
+        let Some(index) = entries.iter().position(|entry| {
+            entry
+                .get(2)
+                .is_some_and(|action| action.starts_with("pull"))
+        }) else {
+            return Ok(None);
+        };
+        let Some(before) = entries.get(index + 1) else {
+            // The pull created the branch, so there is nothing to compare with.
+            return Ok(None);
+        };
+        let selector = entries[index].get(1).copied().unwrap_or_default();
+        let when = selector
+            .split_once("@{")
+            .map_or("", |(_, rest)| rest.trim_end_matches('}'));
+        Ok(Some(Pull {
+            before: before[0].to_owned(),
+            after: entries[index][0].to_owned(),
+            when: when.to_owned(),
+        }))
+    }
+
+    /// Whether HEAD has a file at `path`, which may be absolute or relative
+    /// to the directory git runs in.
+    pub fn in_head(&self, path: &str) -> bool {
+        self.git(&["ls-tree", "--name-only", "HEAD", "--", path])
+            .is_ok_and(|listed| !listed.trim().is_empty())
+    }
+
+    /// `git blame --porcelain` for the lines `range` (a `-L` value such as
+    /// `120,140` or `:name`) of `path` as it is in the work tree. Whitespace
+    /// changes and moved or copied lines don't count as changes.
+    pub fn blame(&self, path: &str, range: &str) -> Result<String> {
+        self.git(&[
+            "blame",
+            "--porcelain",
+            "-w",
+            "-M",
+            "-C",
+            "-L",
+            range,
+            "--",
+            path,
+        ])
+    }
+
+    /// The lines of `path` that differ from HEAD, as `git diff --unified=0` hunks.
+    pub fn uncommitted_hunks(&self, path: &str) -> Result<String> {
+        self.git(&[
+            "diff",
+            "--no-color",
+            "--no-ext-diff",
+            "--unified=0",
+            "HEAD",
+            "--",
+            path,
+        ])
+    }
+
+    /// The newest `limit` commits that changed the lines `range` of `path` at
+    /// HEAD (`git log -L`), each followed by its diff of those lines.
+    pub fn line_history(&self, path: &str, range: &str, limit: usize) -> Result<String> {
+        self.git(&[
+            "log",
+            "--no-color",
+            "--no-ext-diff",
+            &format!("--max-count={limit}"),
+            "--format=%x1e%h%x1f%an%x1f%as%x1f%B%x1f",
+            &format!("-L{range}:{path}"),
+        ])
     }
 
     /// The checked-out branch.
@@ -803,6 +1095,101 @@ mod tests {
         assert!(!repo.has_uncommitted_changes().unwrap());
         fs::write(dir.path().join("lib.rs"), "fn d() {}\n").unwrap();
         assert!(repo.has_uncommitted_changes().unwrap());
+    }
+
+    #[test]
+    fn traces_the_history_of_lines_through_a_rename() {
+        use crate::why;
+        let (dir, repo) = setup();
+        let write = |content: &str| fs::write(dir.path().join("core.rs"), content).unwrap();
+        fs::write(
+            dir.path().join("lib.rs"),
+            "fn a() {}\nfn b() {}\nfn c() {}\n",
+        )
+        .unwrap();
+        repo.commit("feat: add b and c", Scope::Tracked, &[])
+            .unwrap();
+        run(dir.path(), &["mv", "lib.rs", "core.rs"]);
+        repo.commit("refactor: rename lib to core", Scope::Staged, &[])
+            .unwrap();
+        write("fn a() {}\nfn b2() {}\nfn c() {}\n");
+        repo.commit("fix: rename b", Scope::Tracked, &[]).unwrap();
+        write("// new\nfn a() {}\nfn b2() {}\nfn c() {}\n");
+        assert!(repo.in_head("core.rs") && !repo.in_head("lib.rs"));
+
+        let blamed = why::parse_blame(&repo.blame("core.rs", "1,3").unwrap());
+        let lines: Vec<(usize, bool)> = blamed
+            .iter()
+            .map(|line| (line.line, line.is_committed()))
+            .collect();
+        assert_eq!(lines, [(1, false), (2, true), (3, true)]);
+        let summaries = repo.summaries(&[&blamed[1].hash, &blamed[2].hash]).unwrap();
+        let subjects: Vec<&str> = summaries.iter().map(|s| s.subject.as_str()).collect();
+        assert_eq!(subjects, ["init", "fix: rename b"]);
+        assert!(summaries[0].short.len() >= 7 && summaries[0].date.len() == 10);
+
+        let hunks = why::parse_hunks(&repo.uncommitted_hunks("core.rs").unwrap());
+        assert_eq!(why::head_line(&hunks, 3), Some(2));
+        let history = why::parse_history(&repo.line_history("core.rs", "2,2", 10).unwrap());
+        let subjects: Vec<&str> = history.iter().map(|c| c.message.as_str()).collect();
+        assert_eq!(subjects.first(), Some(&"fix: rename b"));
+        assert_eq!(subjects.last(), Some(&"feat: add b and c"));
+        assert!(history[0].patch.contains("-fn b() {}\n+fn b2() {}"));
+        // Before the rename, the lines were in lib.rs.
+        assert!(history.last().unwrap().patch.contains("lib.rs"));
+        assert_eq!(history[0].author, "Test");
+    }
+
+    #[test]
+    fn finds_methods_with_the_built_in_diff_drivers() {
+        let (dir, repo) = setup();
+        let code = "struct Repo;\n\nimpl Repo {\n    fn has_open(&self) {}\n\n    \
+                    pub fn open() -> Self {\n        Repo\n    }\n}\n";
+        fs::write(dir.path().join("lib.rs"), code).unwrap();
+        repo.commit("feat: open", Scope::Tracked, &[]).unwrap();
+        let word = crate::why::Target {
+            path: "lib.rs".into(),
+            lines: crate::why::Lines::Function("open".into()),
+        }
+        .ranges()
+        .remove(0);
+        // Without a driver, git only finds what starts at the first column.
+        let err = repo.blame("lib.rs", &word).unwrap_err();
+        assert!(err.to_string().contains("no match"), "{err}");
+
+        let attributes = repo.git_path("test-attributes").unwrap();
+        repo.write_function_attributes(&attributes).unwrap();
+        let drivers = repo.with_attributes(attributes);
+        let blamed = crate::why::parse_blame(&drivers.blame("lib.rs", &word).unwrap());
+        let lines: Vec<usize> = blamed.iter().map(|line| line.line).collect();
+        assert_eq!(lines, [6, 7, 8, 9]);
+        let history = drivers.line_history("lib.rs", &word, 5).unwrap();
+        assert!(history.contains("feat: open") && history.contains("+    pub fn open()"));
+    }
+
+    #[test]
+    fn resolves_commits_and_their_parents() {
+        let (dir, repo) = setup();
+        fs::write(dir.path().join("lib.rs"), "fn b() {}\n").unwrap();
+        repo.commit("feat: b\n\nWhy b.", Scope::Tracked, &[])
+            .unwrap();
+        let head = repo.resolve("HEAD").unwrap().unwrap();
+        let first = repo.resolve("HEAD~1").unwrap().unwrap();
+        assert_eq!(repo.parents(&head).unwrap(), std::slice::from_ref(&first));
+        assert!(repo.parents(&first).unwrap().is_empty());
+        assert!(repo.resolve("no-such-branch").unwrap().is_none());
+        assert!(repo.resolve("--all").unwrap().is_none());
+        assert!(repo.is_branch("main") && !repo.is_branch("HEAD~1"));
+
+        let empty = repo.empty_tree().unwrap();
+        let changes = repo.changes_between(&[&empty, &first], &[]).unwrap();
+        assert!(changes.diff.contains("+fn a() {}"));
+        let commits = repo.commits(&["--max-count=1", &head]).unwrap();
+        assert_eq!(commits.len(), 1);
+        assert_eq!(commits[0].message, "- feat: b\n  Why b.");
+        assert_eq!(commits[0].author, "Test");
+        // Without a remote, branches start from main.
+        assert_eq!(repo.default_base().unwrap(), "main");
     }
 
     #[test]

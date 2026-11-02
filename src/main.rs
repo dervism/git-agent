@@ -1,5 +1,6 @@
 mod cli;
 mod config;
+mod explain;
 mod fit;
 mod git;
 mod github;
@@ -12,10 +13,13 @@ mod secrets;
 mod server;
 mod split;
 mod ui;
+mod why;
 
 use anyhow::{Context, Result, bail};
 use clap::Parser;
-use cli::{Cli, Command, ConfigCommand, GenerateArgs, PrArgs, SettingArgs, SplitArgs};
+use cli::{
+    Cli, Command, ConfigCommand, ExplainArgs, GenerateArgs, PrArgs, SettingArgs, SplitArgs, WhyArgs,
+};
 use config::{Config, OnSecrets};
 use fit::Kept;
 use git::{CommitPatch, Repo, Scope};
@@ -27,6 +31,7 @@ use server::{Message, ModelServer, Server};
 use split::{FilePatch, Plan, Unit};
 use std::fs;
 use std::io::{self, IsTerminal};
+use std::path::Path;
 use std::process::ExitCode;
 use ui::{Action, Choice, Review, thousands};
 
@@ -114,6 +119,8 @@ async fn main() -> ExitCode {
         None => generate(&cli.generate, &cli.settings).await,
         Some(Command::Split(args)) => split_changes(&args, &cli.settings).await,
         Some(Command::Pr(args)) => pull_request(&args, &cli.settings).await,
+        Some(Command::Why(args)) => explain_lines(&args, &cli.settings).await,
+        Some(Command::Explain(args)) => explain_commits(&args, &cli.settings).await,
         Some(Command::Models) => list_models(&cli.settings).await,
         Some(Command::Config { command: None }) => menu::run(&cli.settings).await,
         Some(Command::Config {
@@ -301,11 +308,7 @@ async fn split_changes(args: &SplitArgs, settings: &SettingArgs) -> Result<()> {
     }
     let text = redact::text(&described.text, "changes").text;
     let conversation = prompt::split_messages(&text, args.hint.as_deref());
-    let prompt_tokens = conversation
-        .iter()
-        .map(|message| prompt::estimate_tokens(&message.content))
-        .sum();
-    report_model(&model, prompt_tokens);
+    report_model(&model, conversation_tokens(&conversation));
 
     let splitter = Splitter {
         repo: &repo,
@@ -665,6 +668,296 @@ async fn pull_request(args: &PrArgs, settings: &SettingArgs) -> Result<()> {
         extra_args: &args.gh_args,
     };
     create_pull_request(&repo, &config, &pull_request, !args.create)
+}
+
+async fn explain_lines(args: &WhyArgs, settings: &SettingArgs) -> Result<()> {
+    let config = Config::load(settings)?.config;
+    let repo = Repo::open(".")?;
+    let target = why::Target::parse(&args.target, |path| Path::new(path).is_file())?;
+    if !repo.in_head(&target.path) {
+        ui::info(format!(
+            "✨ {} isn't committed yet, so git has no history for it.",
+            target.path
+        ));
+        return Ok(());
+    }
+    let source =
+        fs::read(&target.path).with_context(|| format!("failed to read {}", target.path))?;
+    let source = String::from_utf8_lossy(&source);
+    let target = target.within(source.lines().count())?;
+    // Built-in diff drivers let git find functions inside classes and impl blocks.
+    let attributes = repo.git_path("GIT_AGENT_ATTRIBUTES")?;
+    repo.write_function_attributes(&attributes)?;
+    let found = look_up(&repo.with_attributes(attributes.clone()), &target);
+    let _ = fs::remove_file(&attributes);
+    let Some(Known {
+        blamed,
+        mut history,
+        complete,
+    }) = found?
+    else {
+        ui::info(format!(
+            "✨ {} isn't committed yet, so git has no history for it.",
+            target.label()
+        ));
+        return Ok(());
+    };
+    let lines = (blamed[0].line, blamed[blamed.len() - 1].line);
+    let uncommitted: Vec<usize> = blamed
+        .iter()
+        .filter(|line| !line.is_committed())
+        .map(|line| line.line)
+        .collect();
+
+    let mut hashes: Vec<&str> = blamed
+        .iter()
+        .filter(|line| line.is_committed())
+        .map(|line| line.hash.as_str())
+        .collect();
+    hashes.sort_unstable();
+    hashes.dedup();
+    let summaries = repo.summaries(&hashes)?;
+    let mut status = format!("🔍 {}", target.label());
+    // The history is newest first.
+    if let Some(latest) = history.first() {
+        status.push_str(&format!(
+            ", last changed in {} ({}, {})",
+            latest.short, latest.author, latest.date
+        ));
+    }
+    let count = history.len();
+    status.push_str(&format!(
+        "; {count}{} commit(s) in its history",
+        if complete { "" } else { "+" }
+    ));
+    ui::info(status);
+    if !uncommitted.is_empty() {
+        ui::info(ui::dim(&format!(
+            "   {} of its lines have uncommitted changes; the history is of the committed version.",
+            uncommitted.len()
+        )));
+    }
+
+    let excerpt = redact::text(&why::excerpt(&source, lines.0, lines.1), &target.path);
+    let blame = redact::text(&why::blame_summary(&blamed, &summaries), "git blame");
+    let mut findings = [excerpt.findings, blame.findings].concat();
+    for change in &mut history {
+        let message = redact::text(&change.message, &format!("commit {} message", change.short));
+        change.message = message.text;
+        let patch = redact::diff(&change.patch);
+        change.patch = patch.text;
+        findings.extend(message.findings);
+        findings.extend(patch.findings.into_iter().map(|finding| Finding {
+            place: format!("commit {} {}", change.short, finding.place),
+            ..finding
+        }));
+    }
+    report_secrets(
+        &findings,
+        "If they are real, revoke them: they are in the code or its history.",
+    );
+
+    let (server, model) = connect(&config).await?;
+    let room = prompt::room(
+        prompt::WHY_PROMPT,
+        model.context_length,
+        config.max_output_tokens,
+    )
+    .saturating_sub(prompt::question_bytes(args.question.as_deref()));
+    let intro = why::intro(&target, lines, &uncommitted, &excerpt.text, &blame.text);
+    let described = why::describe(&intro, &history, complete, room);
+    let conversation = prompt::why_messages(&described.text, args.question.as_deref());
+    report_model(&model, conversation_tokens(&conversation));
+    if described.left_out > 0 || described.cut > 0 {
+        let mut parts = Vec::new();
+        if described.left_out > 0 {
+            parts.push(format!("left out {} older commits", described.left_out));
+        }
+        if described.cut > 0 {
+            parts.push(format!("cut {} diffs short", described.cut));
+        }
+        ui::info(ui::dim(&format!(
+            "   The history is too long for the context, so git-agent {}.",
+            parts.join(" and ")
+        )));
+    }
+    discuss(
+        &server,
+        &model,
+        &config,
+        &format!("Why {}", target.label()),
+        conversation,
+    )
+    .await
+}
+
+/// What git knows about the lines `git agent why` explains.
+struct Known {
+    /// The commit that last changed each line; at least one line is committed.
+    blamed: Vec<why::Blamed>,
+    /// The newest commits that changed the lines, newest first.
+    history: Vec<why::Change>,
+    /// Whether `history` goes back to the commit that added the lines.
+    complete: bool,
+}
+
+/// Blames the lines of `target` and reads their history, or returns `None`
+/// if none of them are committed.
+fn look_up(repo: &Repo, target: &why::Target) -> Result<Option<Known>> {
+    let mut patterns = target.ranges().into_iter();
+    let (range, blame) = loop {
+        let Some(range) = patterns.next() else {
+            let why::Lines::Function(name) = &target.lines else {
+                unreachable!("a range of lines has a pattern");
+            };
+            bail!(
+                "git found no function {name:?} in {}. It finds functions by their first line; \
+                 if the language is one git doesn't know, name the lines instead, e.g. {}:120-140",
+                target.path,
+                target.path
+            );
+        };
+        match repo.blame(&target.path, &range) {
+            Ok(blame) => break (range, blame),
+            Err(err) if err.to_string().contains("no match") => continue,
+            Err(err) => return Err(err),
+        }
+    };
+    let blamed = why::parse_blame(&blame);
+    if !blamed.iter().any(why::Blamed::is_committed) {
+        return Ok(None);
+    }
+    // The history is of HEAD's version of the file, whose line numbers differ
+    // where the work tree has uncommitted changes.
+    let range = match &target.lines {
+        why::Lines::Function(_) => range,
+        why::Lines::Range(..) => {
+            let hunks = why::parse_hunks(&repo.uncommitted_hunks(&target.path)?);
+            let head: Vec<usize> = blamed
+                .iter()
+                .filter_map(|line| why::head_line(&hunks, line.line))
+                .collect();
+            let (Some(first), Some(last)) = (head.iter().min(), head.iter().max()) else {
+                bail!("could not find {} in HEAD", target.label());
+            };
+            format!("{first},{last}")
+        }
+    };
+    let mut history =
+        why::parse_history(&repo.line_history(&target.path, &range, why::HISTORY_LIMIT + 1)?);
+    let complete = history.len() <= why::HISTORY_LIMIT;
+    history.truncate(why::HISTORY_LIMIT);
+    Ok(Some(Known {
+        blamed,
+        history,
+        complete,
+    }))
+}
+
+async fn explain_commits(args: &ExplainArgs, settings: &SettingArgs) -> Result<()> {
+    let config = Config::load(settings)?.config;
+    let repo = Repo::open(".")?;
+    let subject = explain::subject(&repo, args)?;
+    let log: Vec<&str> = subject.log.iter().map(String::as_str).collect();
+    let mut commits = repo.commits(&log)?;
+    if commits.is_empty() {
+        ui::info(format!("✨ {}", subject.nothing));
+        return Ok(());
+    }
+    let diff: Vec<&str> = subject.diff.iter().map(String::as_str).collect();
+    let mut changes = repo.changes_between(&diff, &config.exclude)?;
+    let summary = changes.stat.lines().last().unwrap_or_default().trim();
+    if subject.single {
+        let message = commits[0].message.trim_start_matches("- ");
+        let title = message.lines().next().unwrap_or_default();
+        ui::info(format!("🔍 {} ({title}): {summary}", subject.heading));
+    } else {
+        ui::info(format!(
+            "🔍 {}: {} commit(s), {summary}",
+            subject.heading,
+            commits.len()
+        ));
+    }
+    if let Some(target) = &args.target
+        && !args.branch
+        && repo.is_branch(target)
+    {
+        ui::info(ui::dim(&format!(
+            "   {target} is a branch, so this is its last commit; add --branch to explain the \
+             whole branch."
+        )));
+    }
+
+    let redacted = redact::diff(&changes.diff);
+    changes.diff = redacted.text;
+    let mut findings = redacted.findings;
+    for commit in &mut commits {
+        let place = format!("commit {} message", commit.hash);
+        let redacted = redact::text(&commit.message, &place);
+        commit.message = redacted.text;
+        findings.extend(redacted.findings);
+    }
+    report_secrets(
+        &findings,
+        "They are in the repository's history. If they are real, revoke them.",
+    );
+
+    let (server, model) = connect(&config).await?;
+    let listed: Vec<String> = commits.iter().map(explain::listed).collect();
+    let (conversation, fit) = prompt::explain_messages(
+        &subject.about,
+        &listed,
+        &changes,
+        args.question.as_deref(),
+        model.context_length,
+        config.max_output_tokens,
+    );
+    let smaller = (!subject.single).then_some("explain fewer commits at a time");
+    report_fit(&model, &fit, "explanation", smaller);
+    discuss(&server, &model, &config, &subject.heading, conversation).await
+}
+
+/// Shows the model's answer to `conversation` under `heading`, then answers
+/// follow-up questions until the user is done or the context is full.
+async fn discuss(
+    server: &impl ModelServer,
+    model: &Model,
+    config: &Config,
+    heading: &str,
+    mut conversation: Vec<Message>,
+) -> Result<()> {
+    let mut answer = generate_message(server, model, &conversation).await?;
+    ui::show_answer(heading, &answer);
+    if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
+        return Ok(());
+    }
+    while let Some(question) = ui::ask_follow_up()? {
+        let next = prompt::follow_up(&conversation, &answer, &question);
+        if !prompt::has_room(&next, model.context_length, config.max_output_tokens) {
+            ui::info(ui::dim(
+                "The conversation no longer fits in the model's context; ask your question in a \
+                 new run.",
+            ));
+            return Ok(());
+        }
+        // A failed reply keeps the conversation as it was, so the user can ask again.
+        match generate_message(server, model, &next).await {
+            Ok(reply) => {
+                conversation = next;
+                answer = reply;
+                ui::show_answer(heading, &answer);
+            }
+            Err(err) => ui::error(&err),
+        }
+    }
+    Ok(())
+}
+
+fn conversation_tokens(conversation: &[Message]) -> usize {
+    conversation
+        .iter()
+        .map(|message| prompt::estimate_tokens(&message.content))
+        .sum()
 }
 
 /// Connects to the configured server and picks the model to use.

@@ -31,14 +31,18 @@ sides and a proposed resolution, which can be accepted, edited or skipped. Today
 git-agent cancels the rebase when a push runs into a conflict, and this would give
 that case a next step.
 
-### `git agent why src/fit.rs:120`
+### `git agent why src/fit.rs:120` (DONE)
 
 Explains why a line is the way it is, from blame and the commits and diffs that
-touched it. It is IntelliJ's Annotate, with the model reading the history.
+touched it. It is IntelliJ's Annotate, with the model reading the history. It also
+takes a range of lines or a function, follows the lines through renames, and answers
+follow-up questions.
 
-### `git agent explain <commit or range>`
+### `git agent explain <commit or range>` (DONE)
 
-Summarizes a commit, a branch, or everything that arrived with the last pull.
+Summarizes a commit, a branch, or everything that arrived with the last pull. A merge
+is explained through the commits it merged, and after a pull with rebase, the
+branch's own rebased commits are left out, so only what arrived is described.
 
 ### Checking untracked files
 

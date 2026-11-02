@@ -165,7 +165,7 @@ pub fn path(file: &str) -> String {
 /// Drops header lines the model doesn't need: the blob hashes on the `index`
 /// line, and the `---` and `+++` lines that repeat the paths of the first line.
 /// Lines such as "new file mode" and "rename from" stay.
-fn compact_header(file: &str) -> String {
+pub fn compact_header(file: &str) -> String {
     let hunks = file.find("\n@@").map_or(file.len(), |newline| newline + 1);
     let (header, hunks) = file.split_at(hunks);
     let mut out: String = header

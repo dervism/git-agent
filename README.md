@@ -76,6 +76,8 @@ git agent --raw            # print just the message, e.g. for `| git commit -F -
 git agent -- --signoff     # pass extra arguments to `git commit`
 git agent split            # split the changes into several commits
 git agent pr               # write a pull request for the branch, then create it
+git agent why src/fit.rs:120  # explain why a line is the way it is
+git agent explain          # explain the last commit, a range, a branch or a pull
 ```
 
 ### Which changes are included
@@ -221,6 +223,77 @@ If the branch already has an open pull request, git-agent shows its address and
 stops. If `gh pr create` fails, git-agent saves the description to
 `.git/GIT_AGENT_PR.md` and prints the command that creates the pull request from it.
 
+## Explaining code and history
+
+Two commands answer questions about code that is already committed. Neither changes
+anything in the repository.
+
+### Why a line is the way it is
+
+`git agent why` explains lines of code from their history.
+
+```sh
+git agent why src/fit.rs:120              # one line
+git agent why src/fit.rs:120-140          # a range of lines
+git agent why src/fit.rs:share            # a function
+git agent why src/fit.rs:120 "why 400?"   # ask something specific
+```
+
+The model gets the lines with some code around them, the commit that last changed
+each line, and the history of the lines: every commit that changed them, newest
+first, with its message and its diff of those lines. The history follows the lines
+through renames, and blame skips commits that only change whitespace or move the
+lines. When the history is too long for the context, git-agent keeps the newest
+commits and the oldest one, because the commit that added the lines often says why,
+and cuts the diffs short.
+
+git-agent finds a function the way `git log -L :name:file` does, by the line that
+starts it. It turns on git's built-in function detection for common languages, among
+them Rust, Python, Go, Java, Kotlin, C, C++, C#, Ruby and PHP, so methods inside
+classes and impl blocks are found too. Your own `.gitattributes` still takes
+precedence.
+
+Lines with uncommitted changes are marked, and the rest are explained from the
+committed version. If none of the lines are committed yet, there is no history to
+explain, and git-agent says so.
+
+### Explaining commits
+
+`git agent explain` summarizes commits: what they change and why, and what you may
+need to act on, such as a breaking change or a new setting.
+
+```sh
+git agent explain                          # the last commit
+git agent explain a1b2c3d                  # another commit
+git agent explain v0.5.0..v0.6.0           # a range of commits
+git agent explain --branch                 # the current branch since it left the default branch
+git agent explain --branch feature         # another branch
+git agent explain --pull                   # what the last git pull brought in
+git agent explain -q "anything breaking?"  # ask something specific
+```
+
+A merge commit is explained through the commits it merged. `--branch` compares the
+branch with the remote's default branch, such as `origin/main`, unless you name
+another with `--base`. `--pull` finds the last `git pull` that changed the current
+branch in the branch's reflog. After a pull with rebase, your own commits are new
+copies on top of the ones that arrived; git-agent leaves them out, so only the
+commits that arrived are explained.
+
+The model gets the commit messages and the diff of everything the commits change
+together. A long range is shortened the same way as a large commit (see
+[Large changes](#large-changes)).
+
+### Follow-up questions
+
+After the answer, both commands wait for a follow-up question, and the model answers
+it with the same code and history at hand. Press Enter on an empty line to finish.
+git-agent stops asking when the conversation no longer fits in the model's context.
+When the output goes to a pipe or a file, it prints the answer and exits.
+
+Secrets in the code and the history are replaced with `[REDACTED]` before anything is
+sent, as for commits. These commands commit and push nothing, so they only warn about
+secrets, whatever `on_secrets` is set to.
+
 ## Choosing a model
 
 git-agent sends your changes to the model server at `base_url`. By default that is
@@ -280,8 +353,8 @@ export GIT_AGENT_API_KEY="your-api-key"
 ## Secrets in your changes
 
 Before git-agent sends anything to the model, it looks for secrets in it and replaces
-each one with `[REDACTED]`. That covers the diff and, for pull requests, the commit
-messages. The model still sees that something was there, but the secret itself never
+each one with `[REDACTED]`. That covers the diff, the commit messages of pull requests
+and explained commits, and the code and history that `git agent why` sends. The model still sees that something was there, but the secret itself never
 goes into a prompt, whichever server you use.
 
 ### Rejecting or warning

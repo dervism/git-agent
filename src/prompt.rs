@@ -27,6 +27,34 @@ Guidelines:
 
 Reply with the title and description only: no introduction, no "Title:" label, no code fences."###;
 
+/// Instructions for explaining lines of code (`git agent why`).
+pub const WHY_PROMPT: &str = r#"You explain to a developer why some lines of code are the way they are, from what git knows about them.
+
+You get:
+- The lines to explain, marked with ">", and some of the code around them.
+- The commit that last changed each line (git blame).
+- The history of the lines: each commit that changed them, newest first, with its message and its diff of the lines.
+
+How to answer:
+- Start with the answer: why the lines are as they are, and what they are for.
+- Then tell how they got here: the commit that added them and the changes since, as far as they matter, naming each commit by its short hash in parentheses, e.g. (a1b2c3d).
+- Base the answer on the commit messages, the diffs and the code. When they don't say why something was done, say so instead of guessing, and keep what you infer from the code apart from what the commits say.
+- If the developer asks a question, answer it.
+- Be brief: a few short paragraphs, or "- " bullets. Write plain text for a terminal, without headings, tables or bold."#;
+
+/// Instructions for explaining commits (`git agent explain`).
+pub const EXPLAIN_PROMPT: &str = r#"You explain commits to a developer who wants to understand them: one commit, a range of commits, a branch, or the commits a pull brought in.
+
+You get the commits, oldest first, each with its short hash, subject, author and date and the rest of its message, then the files they change and the diff of everything they change together. Long diffs are shortened.
+
+How to answer:
+- Start with a sentence or two on what the commits do and why, as far as their messages and the diff say.
+- Then the notable changes as "- " bullets, grouped by topic rather than by commit or by file. When there are several commits, name the ones behind each point by their short hashes in parentheses, e.g. (a1b2c3d).
+- Point out what the developer may need to act on, such as breaking changes, new or changed settings, new dependencies, migrations, or changes to how something is used. Leave this out when there is nothing.
+- Base the answer on the commits and the diff. Do not invent motivation, issue numbers or test results, and say so when the reason for a change isn't clear.
+- If the developer asks a question, answer it.
+- Write plain text for a terminal, without headings, tables or bold."#;
+
 /// Instructions for grouping a change into commits (`git agent split`). The
 /// messages come later, one commit at a time, from the commit message prompt.
 pub const SPLIT_PROMPT: &str = r#"You split a developer's uncommitted changes into a series of small, logical commits, the way a careful developer would before pushing.
@@ -146,19 +174,100 @@ pub fn pull_request_messages(
     context_length: usize,
     max_output_tokens: usize,
 ) -> (Vec<Message>, Fit) {
-    const HEADING: &str = "Commits on the branch, oldest first:\n";
-    let room = room(PULL_REQUEST_PROMPT, context_length, max_output_tokens);
-    let mut intro = notes(hint);
+    with_commits(
+        PULL_REQUEST_PROMPT,
+        notes(hint),
+        "Commits on the branch, oldest first:\n",
+        commits,
+        changes,
+        room(PULL_REQUEST_PROMPT, context_length, max_output_tokens),
+    )
+}
+
+/// Like [`pull_request_messages`], asking to explain the `commits` (see
+/// `explain::listed`) and the `changes` they make together. `about` names
+/// them, e.g. "commit a1b2c3d".
+pub fn explain_messages(
+    about: &str,
+    commits: &[String],
+    changes: &Changes,
+    question: Option<&str>,
+    context_length: usize,
+    max_output_tokens: usize,
+) -> (Vec<Message>, Fit) {
+    with_commits(
+        EXPLAIN_PROMPT,
+        format!("{}Explain {about}.\n\n", asks(question)),
+        "Commits, oldest first:\n",
+        commits,
+        changes,
+        room(EXPLAIN_PROMPT, context_length, max_output_tokens),
+    )
+}
+
+/// The system prompt and a user message of `intro`, the `commits` under
+/// `heading`, and the changes, in about `room` bytes.
+fn with_commits(
+    system_prompt: &str,
+    mut intro: String,
+    heading: &str,
+    commits: &[String],
+    changes: &Changes,
+    room: usize,
+) -> (Vec<Message>, Fit) {
     let intro_bytes =
-        intro.len() + HEADING.len() + commits.iter().map(|c| c.len() + 1).sum::<usize>();
+        intro.len() + heading.len() + commits.iter().map(|c| c.len() + 1).sum::<usize>();
     // Commit messages often say why the changes were made, which the diff
     // can't, so they get up to a third of the room.
     let listed = list_commits(commits, room / 3);
-    let _ = writeln!(intro, "{HEADING}{}", listed.text);
-    let (messages, mut fit) = build(PULL_REQUEST_PROMPT, intro, intro_bytes, changes, room);
+    let _ = writeln!(intro, "{heading}{}", listed.text);
+    let (messages, mut fit) = build(system_prompt, intro, intro_bytes, changes, room);
     fit.commit_bodies_left_out = listed.bodies_left_out;
     fit.commits_left_out = listed.left_out;
     (messages, fit)
+}
+
+/// The conversation asking why the lines that `history` describes (see
+/// `why::describe`) are the way they are.
+pub fn why_messages(history: &str, question: Option<&str>) -> Vec<Message> {
+    vec![
+        Message::system(WHY_PROMPT),
+        Message::user(format!("{}{history}", asks(question))),
+    ]
+}
+
+/// Bytes the developer's question takes in the user message.
+pub fn question_bytes(question: Option<&str>) -> usize {
+    asks(question).len()
+}
+
+/// Continues `base` with the model's `answer` and the developer's next `question`.
+pub fn follow_up(base: &[Message], answer: &str, question: &str) -> Vec<Message> {
+    let mut messages = base.to_vec();
+    messages.push(Message::assistant(answer));
+    messages.push(Message::user(question));
+    messages
+}
+
+/// Whether `messages` leave room in the context for another reply.
+pub fn has_room(messages: &[Message], context_length: usize, max_output_tokens: usize) -> bool {
+    let used: usize = messages
+        .iter()
+        .map(|message| estimate_tokens(&message.content))
+        .sum();
+    let reply = (reply_reserve(context_length, max_output_tokens) / 2).max(1024);
+    used + reply <= context_length
+}
+
+/// The developer's question, if there is one.
+fn asks(question: Option<&str>) -> String {
+    match question
+        .map(str::trim)
+        .filter(|question| !question.is_empty())
+    {
+        Some(question) => format!("The developer asks:\n{question}\n\n"),
+        None => String::new(),
+    }
 }
 
 /// "Notes from the author" from the hint, if there is one.
@@ -481,6 +590,46 @@ mod tests {
             listed.left_out
         )));
         assert!(listed.text.len() <= 300 + 40);
+    }
+
+    #[test]
+    fn asks_to_explain_commits_with_the_question_first() {
+        let commits = ["- a1b2c3d feat: add b (Ann, 2025-10-02)".to_owned()];
+        let (messages, fit) = explain_messages(
+            "commit a1b2c3d",
+            &commits,
+            &changes(&diff(1)),
+            Some("does it break anything?"),
+            8192,
+            REPLY,
+        );
+        assert_eq!(messages[0].content, EXPLAIN_PROMPT);
+        assert!(messages[1].content.starts_with(
+            "The developer asks:\ndoes it break anything?\n\nExplain commit a1b2c3d.\n\n\
+             Commits, oldest first:\n- a1b2c3d feat: add b (Ann, 2025-10-02)\n\nChanged files:\n"
+        ));
+        assert!(fit.is_complete());
+    }
+
+    #[test]
+    fn asks_why_and_follows_up_while_there_is_room() {
+        let messages = why_messages("Explain line 3 of a.rs.\n", None);
+        assert_eq!(messages[0].content, WHY_PROMPT);
+        assert_eq!(messages[1].content, "Explain line 3 of a.rs.\n");
+        assert_eq!(question_bytes(Some("  ")), 0);
+        let asked = why_messages("history\n", Some("why 3?"));
+        assert_eq!(asked[1].content, "The developer asks:\nwhy 3?\n\nhistory\n");
+        assert_eq!(
+            question_bytes(Some("why 3?")),
+            "The developer asks:\nwhy 3?\n\n".len()
+        );
+
+        let next = follow_up(&messages, "Because.", "And line 4?");
+        assert_eq!(next.len(), 4);
+        assert_eq!(next[3].content, "And line 4?");
+        assert!(has_room(&next, 4096, REPLY));
+        let long = follow_up(&messages, &"word ".repeat(3000), "more?");
+        assert!(!has_room(&long, 4096, REPLY));
     }
 
     #[test]

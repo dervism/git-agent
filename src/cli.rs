@@ -153,12 +153,53 @@ pub struct SplitArgs {
     pub git_args: Vec<String>,
 }
 
+/// Options for `git agent why`.
+#[derive(Args, Debug)]
+pub struct WhyArgs {
+    /// The lines to explain: FILE:LINE, FILE:START-END or FILE:FUNCTION
+    #[arg(value_name = "FILE:LINE")]
+    pub target: String,
+
+    /// A question about the lines, e.g. "why 400 bytes?"
+    #[arg(value_name = "QUESTION")]
+    pub question: Option<String>,
+}
+
+/// Options for `git agent explain`.
+#[derive(Args, Debug)]
+pub struct ExplainArgs {
+    /// A commit (e.g. HEAD~2) or a range (e.g. v1.0..v1.1); with --branch, a branch
+    /// [default: HEAD, or with --branch the current branch]
+    #[arg(value_name = "COMMIT")]
+    pub target: Option<String>,
+
+    /// Explain a branch: its commits since it left the default branch
+    #[arg(short, long)]
+    pub branch: bool,
+
+    /// The branch --branch compares with [default: the remote's default branch]
+    #[arg(long, value_name = "BRANCH", requires = "branch")]
+    pub base: Option<String>,
+
+    /// Explain what the last `git pull` brought into the current branch
+    #[arg(long, conflicts_with_all = ["target", "branch"])]
+    pub pull: bool,
+
+    /// A question about the commits, e.g. "does anything break?"
+    #[arg(short, long, value_name = "TEXT")]
+    pub question: Option<String>,
+}
+
 #[derive(Subcommand, Debug)]
 pub enum Command {
     /// Split the changes into several commits, grouped by the model
     Split(SplitArgs),
     /// Write a pull request for the current branch, then create it on GitHub with gh
     Pr(PrArgs),
+    /// Explain why lines of code are the way they are, from their history
+    Why(WhyArgs),
+    /// Explain a commit, a range of commits, a branch or the last pull
+    Explain(ExplainArgs),
     /// List the models available on the configured server
     Models,
     /// Change the settings in an interactive menu, or create or inspect the config file
@@ -255,6 +296,40 @@ mod tests {
         };
         assert!(args.all && args.commit && !args.push);
         assert_eq!(args.git_args, ["--signoff"]);
+    }
+
+    #[test]
+    fn why_takes_lines_and_a_question() {
+        let cli = Cli::try_parse_from(["git-agent", "why", "src/fit.rs:120", "why 400?"]).unwrap();
+        let Some(Command::Why(args)) = cli.command else {
+            panic!("expected the why command");
+        };
+        assert_eq!(args.target, "src/fit.rs:120");
+        assert_eq!(args.question.as_deref(), Some("why 400?"));
+        assert!(Cli::try_parse_from(["git-agent", "why"]).is_err());
+    }
+
+    #[test]
+    fn explain_takes_a_commit_a_branch_or_the_last_pull() {
+        let parse = |args: &[&str]| {
+            let cli = Cli::try_parse_from([&["git-agent", "explain"], args].concat())?;
+            match cli.command {
+                Some(Command::Explain(args)) => Ok::<_, clap::Error>(args),
+                _ => panic!("expected the explain command"),
+            }
+        };
+        let args = parse(&[]).unwrap();
+        assert!(args.target.is_none() && !args.branch && !args.pull);
+        let args = parse(&["v1.0..v1.1", "-q", "breaking?"]).unwrap();
+        assert_eq!(args.target.as_deref(), Some("v1.0..v1.1"));
+        assert_eq!(args.question.as_deref(), Some("breaking?"));
+        let args = parse(&["--branch", "feature", "--base", "develop"]).unwrap();
+        assert!(args.branch);
+        assert_eq!(args.base.as_deref(), Some("develop"));
+        assert!(parse(&["--pull"]).unwrap().pull);
+        assert!(parse(&["--pull", "HEAD~2"]).is_err());
+        assert!(parse(&["--pull", "--branch"]).is_err());
+        assert!(parse(&["--base", "main"]).is_err());
     }
 
     #[test]

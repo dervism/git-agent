@@ -1,3 +1,4 @@
+mod branch;
 mod cli;
 mod config;
 mod explain;
@@ -12,26 +13,28 @@ mod redact;
 mod secrets;
 mod server;
 mod split;
+mod tidy;
 mod ui;
 mod why;
 
 use anyhow::{Context, Result, bail};
 use clap::Parser;
 use cli::{
-    Cli, Command, ConfigCommand, ExplainArgs, GenerateArgs, PrArgs, SettingArgs, SplitArgs, WhyArgs,
+    BranchArgs, Cli, Command, ConfigCommand, ExplainArgs, GenerateArgs, PrArgs, SettingArgs,
+    SplitArgs, TidyArgs, WhyArgs,
 };
 use config::{Config, OnSecrets};
 use fit::Kept;
-use git::{CommitPatch, Repo, Scope};
+use git::{Changes, CommitPatch, Repo, Scope};
 use github::PullRequest;
 use models::{ContextSource, Model, Pick};
-use prompt::Fit;
+use prompt::{Fit, Work};
 use redact::{Change, Finding};
 use server::{Message, ModelServer, Server};
 use split::{FilePatch, Plan, Unit};
 use std::fs;
 use std::io::{self, IsTerminal};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use ui::{Action, Choice, Review, thousands};
 
@@ -110,6 +113,61 @@ const SPLIT_COMMIT_REVIEW: Review<bool> = Review {
         },
     ],
     quit: "stop here; the commits made so far stay, and the rest stays uncommitted",
+};
+
+/// Accepting the plan of a tidy-up.
+const TIDY_REVIEW: Review<()> = Review {
+    heading: "Proposed tidy-up",
+    first_line: "first line",
+    noun: "plan",
+    what: "plan",
+    edit: "edit the plan in your editor",
+    accept: &[Choice {
+        word: "accept",
+        help: "write the new messages, reviewing each, then tidy the commits",
+        value: (),
+    }],
+    quit: "quit without changing anything",
+};
+
+/// Accepting a new message for a commit being tidied: the value says whether to use it.
+const TIDY_MESSAGE_REVIEW: Review<bool> = Review {
+    heading: "Proposed commit message",
+    first_line: "subject line",
+    noun: "message",
+    what: "commit message",
+    edit: "edit the message in your editor",
+    accept: &[
+        Choice {
+            word: "use",
+            help: "give the commit this message",
+            value: true,
+        },
+        Choice {
+            word: "keep",
+            help: "keep the commit's old message",
+            value: false,
+        },
+    ],
+    quit: "stop without changing anything",
+};
+
+/// Most commits to tidy at a time.
+const MOST_TIDIED: usize = 40;
+
+/// Accepting a branch name.
+const BRANCH_REVIEW: Review<()> = Review {
+    heading: "Proposed branch name",
+    first_line: "name",
+    noun: "name",
+    what: "branch name",
+    edit: "edit the name",
+    accept: &[Choice {
+        word: "create",
+        help: "create the branch and switch to it",
+        value: (),
+    }],
+    quit: "quit without creating a branch",
 };
 
 #[tokio::main(flavor = "current_thread")]
@@ -202,7 +260,7 @@ async fn generate(args: &GenerateArgs, settings: &SettingArgs) -> Result<()> {
             "commit in smaller parts\n   (git agent split, or stage some files and run git agent)",
         ),
     );
-    let message = generate_message(&server, &model, &conversation).await?;
+    let message = commit_message(&server, &model, &conversation).await?;
 
     if args.raw {
         println!("{message}");
@@ -1042,11 +1100,6 @@ fn create_pull_request(
     }
     ui::info(ui::green("✅ Pull request created."));
     Ok(())
-}
-
-/// `text` quoted for a POSIX shell.
-fn shell_quote(text: &str) -> String {
-    format!("'{}'", text.replace('\'', r"'\''"))
 }
 
 /// Lists the secrets that were replaced before sending, then gives `advice`.

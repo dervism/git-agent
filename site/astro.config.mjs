@@ -7,6 +7,9 @@ import theme from './src/lib/shiki-theme.mjs'
 
 // https://astro.build/config
 export default defineConfig({
+  // Served by GitHub Pages as a project site.
+  site: 'https://dervism.github.io',
+  base: '/git-agent',
   markdown: {
     shikiConfig: { theme },
     // The docs page is the README, tidied by remark and rehype plugins.

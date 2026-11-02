@@ -16,3 +16,10 @@ The docs page (`/docs/`) is the repository's own `README.md`, loaded as a conten
 updates it. The
 colors are design tokens in `src/styles/global.css`: the palette overrides Tailwind's `gray`
 scale, and `brand` is the accent.
+
+## Deployment
+
+The site is published at https://dervism.github.io/git-agent/ by the `Website` workflow
+(`.github/workflows/pages.yml`). It runs on every push to master that changes `site/` or the
+README, and can be started by hand from the Actions tab. `site` and `base` in `astro.config.mjs`
+match that address; change both if the site moves.

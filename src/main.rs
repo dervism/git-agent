@@ -1509,7 +1509,8 @@ async fn connect(config: &Config) -> Result<(Server, Model)> {
 }
 
 /// Lets the user review `text` until they accept or quit it, revising it as
-/// they ask. Returns the accept choice and the final text, or `None` on quit.
+/// they ask; `clean` checks and tidies each new reply from the model. Returns
+/// the accept choice and the final text, or `None` on quit.
 async fn review<T: Copy>(
     review: &Review<T>,
     mut text: String,
@@ -1517,6 +1518,7 @@ async fn review<T: Copy>(
     model: &Model,
     conversation: &[Message],
     edit: impl Fn(&str) -> Result<Option<String>>,
+    clean: impl Fn(String) -> Result<String>,
 ) -> Result<Option<(T, String)>> {
     loop {
         let revised = match ui::ask_action(review)? {
@@ -1525,10 +1527,14 @@ async fn review<T: Copy>(
             Action::Edit => edit(&text),
             Action::Regenerate => generate_message(server, model, conversation)
                 .await
+                .and_then(&clean)
                 .map(Some),
             Action::Refine(feedback) => {
                 let refined = prompt::refine_messages(conversation, &text, &feedback, review.what);
-                generate_message(server, model, &refined).await.map(Some)
+                generate_message(server, model, &refined)
+                    .await
+                    .and_then(&clean)
+                    .map(Some)
             }
         };
         // A failed edit or generation keeps the current text so the review can go on.

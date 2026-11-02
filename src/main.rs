@@ -1580,7 +1580,7 @@ fn create_pull_request(
             "{err}; the description was saved, create the pull request with:\n  \
              gh pr create --base {} --title {} --body-file {}",
             pull_request.base,
-            shell_quote(pull_request.title),
+            git::shell_quote(pull_request.title),
             path.display()
         );
     }
@@ -1814,6 +1814,22 @@ async fn generate_message(
         bail!("the model returned an empty message");
     }
     Ok(message)
+}
+
+/// A commit message from the model, with its subject apart from its body.
+async fn commit_message(
+    server: &impl ModelServer,
+    model: &Model,
+    conversation: &[Message],
+) -> Result<String> {
+    generate_message(server, model, conversation)
+        .await
+        .and_then(separated)
+}
+
+/// A review's way of tidying a new commit message (see [`commit_message`]).
+fn separated(message: String) -> Result<String> {
+    Ok(prompt::separate_subject(&message))
 }
 
 fn commit(repo: &Repo, message: &str, scope: Scope, git_args: &[String]) -> Result<()> {

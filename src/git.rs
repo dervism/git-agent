@@ -217,6 +217,37 @@ impl Repo {
         self.git(&["add", "--all"]).map(drop)
     }
 
+    /// Stages all changes like [`Repo::stage_all`], except what the `exclude`
+    /// pathspecs name.
+    pub fn stage_all_except(&self, exclude: &[String]) -> Result<()> {
+        let mut args = vec!["add", "--all", "--", ":/"];
+        args.extend(exclude.iter().map(String::as_str));
+        self.git(&args).map(drop)
+    }
+
+    /// The untracked files that no ignore rule covers, each file listed on its
+    /// own and relative to the top of the work tree.
+    pub fn untracked_files(&self) -> Result<Vec<String>> {
+        let status = self.git(&["status", "--porcelain", "-z", "--untracked-files=all"])?;
+        let mut files = Vec::new();
+        let mut entries = status.split('\0');
+        while let Some(entry) = entries.next() {
+            if let Some(path) = entry.strip_prefix("?? ") {
+                files.push(path.to_owned());
+            } else if entry.get(..2).is_some_and(|code| code.contains(['R', 'C'])) {
+                // A rename or copy is followed by the path it came from.
+                entries.next();
+            }
+        }
+        Ok(files)
+    }
+
+    /// The top directory of the work tree.
+    pub fn toplevel(&self) -> Result<PathBuf> {
+        let top = self.git(&["rev-parse", "--show-toplevel"])?;
+        Ok(PathBuf::from(top.trim_end_matches(['\n', '\r'])))
+    }
+
     /// The changes to describe and how to commit them, or `None` if there are
     /// no staged or tracked changes.
     pub fn changes(&self, exclude: &[String]) -> Result<Option<(Scope, Changes)>> {
@@ -1476,6 +1507,45 @@ mod tests {
         assert!(err.to_string().contains("conflicts"), "{err}");
         assert_eq!(repo.resolve("HEAD").unwrap().unwrap(), tip);
         assert!(repo.git(&["worktree", "list"]).unwrap().lines().count() == 1);
+    }
+
+    #[test]
+    fn stages_everything_but_the_untracked_files_left_out() {
+        let (dir, repo) = setup();
+        fs::write(dir.path().join("Cargo.toml"), "[package]\n").unwrap();
+        fs::create_dir_all(dir.path().join("target/debug")).unwrap();
+        fs::write(dir.path().join("target/debug/app"), "binary").unwrap();
+        fs::create_dir_all(dir.path().join("src")).unwrap();
+        fs::write(dir.path().join("src/a b.rs"), "fn a() {}\n").unwrap();
+        fs::write(dir.path().join("lib.rs"), "fn changed() {}\n").unwrap();
+        run(dir.path(), &["mv", "lib.rs", "core.rs"]);
+        fs::write(dir.path().join("x.o"), "object").unwrap();
+
+        let mut untracked = repo.untracked_files().unwrap();
+        untracked.sort();
+        assert_eq!(
+            untracked,
+            ["Cargo.toml", "src/a b.rs", "target/debug/app", "x.o"]
+        );
+        assert_eq!(
+            repo.toplevel().unwrap().canonicalize().unwrap(),
+            dir.path().canonicalize().unwrap()
+        );
+
+        let findings = crate::untracked::check(&repo.toplevel().unwrap(), &untracked);
+        repo.stage_all_except(&crate::untracked::exclude(&findings))
+            .unwrap();
+        let staged = run(dir.path(), &["diff", "--cached", "--name-only"]);
+        // The rename shows by its new name.
+        assert_eq!(staged, "Cargo.toml\ncore.rs\nsrc/a b.rs\n");
+        assert_eq!(repo.untracked_files().unwrap().len(), 2);
+
+        // Once ignored, they stay out of a plain `git add --all` too.
+        crate::untracked::add_to_gitignore(&repo.toplevel().unwrap(), &findings).unwrap();
+        repo.stage_all().unwrap();
+        assert!(repo.untracked_files().unwrap().is_empty());
+        let staged = run(dir.path(), &["diff", "--cached", "--name-only"]);
+        assert!(staged.contains(".gitignore") && !staged.contains("target"));
     }
 
     #[test]

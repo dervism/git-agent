@@ -102,6 +102,22 @@ pub fn thousands(number: usize) -> String {
     out
 }
 
+/// Formats a size in bytes, e.g. 220 MB.
+pub fn bytes(count: u64) -> String {
+    const UNITS: [&str; 4] = ["bytes", "KB", "MB", "GB"];
+    let mut value = count as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
+    }
+    match unit {
+        0 => format!("{count} bytes"),
+        _ if value >= 10.0 => format!("{value:.0} {}", UNITS[unit]),
+        _ => format!("{value:.1} {}", UNITS[unit]),
+    }
+}
+
 pub fn info(message: impl Display) {
     eprintln!("{message}");
 }
@@ -276,6 +292,36 @@ fn read_line(prompt: &str) -> Result<Option<String>> {
     Ok(Some(line.trim().to_owned()))
 }
 
+/// What to do with untracked files that look like they should be ignored.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum UntrackedChoice {
+    /// Add them to .gitignore.
+    Ignore,
+    /// Stage them with everything else.
+    Commit,
+    Quit,
+}
+
+/// Asks what to do with untracked files that look like they should be
+/// ignored. Enter means ignore them; end of input means quit.
+pub fn ask_untracked() -> Result<UntrackedChoice> {
+    loop {
+        let question = format!(
+            "Add them to .gitignore? {}",
+            dim("[Y]es  [n]o, commit them too  [q]uit ›")
+        );
+        let Some(answer) = read_line(&question)? else {
+            return Ok(UntrackedChoice::Quit);
+        };
+        match answer.to_lowercase().as_str() {
+            "" | "y" | "yes" => return Ok(UntrackedChoice::Ignore),
+            "n" | "no" => return Ok(UntrackedChoice::Commit),
+            "q" | "quit" => return Ok(UntrackedChoice::Quit),
+            _ => eprintln!("Please answer y, n or q."),
+        }
+    }
+}
+
 /// Asks a yes/no question. Enter means yes; end of input means no.
 pub fn confirm(question: &str) -> Result<bool> {
     loop {
@@ -359,6 +405,14 @@ mod tests {
         assert_eq!(thousands(4096), "4,096");
         assert_eq!(thousands(131072), "131,072");
         assert_eq!(thousands(1234567), "1,234,567");
+    }
+
+    #[test]
+    fn formats_sizes() {
+        assert_eq!(bytes(40), "40 bytes");
+        assert_eq!(bytes(1536), "1.5 KB");
+        assert_eq!(bytes(220 * 1024 * 1024), "220 MB");
+        assert_eq!(bytes(3 * 1024 * 1024 * 1024 / 2), "1.5 GB");
     }
 
     #[test]

@@ -15,6 +15,7 @@ mod server;
 mod split;
 mod tidy;
 mod ui;
+mod untracked;
 mod why;
 
 use anyhow::{Context, Result, bail};
@@ -208,13 +209,17 @@ async fn generate(args: &GenerateArgs, settings: &SettingArgs) -> Result<()> {
 
     let config = Config::load(settings)?.config;
     let repo = Repo::open(".")?;
-    if args.all {
-        repo.stage_all()?;
+    let ask = !args.commit && !args.raw && io::stdin().is_terminal();
+    if args.all && !stage_all(&repo, ask)? {
+        ui::info("Nothing staged or committed.");
+        return Ok(());
     }
 
     let Some((scope, mut changes)) = repo.changes(&config.exclude)? else {
         match repo.untracked_count()? {
             0 => ui::info("✨ No changes to commit."),
+            // --all already said which untracked files it left out.
+            _ if args.all => ui::info("✨ No changes to commit besides the files left out above."),
             n => ui::info(format!(
                 "No changes to tracked files, but {n} untracked path(s). Use --all to include them."
             )),
@@ -231,7 +236,7 @@ async fn generate(args: &GenerateArgs, settings: &SettingArgs) -> Result<()> {
         )),
     }
     let untracked = repo.untracked_count()?;
-    if untracked > 0 {
+    if untracked > 0 && !args.all {
         ui::info(ui::dim(&format!(
             "   {untracked} untracked path(s) not included; use --all to include them."
         )));
@@ -320,8 +325,10 @@ async fn split_changes(args: &SplitArgs, settings: &SettingArgs) -> Result<()> {
     if let Some(operation) = repo.operation_in_progress()? {
         bail!("{operation} is in progress; finish or abort it before splitting changes");
     }
-    if args.all {
-        repo.stage_all()?;
+    let ask = !args.commit && io::stdin().is_terminal();
+    if args.all && !stage_all(&repo, ask)? {
+        ui::info("Nothing staged or committed.");
+        return Ok(());
     }
     let Some((scope, changes)) = repo.changes(&config.exclude)? else {
         ui::info("✨ No changes to split.");
@@ -1496,6 +1503,40 @@ fn conversation_tokens(conversation: &[Message]) -> usize {
         .iter()
         .map(|message| prompt::estimate_tokens(&message.content))
         .sum()
+}
+
+/// Stages everything for `--all`, after checking the untracked files for
+/// build output, dependencies, secrets and large files that a `.gitignore`
+/// should keep out. With `ask`, the user decides what happens to them;
+/// otherwise they are left out. Returns `false` if the user quit.
+fn stage_all(repo: &Repo, ask: bool) -> Result<bool> {
+    let top = repo.toplevel()?;
+    let findings = untracked::check(&top, &repo.untracked_files()?);
+    if findings.is_empty() {
+        repo.stage_all()?;
+        return Ok(true);
+    }
+    ui::warn("some untracked files look like they should be ignored rather than committed:");
+    ui::info(untracked::list(&findings));
+    if !ask {
+        repo.stage_all_except(&untracked::exclude(&findings))?;
+        ui::info(ui::dim(
+            "   git-agent left them out. Add them to .gitignore, or stage them yourself with git add.",
+        ));
+        return Ok(true);
+    }
+    match ui::ask_untracked()? {
+        ui::UntrackedChoice::Ignore => {
+            let added = untracked::add_to_gitignore(&top, &findings)?;
+            if !added.is_empty() {
+                ui::info(format!("📝 Added to .gitignore: {}", added.join(", ")));
+            }
+            repo.stage_all()?;
+        }
+        ui::UntrackedChoice::Commit => repo.stage_all()?,
+        ui::UntrackedChoice::Quit => return Ok(false),
+    }
+    Ok(true)
 }
 
 /// Connects to the configured server and picks the model to use.

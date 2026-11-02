@@ -1,12 +1,27 @@
+// SPDX-FileCopyrightText: 2026 Dervis Mansuroglu
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 // What the site says. Every claim here comes from the project's README.
 
-import type { IconName } from '../lib/icons'
+import { readFileSync } from 'node:fs'
+import { resolve } from 'node:path'
+import type { IconName } from '../design/icons'
+import type { TerminalLine } from '../design/terminal'
 
 export const repository = 'https://github.com/dervism/git-agent'
 export const readme = `${repository}#readme`
 export const readmeSource = `${repository}/blob/master/README.md`
 export const crate = 'https://crates.io/crates/git-agent'
-export const version = '0.8.0'
+/** git-agent's version, from Cargo.toml, so the site follows each release. */
+export const version =
+  readFileSync(resolve(process.cwd(), '../Cargo.toml'), 'utf8').match(/^version = "([^"]+)"/m)?.[1] ?? ''
+
+/** The newest thing git-agent does, announced above the hero's heading. */
+export const news = {
+  label: 'New',
+  text: 'git agent --all checks untracked files',
+  href: '#untracked',
+}
 
 export interface Link {
   readonly name: string
@@ -62,16 +77,16 @@ export const providers: readonly string[] = [
   'Cerebras',
 ]
 
-/** A line of terminal output; `tone` picks its color. */
-export interface TerminalLine {
-  readonly text: string
-  readonly tone?: 'muted' | 'accent' | 'bright' | 'success' | 'rule' | 'menu'
-}
-
 /** One run of a command in the hero's terminal. */
 export interface Scene {
   readonly tab: string
   readonly command: string
+  /** What git-agent shows before it asks the model, such as a question. */
+  readonly before?: readonly TerminalLine[]
+  /** The key typed at that question. */
+  readonly beforeAnswer?: string
+  /** What follows that answer. */
+  readonly afterAnswer?: readonly TerminalLine[]
   readonly output: readonly TerminalLine[]
   /** The key typed at the review menu, if the scene shows one. */
   readonly answer?: string
@@ -91,6 +106,34 @@ export const scenes: readonly Scene[] = [
       { text: '' },
       { text: 'export_csv takes an optional header and writes it as' },
       { text: 'the first line of the output.' },
+      { text: '────────────────────────────────────────────────', tone: 'rule' },
+      { text: '[c]ommit  [p]ush  [e]dit  [r]egenerate  [f]eedback  [q]uit ›', tone: 'menu' },
+    ],
+    answer: 'c',
+    after: [{ text: '✅ Committed.', tone: 'success' }],
+  },
+  {
+    tab: '--all',
+    command: 'git agent --all',
+    before: [
+      { text: 'warning: some untracked files look like they should be ignored rather than committed:', tone: 'accent' },
+      { text: '   .env       environment file; it may hold secrets' },
+      { text: '   data.bin   large file, 12 MB' },
+      { text: '   target/    Rust build output, 29 files, 991 KB' },
+      { text: 'Add them to .gitignore? [Y]es  [n]o, commit them too  [q]uit ›', tone: 'menu' },
+    ],
+    beforeAnswer: 'y',
+    afterAnswer: [
+      { text: '📝 Added to .gitignore: .env, /data.bin, /target/', tone: 'muted' },
+      { text: '🔍 Staged changes: 5 files changed, 22 insertions(+)', tone: 'muted' },
+    ],
+    output: [
+      { text: '' },
+      { text: '── Proposed commit message ─────────────────────', tone: 'rule' },
+      { text: 'feat: initialize the project', tone: 'bright' },
+      { text: '' },
+      { text: 'Adds the Cargo manifest and a first main.rs, and keeps' },
+      { text: 'build output and local files out of the repository.' },
       { text: '────────────────────────────────────────────────', tone: 'rule' },
       { text: '[c]ommit  [p]ush  [e]dit  [r]egenerate  [f]eedback  [q]uit ›', tone: 'menu' },
     ],
@@ -217,6 +260,37 @@ export const explainSamples: readonly { readonly tab: string; readonly lines: re
     ],
   },
 ]
+
+/** `--all` checking the untracked files before it stages them. */
+export const untracked = {
+  title: 'Build output stays out of your commits',
+  description:
+    'Before git agent --all stages anything, it checks the untracked files. What a .gitignore usually keeps out is listed, and one answer adds it there. When git-agent can’t ask, it leaves those files out of the commit.',
+  points: [
+    'Build output and dependencies, such as target/ next to a Cargo.toml, or node_modules/',
+    'Compiled files, and the .DS_Store files an operating system leaves behind',
+    '.env files and private keys, which may hold secrets',
+    'Files of 10 MB or more',
+  ],
+  output: [
+    { text: '$ git agent --all', tone: 'bright' },
+    { text: 'warning: some untracked files look like they should be', tone: 'accent' },
+    { text: '         ignored rather than committed:', tone: 'accent' },
+    { text: '   .DS_Store           operating system file' },
+    { text: '   .env                environment file; it may hold secrets' },
+    { text: '   data.bin            large file, 12 MB' },
+    { text: '   target/             Rust build output, 29 files, 991 KB' },
+    { text: '   tools/__pycache__/  Python bytecode' },
+    { text: 'Add them to .gitignore? [Y]es  [n]o, commit them too  [q]uit › y', tone: 'menu' },
+    { text: '📝 Added to .gitignore: .DS_Store, .env, /data.bin, /target/,', tone: 'muted' },
+    { text: '   __pycache__/', tone: 'muted' },
+  ],
+} satisfies {
+  readonly title: string
+  readonly description: string
+  readonly points: readonly string[]
+  readonly output: readonly TerminalLine[]
+}
 
 /** How git-agent keeps your code, keys and history safe. */
 export const safetyFeatures: readonly Feature[] = [

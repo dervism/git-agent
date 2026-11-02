@@ -1,26 +1,31 @@
 ---
+// SPDX-FileCopyrightText: 2026 Dervis Mansuroglu
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 import Layout from '../layouts/Layout.astro'
-import Header from '../components/Header.astro'
-import Hero from '../components/Hero.astro'
+import Header from '../blocks/Header.astro'
+import Hero from '../blocks/Hero.astro'
 import Providers from '../components/Providers.astro'
-import Features from '../components/Features.astro'
-import Explain from '../components/Explain.astro'
-import Safety from '../components/Safety.astro'
+import Features from '../blocks/Features.astro'
+import Explain from '../blocks/Explain.astro'
+import Safety from '../blocks/Safety.astro'
 import Install from '../components/Install.astro'
-import Cta from '../components/Cta.astro'
-import Footer from '../components/Footer.astro'
-import Divider from '../components/Divider.astro'
+import Cta from '../blocks/Cta.astro'
+import Footer from '../blocks/Footer.astro'
+import Divider from '../design/components/Divider.astro'
 import {
   crate,
   explainFeatures,
   explainSamples,
   installMethods,
   navigation,
+  news,
   providers,
   quickStart,
   repository,
   safetyFeatures,
   scenes,
+  untracked,
   version,
 } from '../content/site'
 ---
@@ -31,14 +36,14 @@ import {
 >
   <Header navigation={navigation} repository={repository} />
   <main>
-    <Hero version={version} repository={repository} scenes={scenes} />
+    <Hero news={news} repository={repository} scenes={scenes} />
     <Providers providers={providers} />
     <Divider />
     <Features />
     <Divider />
     <Explain features={explainFeatures} samples={explainSamples} />
     <Divider />
-    <Safety features={safetyFeatures} />
+    <Safety features={safetyFeatures} featured={untracked} />
     <Divider />
     <Install methods={installMethods} steps={quickStart} />
     <Cta />

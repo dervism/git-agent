@@ -44,11 +44,13 @@ Summarizes a commit, a branch, or everything that arrived with the last pull. A 
 is explained through the commits it merged, and after a pull with rebase, the
 branch's own rebased commits are left out, so only what arrived is described.
 
-### Checking untracked files
+### Checking untracked files (DONE)
 
 IntelliJ asks before it adds new files to version control. With `--all`, git-agent
-could warn about build output, `.env` files, private keys and large binaries, and
-offer to add them to `.gitignore`. This needs no model.
+now warns about build output, `.env` files, private keys and large binaries, and
+offers to add them to `.gitignore`. This needs no model. Build directories with
+common names only count when the file that marks their project is next to them, and
+when git-agent can't ask, it leaves the files out of the commit.
 
 ## Git workflows people do by hand
 

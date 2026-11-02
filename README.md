@@ -91,6 +91,35 @@ If you have staged changes, git-agent describes and commits only those. If nothi
 staged, it describes all changes to tracked files and commits them with
 `git commit --all`. Untracked files are left out unless you use `--all`.
 
+### Untracked files
+
+Before `--all` stages anything, git-agent checks the untracked files for ones that are
+usually ignored rather than committed:
+
+- build output and downloaded dependencies, such as `target/` next to a `Cargo.toml`,
+  `dist/` next to a `package.json`, or `node_modules/`
+- compiled files, such as `.o`, `.class` or `.pyc`, and files like `.DS_Store` that the
+  operating system leaves behind
+- `.env` files and private keys, which may hold secrets
+- files of 10 MB or more
+
+It lists what it found and asks what to do:
+
+```text
+warning: some untracked files look like they should be ignored rather than committed:
+   .env                environment file; it may hold secrets
+   data.bin            large file, 12 MB
+   target/             Rust build output, 29 files, 991 KB
+Add them to .gitignore? [Y]es  [n]o, commit them too  [q]uit ›
+```
+
+`y` adds them to `.gitignore`, which is staged and committed with your changes. `n` stages
+them anyway, and `q` stops before anything is staged. When git-agent can't ask, as with
+`--commit`, `--raw` or input from a pipe, it leaves them out of the commit and changes
+nothing else. Common names such as `dist/` or `build/` only count when the file that marks
+their project sits next to them, so a `dist/` folder of your own is left alone. The same
+check runs for `git agent split --all`.
+
 ### Reviewing the message
 
 git-agent shows the proposed message and waits for one of these keys:

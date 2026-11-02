@@ -167,9 +167,9 @@ to tracked files if nothing is staged. It cuts them into parts. A part is one hu
 a changed file, or a whole file when the file is new, deleted, renamed or binary, or
 excluded like a lockfile. The model sees the numbered parts and groups them into
 commits, ordered so that each builds on those before it. If it leaves a part out,
-git-agent adds that part to the commit with the rest of its file, or to a last commit,
-so nothing goes missing. When the hunks are too many to show the model one by one, it
-groups whole files instead.
+git-agent adds that part to the commit with the rest of its file, or to a last commit.
+When the hunks are too many to show the model one by one, it groups whole files
+instead.
 
 ### Reviewing the plan
 
@@ -194,12 +194,76 @@ git-agent then makes the commits in order. For each one it writes the message fr
 that commit's own changes, and you review it like any other message, with two
 differences: `c` commits, and `s` skips the commit and leaves its changes as they
 were. `q` stops; the commits made so far stay. Changes that aren't committed stay
-where they were, staged or not, so skipping or stopping loses nothing.
+where they were, staged or not.
 
 git-agent doesn't build or test the commits in between, so a commit may not compile
 on its own if the plan separates code that belongs together. Secrets are checked as
 for any commit, and git-agent won't split changes while a merge or rebase is in
 progress.
+
+## Tidying commits before you push
+
+`git agent tidy` cleans up the commits you haven't pushed yet. A commit whose message
+doesn't say what it does, such as "wip" or "asdf", gets a new message written from its
+changes. A commit that only fixes an earlier one, such as "fix typo", is folded into
+the commit it fixes.
+
+```sh
+git agent tidy                 # plan the tidy-up, then review it and each new message
+git agent tidy --base HEAD~5   # tidy the commits after HEAD~5
+git agent tidy -H "why"        # give the model extra context
+git agent tidy --apply         # tidy without any review
+```
+
+### Reviewing the plan
+
+```text
+── Proposed tidy-up ────────────────────────────────────────────
+keep   a6fbe58 feat: add csv export
+reword ed39c0d wip
+fold   842f69d fix typo
+keep   8e249fb docs: document the export
+fold   7f944d8 fixup! docs: document the export
+reword 237af0f asdf
+
+6 commits become 4: 2 folded into others, 2 with a new message
+────────────────────────────────────────────────────────────────
+[a]ccept  [e]dit  [r]egenerate  [f]eedback  [q]uit  [?] ›
+```
+
+A folded commit joins the commit on the line above it and keeps that commit's message.
+Commits named `fixup! <subject>` or `squash! <subject>`, as `git commit --fixup` makes
+them, fold into the commit they name unless you tell the model otherwise. `e` opens
+the plan in your git editor as lines like those of `git rebase -i`: change a line's
+first word to keep, reword or fold, and move a fold line under the commit it fixes.
+Every commit must stay in the plan.
+
+After you accept the plan, git-agent writes the new messages one by one, and you review
+each like any commit message, except that `u` uses the new message and `k` keeps the
+old one. `q` stops before anything has changed.
+
+### What git-agent changes
+
+git-agent only tidies commits that no remote branch has, so it never has to
+force-push. In a repository without a remote, name the commit to tidy after with
+`--base`. It doesn't tidy across merges, or more than 40 commits at a time.
+
+The rewrite runs `git rebase` in a temporary worktree, without hooks, so your work
+tree and index stay as they are, uncommitted changes included. The branch moves only
+if the tidied commits end with exactly the same files as before, and git-agent then
+prints the command that undoes the tidy-up:
+
+```text
+✅ Tidied 6 commit(s) into 4:
+   a6fbe58 feat: add csv export
+   63b8816 feat(export): add optional CSV header support
+   7d6754a docs: document the export
+   bf40777 test(export): add a test for the CSV header
+   To undo: git reset --keep 237af0f
+```
+
+If folding a commit into an earlier one conflicts with the commits between them,
+git-agent stops and leaves the branch as it was.
 
 ## Pushing
 
@@ -283,9 +347,9 @@ The model gets the lines with some code around them, the commit that last change
 each line, and the history of the lines: every commit that changed them, newest
 first, with its message and its diff of those lines. The history follows the lines
 through renames, and blame skips commits that only change whitespace or move the
-lines. When the history is too long for the context, git-agent keeps the newest
-commits and the oldest one, because the commit that added the lines often says why,
-and cuts the diffs short.
+lines. When the history is too long for the context, git-agent cuts the diffs short
+and keeps the newest commits and the oldest one, since the commit that added the
+lines often says why they are there.
 
 git-agent finds a function the way `git log -L :name:file` does, by the line that
 starts it. It turns on git's built-in function detection for common languages, among

@@ -195,10 +195,11 @@ git-agent splits the changes a commit would include: the staged ones, or all cha
 to tracked files if nothing is staged. It cuts them into parts. A part is one hunk of
 a changed file, or a whole file when the file is new, deleted, renamed or binary, or
 excluded like a lockfile. The model sees the numbered parts and groups them into
-commits, ordered so that each builds on those before it. If it leaves a part out,
-git-agent adds that part to the commit with the rest of its file, or to a last commit.
-When the hunks are too many to show the model one by one, it groups whole files
-instead.
+commits, ordered so that each builds on those before it. If the plan leaves out three
+or more parts, git-agent asks the model once more to place them, and keeps whichever
+plan leaves out fewer. A part still left out joins the commit with the rest of its file,
+or a last commit. When the hunks are too many to show the model one by one, it groups
+whole files instead.
 
 ### Reviewing the plan
 
@@ -208,11 +209,15 @@ instead.
    Cargo.lock, Cargo.toml, README.md, src/cache.rs (new file), src/config.rs (1 of 3 changes)
 2. Refine config parsing logic and documentation
    src/config.rs (2 of 3 changes)
+
+7 parts in 2 commits
 ────────────────────────────────────────────────────────────────
-[a]ccept  [e]dit  [r]egenerate  [f]eedback  [q]uit  [?] ›
+[a]ll commits  [c]ommit  [e]dit  [r]egenerate  [f]eedback  [q]uit  [?] ›
 ```
 
-`a` accepts the plan. `e` opens it in your git editor, where each part has a numbered
+`a` makes all the commits without stopping at each message; you still see the messages
+as they are committed. `c` commits them one at a time, and you review each message.
+`e` opens the plan in your git editor, where each part has a numbered
 line under its commit; move a line to move the part to another commit. `r` asks for a
 new plan, and `f` tells the model what to change, such as
 `f put the feature and its documentation in one commit`.
@@ -220,9 +225,9 @@ new plan, and `f` tells the model what to change, such as
 ### Making the commits
 
 git-agent then makes the commits in order. For each one it writes the message from
-that commit's own changes, and you review it like any other message, with two
-differences: `c` commits, and `s` skips the commit and leaves its changes as they
-were. `q` stops; the commits made so far stay. Changes that aren't committed stay
+that commit's own changes. If you chose `c` at the plan, you review each message like
+any other, with two differences: `c` commits, and `s` skips the commit and leaves
+its changes as they were. `q` stops; the commits made so far stay. Changes that aren't committed stay
 where they were, staged or not.
 
 git-agent doesn't build or test the commits in between, so a commit may not compile

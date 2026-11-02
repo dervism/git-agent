@@ -256,10 +256,15 @@ fn accepted<T: Copy>(review: &Review<T>, choice: &str) -> Option<T> {
     if matches!(choice, "y" | "yes") {
         return review.accept.first().map(|first| first.value);
     }
+    // A choice of several words, such as "all commits", also takes its first word.
     review
         .accept
         .iter()
-        .find(|accept| choice == accept.word || choice == &accept.word[..1])
+        .find(|accept| {
+            choice == accept.word
+                || choice == &accept.word[..1]
+                || accept.word.split(' ').next() == Some(choice)
+        })
         .map(|accept| accept.value)
 }
 
@@ -459,6 +464,17 @@ mod tests {
         assert_eq!(accepted(&REVIEW, "draft"), Some(2));
         assert_eq!(accepted(&REVIEW, "y"), Some(1));
         assert_eq!(accepted(&REVIEW, "e"), None);
+        let several = Review {
+            accept: &[Choice {
+                word: "all commits",
+                help: "make them all",
+                value: 3,
+            }],
+            ..REVIEW
+        };
+        assert_eq!(accepted(&several, "a"), Some(3));
+        assert_eq!(accepted(&several, "all"), Some(3));
+        assert_eq!(accepted(&several, "commits"), None);
         let help = help(&REVIEW);
         assert!(help.starts_with("  c  create it\n  d  create a draft\n  e  edit the thing"));
         assert!(help.ends_with("  q  quit without creating it"));

@@ -305,9 +305,20 @@ impl Plan {
     }
 }
 
-/// Reads the model's plan, then makes it complete (see [`settle`]). Returns
-/// notes about what had to be fixed.
-pub fn parse_plan(reply: &str, files: &[FilePatch], units: &[Unit]) -> Result<(Plan, Vec<String>)> {
+/// A plan made valid by [`settle`], and what had to be fixed.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Settled {
+    pub plan: Plan,
+    /// What was fixed, for the user.
+    pub notes: Vec<String>,
+    /// The 1-based numbers of the units the plan left out.
+    pub missing: Vec<usize>,
+    /// The 1-based numbers of the units the plan put in more than one commit.
+    pub repeated: Vec<usize>,
+}
+
+/// Reads the model's plan, then makes it complete (see [`settle`]).
+pub fn parse_plan(reply: &str, files: &[FilePatch], units: &[Unit]) -> Result<Settled> {
     let start = reply
         .find(['{', '['])
         .context("the model's reply has no plan in it")?;
@@ -373,13 +384,8 @@ fn unit_numbers(value: &Value, found: &mut Vec<usize>) {
 
 /// Makes a plan of titles and 1-based unit numbers valid: unknown and
 /// repeated numbers are dropped, and units the plan left out join the commit
-/// with another part of their file, or a last commit of their own. Returns
-/// notes about what was fixed.
-fn settle(
-    raw: Vec<(String, Vec<usize>)>,
-    files: &[FilePatch],
-    units: &[Unit],
-) -> (Plan, Vec<String>) {
+/// with another part of their file, or a last commit of their own.
+fn settle(raw: Vec<(String, Vec<usize>)>, files: &[FilePatch], units: &[Unit]) -> Settled {
     let mut placed = vec![false; units.len()];
     let (mut unknown, mut repeated) = (Vec::new(), Vec::new());
     let mut commits: Vec<Planned> = Vec::new();
@@ -422,6 +428,7 @@ fn settle(
         ));
     }
     let missing: Vec<usize> = (0..units.len()).filter(|&index| !placed[index]).collect();
+    let missing_numbers: Vec<usize> = missing.iter().map(|index| index + 1).collect();
     let mut leftover = Vec::new();
     for &index in &missing {
         let file = units[index].file;
@@ -434,11 +441,10 @@ fn settle(
         }
     }
     if !missing.is_empty() {
-        let numbers: Vec<usize> = missing.iter().map(|index| index + 1).collect();
         notes.push(format!(
             "the plan left out changes {}; they joined the commit with the rest of their file, \
              or a last commit",
-            join(&numbers)
+            join(&missing_numbers)
         ));
     }
     if !leftover.is_empty() {
@@ -447,7 +453,12 @@ fn settle(
             units: leftover,
         });
     }
-    (Plan { commits }, notes)
+    Settled {
+        plan: Plan { commits },
+        notes,
+        missing: missing_numbers,
+        repeated,
+    }
 }
 
 fn join(numbers: &[usize]) -> String {
@@ -477,14 +488,21 @@ pub fn files_of(commit: &Planned, files: &[FilePatch], units: &[Unit]) -> Vec<St
         .collect()
 }
 
-/// The plan as shown for review.
+/// The plan as shown for review, ending with how many parts go into how many commits.
 pub fn show(plan: &Plan, files: &[FilePatch], units: &[Unit]) -> String {
     let mut text = String::new();
     for (index, commit) in plan.commits.iter().enumerate() {
         let _ = writeln!(text, "{}. {}", index + 1, commit.title);
         let _ = writeln!(text, "   {}", files_of(commit, files, units).join(", "));
     }
-    text.trim_end().to_owned()
+    let commits = plan.commits.len();
+    let _ = write!(
+        text,
+        "\n{} parts in {commits} commit{}",
+        units.len(),
+        if commits == 1 { "" } else { "s" }
+    );
+    text
 }
 
 /// The plan as the user edits it.
@@ -520,7 +538,8 @@ pub fn from_text(text: &str, files: &[FilePatch], units: &[Unit]) -> (Plan, Vec<
     if raw.is_empty() {
         return (Plan::default(), Vec::new());
     }
-    settle(raw, files, units)
+    let settled = settle(raw, files, units);
+    (settled.plan, settled.notes)
 }
 
 /// A patch that adds a commit's units to HEAD.
@@ -781,7 +800,14 @@ mod tests {
         let units = describe(&files, 100_000).unwrap().units;
         let reply = "Sure:\n```json\n{\"commits\": [{\"title\": \"Change lib\", \"units\": [[2], \"Unit 3\", 9]}, \
                      {\"title\": \"Add new\", \"units\": [{\"unit\": 5}, 2]}, {\"title\": \"\", \"units\": [6]}]}\n```";
-        let (plan, notes) = parse_plan(reply, &files, &units).unwrap();
+        let Settled {
+            plan,
+            notes,
+            missing,
+            repeated,
+        } = parse_plan(reply, &files, &units).unwrap();
+        // Units 1 and 4 were left out, and unit 2 was in two commits.
+        assert_eq!((missing, repeated), (vec![1, 4], vec![2]));
         let commits: Vec<_> = plan
             .commits
             .iter()
@@ -802,6 +828,11 @@ mod tests {
 
         let shown = show(&plan, &files, &units);
         assert!(shown.starts_with("1. Change lib\n   lib.txt\n2. Add new\n   new.txt (new file)"));
+        assert!(shown.ends_with("\n\n6 parts in 4 commits"), "{shown}");
+        let one = Plan {
+            commits: vec![plan.commits[0].clone()],
+        };
+        assert!(show(&one, &files, &units).ends_with("6 parts in 1 commit"));
     }
 
     #[test]

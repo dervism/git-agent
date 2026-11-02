@@ -191,6 +191,38 @@ pub fn refine_plan(base: &[Message], plan: &str, feedback: &str) -> Vec<Message>
     messages
 }
 
+/// Continues `base` with a plan that left out the `missing` units (and put the
+/// `repeated` ones in more than one commit), asking for it again with every unit
+/// in it once. Numbers are 1-based, as the model sees them.
+pub fn complete_plan(
+    base: &[Message],
+    plan: &str,
+    missing: &[usize],
+    repeated: &[usize],
+) -> Vec<Message> {
+    let list = |numbers: &[usize]| {
+        let numbers: Vec<String> = numbers.iter().map(usize::to_string).collect();
+        numbers.join(", ")
+    };
+    let mut request = format!("Your plan leaves out units {}.", list(missing));
+    if !repeated.is_empty() {
+        let _ = write!(
+            request,
+            " It also puts units {} in more than one commit.",
+            list(repeated)
+        );
+    }
+    request.push_str(
+        " Put each missing unit in the commit it belongs with, or in a new commit if none fits. \
+         Reply with the whole plan again, as JSON in the same form, with every unit in exactly \
+         one commit.",
+    );
+    let mut messages = base.to_vec();
+    messages.push(Message::assistant(plan));
+    messages.push(Message::user(request));
+    messages
+}
+
 /// Continues `base` with a reply that wasn't a readable plan, why, and the
 /// `rule` the plan must follow, e.g. "with every unit in exactly one commit".
 pub fn retry_plan(base: &[Message], reply: &str, problem: &str, rule: &str) -> Vec<Message> {
@@ -789,6 +821,16 @@ mod tests {
         let refined = refine_plan(&messages, "{\"commits\": []}", "fewer commits");
         assert_eq!(refined.len(), 4);
         assert!(refined[3].content.contains("fewer commits"));
+        let completed = complete_plan(&messages, "{\"commits\": []}", &[3, 5, 8], &[2]);
+        assert_eq!(completed.len(), 4);
+        assert!(completed[3].content.starts_with(
+            "Your plan leaves out units 3, 5, 8. It also puts units 2 in more than one commit."
+        ));
+        assert!(
+            complete_plan(&messages, "{}", &[4], &[])[3]
+                .content
+                .starts_with("Your plan leaves out units 4. Put")
+        );
         let retried = retry_plan(
             &messages,
             "oops",

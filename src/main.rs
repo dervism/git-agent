@@ -83,20 +83,30 @@ const PULL_REQUEST_REVIEW: Review<bool> = Review {
     quit: "quit without creating it",
 };
 
-/// Accepting the plan of a split.
-const PLAN_REVIEW: Review<()> = Review {
+/// Accepting the plan of a split: the value says whether to review each message.
+const PLAN_REVIEW: Review<bool> = Review {
     heading: "Proposed commits",
     first_line: "first line",
     noun: "plan",
     what: "plan",
     edit: "edit the plan in your editor",
-    accept: &[Choice {
-        word: "accept",
-        help: "make the commits one by one, reviewing each message",
-        value: (),
-    }],
+    accept: &[
+        Choice {
+            word: "all commits",
+            help: "make all the commits, without stopping to review their messages",
+            value: false,
+        },
+        Choice {
+            word: "commit",
+            help: "make the commits one at a time, reviewing each message",
+            value: true,
+        },
+    ],
     quit: "quit without committing anything",
 };
+
+/// A plan that leaves out at least this many parts is asked for once more.
+const ASK_AGAIN_MISSING: usize = 3;
 
 /// Accepting one commit of a split: the value says whether to make it.
 const SPLIT_COMMIT_REVIEW: Review<bool> = Review {
@@ -366,11 +376,10 @@ async fn split_changes(args: &SplitArgs, settings: &SettingArgs) -> Result<()> {
         return Ok(());
     }
     let summary = changes.stat.lines().last().unwrap_or_default().trim();
-    let parts = described.units.len();
     match scope {
-        Scope::Staged => ui::info(format!("🔍 Staged changes: {summary}, in {parts} parts")),
+        Scope::Staged => ui::info(format!("🔍 Staged changes: {summary}")),
         Scope::Tracked => ui::info(format!(
-            "🔍 Nothing staged; splitting all changes to tracked files: {summary}, in {parts} parts"
+            "🔍 Nothing staged; splitting all changes to tracked files: {summary}"
         )),
     }
     if described.by_file {
@@ -393,6 +402,7 @@ async fn split_changes(args: &SplitArgs, settings: &SettingArgs) -> Result<()> {
         model: &model,
     };
     let mut plan = splitter.ask_for_plan(&conversation).await?;
+    let mut review_messages = !args.commit;
     if args.commit {
         ui::show_framed(PLAN_REVIEW.heading, &splitter.show(&plan));
     } else if !io::stdin().is_terminal() {
@@ -404,7 +414,10 @@ async fn split_changes(args: &SplitArgs, settings: &SettingArgs) -> Result<()> {
         return Ok(());
     } else {
         match splitter.review_plan(plan, &conversation).await? {
-            Some(reviewed) => plan = reviewed,
+            Some((reviewed, review)) => {
+                plan = reviewed;
+                review_messages = review;
+            }
             None => {
                 ui::info("Nothing committed.");
                 return Ok(());
@@ -412,10 +425,13 @@ async fn split_changes(args: &SplitArgs, settings: &SettingArgs) -> Result<()> {
         }
     }
 
-    let outcome = splitter.make_commits(&plan).await.context(
-        "the split stopped; the commits made so far stay, and the rest of the changes are as \
+    let outcome = splitter
+        .make_commits(&plan, review_messages)
+        .await
+        .context(
+            "the split stopped; the commits made so far stay, and the rest of the changes are as \
          they were",
-    )?;
+        )?;
     if outcome.made > 0 {
         ui::info(ui::green(&format!("\n✅ Made {} commit(s):", outcome.made)));
         for line in repo.recent_commits(outcome.made)?.iter().rev() {
@@ -474,11 +490,11 @@ impl Splitter<'_> {
     }
 
     /// Asks the model for a plan, reminding it once of the form if its first
-    /// reply can't be read.
+    /// reply can't be read, and once more of the parts if it leaves out several.
     async fn ask_for_plan(&self, conversation: &[Message]) -> Result<Plan> {
-        let reply = generate_message(self.server, self.model, conversation).await?;
-        let (plan, notes) = match split::parse_plan(&reply, self.files, self.units) {
-            Ok(parsed) => parsed,
+        let mut reply = generate_message(self.server, self.model, conversation).await?;
+        let mut settled = match split::parse_plan(&reply, self.files, self.units) {
+            Ok(settled) => settled,
             Err(err) => {
                 let retry = prompt::retry_plan(
                     conversation,
@@ -486,24 +502,48 @@ impl Splitter<'_> {
                     &format!("{err:#}"),
                     "with every unit in exactly one commit",
                 );
-                let reply = generate_message(self.server, self.model, &retry).await?;
+                reply = generate_message(self.server, self.model, &retry).await?;
                 split::parse_plan(&reply, self.files, self.units)
                     .context("the model didn't reply with a plan git-agent could read")?
             }
         };
-        for note in notes {
+        if settled.missing.len() >= ASK_AGAIN_MISSING {
+            ui::info(ui::dim(&format!(
+                "   The plan left out {} of {} parts; asking the model to place them.",
+                settled.missing.len(),
+                self.units.len()
+            )));
+            let again =
+                prompt::complete_plan(conversation, &reply, &settled.missing, &settled.repeated);
+            let completed = generate_message(self.server, self.model, &again)
+                .await
+                .and_then(|reply| split::parse_plan(&reply, self.files, self.units));
+            // Keep whichever plan leaves out fewer parts.
+            match completed {
+                Ok(completed) if completed.missing.len() < settled.missing.len() => {
+                    settled = completed
+                }
+                Ok(_) => {}
+                Err(err) => ui::warn(format!("{err:#}; keeping the first plan")),
+            }
+        }
+        for note in settled.notes {
             ui::warn(note);
         }
-        Ok(plan)
+        Ok(settled.plan)
     }
 
     /// Lets the user review the plan until they accept or quit it. Returns
-    /// the accepted plan, or `None` on quit.
-    async fn review_plan(&self, mut plan: Plan, conversation: &[Message]) -> Result<Option<Plan>> {
+    /// the accepted plan and whether to review each message, or `None` on quit.
+    async fn review_plan(
+        &self,
+        mut plan: Plan,
+        conversation: &[Message],
+    ) -> Result<Option<(Plan, bool)>> {
         loop {
             ui::show_framed(PLAN_REVIEW.heading, &self.show(&plan));
             let revised = match ui::ask_action(&PLAN_REVIEW)? {
-                Action::Accept(()) => return Ok(Some(plan)),
+                Action::Accept(review) => return Ok(Some((plan, review))),
                 Action::Quit => return Ok(None),
                 Action::Edit => self.edit_plan(&plan),
                 Action::Regenerate => self.ask_for_plan(conversation).await.map(Some),
@@ -535,11 +575,12 @@ impl Splitter<'_> {
     }
 
     /// Makes the planned commits one by one, each built in a temporary index
-    /// from HEAD and its own changes, so the real index is left alone.
-    async fn make_commits(&self, plan: &Plan) -> Result<Outcome> {
+    /// from HEAD and its own changes, so the real index is left alone. With
+    /// `review_messages`, the user reviews each commit's message.
+    async fn make_commits(&self, plan: &Plan, review_messages: bool) -> Result<Outcome> {
         let path = self.repo.git_path("GIT_AGENT_SPLIT_INDEX")?;
         let index = self.repo.with_index(path.clone());
-        let outcome = self.commit_each(plan, &index).await;
+        let outcome = self.commit_each(plan, &index, review_messages).await;
         let _ = fs::remove_file(&path);
         // Nothing was staged before the split, so the real index stays at HEAD.
         if self.scope == Scope::Tracked {
@@ -548,7 +589,12 @@ impl Splitter<'_> {
         outcome
     }
 
-    async fn commit_each(&self, plan: &Plan, index: &Repo) -> Result<Outcome> {
+    async fn commit_each(
+        &self,
+        plan: &Plan,
+        index: &Repo,
+        review_messages: bool,
+    ) -> Result<Outcome> {
         let mut committed = split::Committed::default();
         let mut outcome = Outcome::default();
         let total = plan.commits.len();
@@ -588,7 +634,7 @@ impl Splitter<'_> {
             }
             let message = commit_message(self.server, self.model, &conversation).await?;
             ui::show_proposal(&SPLIT_COMMIT_REVIEW, &message);
-            let (make, message) = if self.args.commit {
+            let (make, message) = if !review_messages {
                 (true, message)
             } else {
                 let edit = |message: &str| ui::edit_message(self.repo, message);

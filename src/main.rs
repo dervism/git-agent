@@ -732,6 +732,468 @@ async fn pull_request(args: &PrArgs, settings: &SettingArgs) -> Result<()> {
     create_pull_request(&repo, &config, &pull_request, !args.create)
 }
 
+async fn new_branch(args: &BranchArgs, settings: &SettingArgs) -> Result<()> {
+    let config = Config::load(settings)?.config;
+    let repo = Repo::open(".")?;
+    if let Some(from) = &args.from
+        && repo.resolve(from)?.is_none()
+    {
+        bail!("{from} is not a commit or a branch");
+    }
+    let description = args.description.join(" ");
+    let description = description.trim();
+    let issue;
+    let mut changes;
+    let work = if description.is_empty() {
+        let Some((_, found)) = repo.changes(&config.exclude)? else {
+            bail!(
+                "say what the branch is for, e.g. `git agent branch fix login timeout`, or name \
+                 an issue, e.g. `git agent branch 42`; with uncommitted changes, git-agent can \
+                 name the branch after them"
+            );
+        };
+        changes = found;
+        let summary = changes.stat.lines().last().unwrap_or_default().trim();
+        ui::info(format!(
+            "🔍 Naming the branch after the uncommitted changes: {summary}"
+        ));
+        let redacted = redact::diff(&changes.diff);
+        changes.diff = redacted.text;
+        report_secrets(
+            &redacted.findings,
+            "If they are real, take them out of the files before you commit.",
+        );
+        Work::Changes(&changes)
+    } else if let Some(reference) = branch::issue_reference(description) {
+        let mut found = github::issue(repo.workdir(), &reference)?;
+        ui::info(format!("🔍 Issue #{}: {}", found.number, found.title));
+        let redacted = redact::text(&found.body, &format!("issue #{}", found.number));
+        found.body = redacted.text;
+        report_secrets(
+            &redacted.findings,
+            "They are in the issue on GitHub. If they are real, revoke them.",
+        );
+        issue = found;
+        Work::Issue(&issue)
+    } else {
+        Work::Described(description)
+    };
+
+    // What the work mentions, so the name doesn't get references it lacks.
+    let mentioned = match &work {
+        Work::Described(text) => text.to_string(),
+        Work::Issue(issue) => format!("#{} {}\n{}", issue.number, issue.title, issue.body),
+        Work::Changes(changes) => format!("{}\n{}", changes.stat, changes.diff),
+    };
+    let taken = repo.branch_names()?;
+    let (server, model) = connect(&config).await?;
+    let conversation = prompt::branch_messages(
+        &work,
+        &branch::style_examples(&taken),
+        model.context_length,
+        config.max_output_tokens,
+    );
+    report_model(&model, conversation_tokens(&conversation));
+    let clean = |reply: String| {
+        let name = branch_name(&repo, &reply)?;
+        branch_name(&repo, &branch::drop_unknown_references(&name, &mentioned))
+    };
+    let mut name = clean(generate_message(&server, &model, &conversation).await?)?;
+    if args.raw {
+        println!("{name}");
+        return Ok(());
+    }
+
+    ui::show_proposal(&BRANCH_REVIEW, &name);
+    let exists = |name: &str| taken.iter().any(|known| known == name);
+    if exists(&name) {
+        ui::warn(format!("a branch named {name} already exists"));
+    }
+    if args.create {
+        if exists(&name) {
+            bail!(
+                "a branch named {name} already exists; run git agent branch again to review the name"
+            );
+        }
+    } else if !io::stdin().is_terminal() {
+        ui::info(ui::dim(
+            "Input is not a terminal, so not asking for review. \
+             Use --create to create the branch directly.",
+        ));
+        return Ok(());
+    } else {
+        let edit = |name: &str| {
+            let edited = ui::edit_line("Branch name:", name)?;
+            edited.map(|edited| branch_name(&repo, &edited)).transpose()
+        };
+        name = loop {
+            let reviewed = review(
+                &BRANCH_REVIEW,
+                name,
+                &server,
+                &model,
+                &conversation,
+                &edit,
+                &clean,
+            )
+            .await?;
+            let Some(((), reviewed)) = reviewed else {
+                ui::info("No branch created.");
+                return Ok(());
+            };
+            if !exists(&reviewed) {
+                break reviewed;
+            }
+            ui::warn(format!(
+                "a branch named {reviewed} already exists; edit the name or ask for another"
+            ));
+            name = reviewed;
+        };
+    }
+
+    repo.create_branch(&name, args.from.as_deref())?;
+    if repo.has_uncommitted_changes()? {
+        ui::info(ui::dim("   Your uncommitted changes came along."));
+    }
+    ui::info(ui::dim(
+        "   Commit with `git agent`, and open a pull request with `git agent pr` when the \
+         branch is ready.",
+    ));
+    Ok(())
+}
+
+/// `text`, a reply from the model or the user's edit, as a branch name git accepts.
+fn branch_name(repo: &Repo, text: &str) -> Result<String> {
+    branch::clean_name(text)
+        .filter(|name| repo.is_valid_branch_name(name))
+        .with_context(|| format!("{:?} can't be made into a branch name", text.trim()))
+}
+
+async fn tidy_commits(args: &TidyArgs, settings: &SettingArgs) -> Result<()> {
+    let config = Config::load(settings)?.config;
+    let repo = Repo::open(".")?;
+    if let Some(operation) = repo.operation_in_progress()? {
+        bail!("{operation} is in progress; finish or abort it before tidying commits");
+    }
+    let head = repo
+        .resolve("HEAD")?
+        .context("there are no commits to tidy yet")?;
+    let unpushed = repo.unpushed()?;
+    let hashes = match &args.base {
+        Some(base) => {
+            let base = repo
+                .resolve(base)?
+                .with_context(|| format!("{base} is not a commit"))?;
+            let after = repo.commits_after(&base)?;
+            if let Some(pushed) = after.iter().find(|hash| !unpushed.contains(hash)) {
+                bail!(
+                    "commit {} is on a remote already; git-agent only tidies commits that aren't \
+                     pushed, so it never has to force-push",
+                    &pushed[..7]
+                );
+            }
+            after
+        }
+        None if !repo.has_remotes()? => bail!(
+            "the repository has no remote, so git-agent can't tell which commits are pushed; \
+             name the commit to tidy after with --base, e.g. --base HEAD~5"
+        ),
+        None => unpushed,
+    };
+    if hashes.is_empty() {
+        ui::info("✨ No commits to tidy: the remote has them all.");
+        return Ok(());
+    }
+    if hashes.len() > MOST_TIDIED {
+        bail!(
+            "there are {} commits to tidy, more than {MOST_TIDIED} at a time; tidy the latest \
+             ones with --base HEAD~{MOST_TIDIED}",
+            hashes.len()
+        );
+    }
+    let base = repo.parents(&hashes[0])?.first().cloned();
+    let range = match &base {
+        Some(base) => format!("{base}..HEAD"),
+        None => "HEAD".to_owned(),
+    };
+    if repo.has_merges(&range)? {
+        bail!(
+            "there is a merge among the commits to tidy; git-agent tidies a straight line of commits"
+        );
+    }
+    let commits: Vec<tidy::Commit> = repo
+        .commit_patches(&[&range], &config.exclude)?
+        .into_iter()
+        .rev()
+        .map(|commit| tidy::Commit {
+            short: commit.hash,
+            message: commit.message,
+            patch: commit.patch,
+        })
+        .collect();
+    ui::info(format!(
+        "🔍 {} commit(s) to tidy, from {} {} to {} {}",
+        commits.len(),
+        commits[0].short,
+        commits[0].subject(),
+        commits[commits.len() - 1].short,
+        commits[commits.len() - 1].subject()
+    ));
+    let findings: Vec<Finding> = commits
+        .iter()
+        .flat_map(|commit| redact::commit(&commit.short, &commit.message, &commit.patch))
+        .collect();
+    let added = added(&findings);
+    if !added.is_empty() {
+        ui::warn(format!(
+            "the commits add what look like secrets; the model gets {} in their place:\n{}",
+            redact::REDACTED,
+            list_findings(&added)
+        ));
+    }
+
+    let (server, model) = connect(&config).await?;
+    let room = prompt::room(
+        prompt::TIDY_PROMPT,
+        model.context_length,
+        config.max_output_tokens,
+    )
+    .saturating_sub(prompt::notes_bytes(args.hint.as_deref()));
+    let text = redact::text(&tidy::describe(&commits, room), "commits").text;
+    let conversation = prompt::tidy_messages(&text, args.hint.as_deref());
+    report_model(&model, conversation_tokens(&conversation));
+    let tidier = Tidier {
+        repo: &repo,
+        server: &server,
+        model: &model,
+        commits: &commits,
+    };
+    let mut plan = tidier.ask_for_plan(&conversation, true).await?;
+    if args.apply || !io::stdin().is_terminal() {
+        ui::show_framed(TIDY_REVIEW.heading, &tidy::show(&plan, &commits));
+        if !plan.changes_anything() {
+            ui::info("✨ The commits look tidy already.");
+            return Ok(());
+        }
+        if !args.apply {
+            ui::info(ui::dim(
+                "Input is not a terminal, so not asking for review. \
+                 Use --apply to tidy the commits directly.",
+            ));
+            return Ok(());
+        }
+    } else {
+        match tidier.review_plan(plan, &conversation).await? {
+            Some(reviewed) => plan = reviewed,
+            None => {
+                ui::info("Nothing changed.");
+                return Ok(());
+            }
+        }
+    }
+
+    let mut messages: Vec<Option<PathBuf>> = vec![None; plan.groups.len()];
+    let written = tidier
+        .write_messages(&plan, &mut messages, &config, args)
+        .await;
+    let rewritten = match written {
+        Ok(true)
+            if plan.groups.iter().any(|group| !group.folded.is_empty())
+                || messages.iter().any(Option::is_some) =>
+        {
+            let todo = tidy::todo(&plan, &commits, &messages);
+            Some(repo.rewrite(&head, base.as_deref(), &todo))
+        }
+        Ok(_) => None,
+        Err(err) => Some(Err(err)),
+    };
+    for path in messages.iter().flatten() {
+        let _ = fs::remove_file(path);
+    }
+    let Some(rewritten) = rewritten else {
+        ui::info("Nothing changed.");
+        return Ok(());
+    };
+    let new = rewritten.context("nothing was changed")?;
+    if repo.tree(&new)? != repo.tree(&head)? {
+        bail!(
+            "the tidied commits wouldn't end with the same files as before, so git-agent left \
+             them as they were"
+        );
+    }
+    repo.move_head(&head, &new, "git-agent tidy")?;
+    ui::info(ui::green(&format!(
+        "\n✅ Tidied {} commit(s) into {}:",
+        commits.len(),
+        plan.groups.len()
+    )));
+    for line in repo.recent_commits(plan.groups.len())?.iter().rev() {
+        ui::info(format!("   {line}"));
+    }
+    ui::info(ui::dim(&format!(
+        "   To undo: git reset --keep {}",
+        &head[..7]
+    )));
+    Ok(())
+}
+
+/// What tidying commits needs.
+struct Tidier<'a> {
+    repo: &'a Repo,
+    server: &'a Server,
+    model: &'a Model,
+    commits: &'a [tidy::Commit],
+}
+
+impl Tidier<'_> {
+    /// Asks the model for a plan, reminding it once of the form if its first
+    /// reply can't be read. See [`tidy::parse_plan`] for `autosquash`.
+    async fn ask_for_plan(&self, conversation: &[Message], autosquash: bool) -> Result<tidy::Plan> {
+        let reply = generate_message(self.server, self.model, conversation).await?;
+        let (plan, notes) = match tidy::parse_plan(&reply, self.commits, autosquash) {
+            Ok(parsed) => parsed,
+            Err(err) => {
+                let retry = prompt::retry_plan(
+                    conversation,
+                    &reply,
+                    &format!("{err:#}"),
+                    "with an action for every commit",
+                );
+                let reply = generate_message(self.server, self.model, &retry).await?;
+                tidy::parse_plan(&reply, self.commits, autosquash)
+                    .context("the model didn't reply with a plan git-agent could read")?
+            }
+        };
+        for note in notes {
+            ui::warn(note);
+        }
+        Ok(plan)
+    }
+
+    /// Lets the user review the plan until they accept or quit it. Returns
+    /// the accepted plan, or `None` on quit.
+    async fn review_plan(
+        &self,
+        mut plan: tidy::Plan,
+        conversation: &[Message],
+    ) -> Result<Option<tidy::Plan>> {
+        loop {
+            ui::show_framed(TIDY_REVIEW.heading, &tidy::show(&plan, self.commits));
+            let revised = match ui::ask_action(&TIDY_REVIEW)? {
+                Action::Accept(()) => return Ok(Some(plan)),
+                Action::Quit => return Ok(None),
+                Action::Edit => ui::edit_plan(
+                    self.repo,
+                    "GIT_AGENT_TIDY_PLAN",
+                    &tidy::to_text(&plan, self.commits),
+                )
+                .and_then(|text| tidy::from_text(&text, self.commits)),
+                Action::Regenerate => self.ask_for_plan(conversation, true).await,
+                Action::Refine(feedback) => {
+                    let refined = prompt::refine_plan(conversation, &plan.to_json(), &feedback);
+                    self.ask_for_plan(&refined, false).await
+                }
+            };
+            // A failed edit or generation keeps the current plan so the review can go on.
+            match revised {
+                Ok(revised) => plan = revised,
+                Err(err) => ui::error(&err),
+            }
+        }
+    }
+
+    /// Writes a new message for each commit the plan rewords, into a file
+    /// whose path goes into `messages`. Returns `false` if the user stopped.
+    async fn write_messages(
+        &self,
+        plan: &tidy::Plan,
+        messages: &mut [Option<PathBuf>],
+        config: &Config,
+        args: &TidyArgs,
+    ) -> Result<bool> {
+        for (position, group) in plan.groups.iter().enumerate() {
+            if !group.reword {
+                continue;
+            }
+            let commit = &self.commits[group.commit];
+            ui::info(format!(
+                "\n✏️  A new message for {} {}",
+                commit.short,
+                commit.subject()
+            ));
+            let mut changes = self.changes(group, &config.exclude)?;
+            changes.diff = redact::diff(&changes.diff).text;
+            let mut hint = format!(
+                "The commit's current message doesn't say what it does:\n{}",
+                redact::text(&commit.message, "message").text
+            );
+            if let Some(extra) = &args.hint {
+                hint = format!("{hint}\n{extra}");
+            }
+            let (conversation, fit) = prompt::initial_messages(
+                &config.system_prompt,
+                &changes,
+                Some(&hint),
+                self.model.context_length,
+                config.max_output_tokens,
+            );
+            if !fit.is_complete() {
+                report_fit(self.model, &fit, "message", None);
+            }
+            let message = commit_message(self.server, self.model, &conversation).await?;
+            ui::show_proposal(&TIDY_MESSAGE_REVIEW, &message);
+            let (use_it, message) = if args.apply {
+                (true, message)
+            } else {
+                let edit = |message: &str| ui::edit_message(self.repo, message);
+                let reviewed = review(
+                    &TIDY_MESSAGE_REVIEW,
+                    message,
+                    self.server,
+                    self.model,
+                    &conversation,
+                    edit,
+                    separated,
+                )
+                .await?;
+                match reviewed {
+                    Some(reviewed) => reviewed,
+                    None => return Ok(false),
+                }
+            };
+            if use_it {
+                let path = std::path::absolute(
+                    self.repo
+                        .git_path(&format!("GIT_AGENT_TIDY_MSG_{position}"))?,
+                )?;
+                fs::write(&path, format!("{message}\n"))
+                    .with_context(|| format!("failed to write {}", path.display()))?;
+                messages[position] = Some(path);
+            }
+        }
+        Ok(true)
+    }
+
+    /// The changes of the group's commit and of the commits folded into it.
+    fn changes(&self, group: &tidy::Group, exclude: &[String]) -> Result<Changes> {
+        let mut changes = Changes {
+            stat: String::new(),
+            diff: String::new(),
+        };
+        for &index in std::iter::once(&group.commit).chain(&group.folded) {
+            let hash = &self.commits[index].short;
+            let parent = match self.repo.parents(hash)?.into_iter().next() {
+                Some(parent) => parent,
+                None => self.repo.empty_tree()?,
+            };
+            let part = self.repo.changes_between(&[&parent, hash], exclude)?;
+            changes.stat.push_str(&part.stat);
+            changes.diff.push_str(&part.diff);
+        }
+        Ok(changes)
+    }
+}
+
 async fn explain_lines(args: &WhyArgs, settings: &SettingArgs) -> Result<()> {
     let config = Config::load(settings)?.config;
     let repo = Repo::open(".")?;

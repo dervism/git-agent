@@ -6,7 +6,10 @@ git-agent writes git commit messages for your changes with a language model, eit
 one running on your own machine (LM Studio, Ollama, llama.cpp, vLLM) or one from a
 cloud provider such as OpenAI, Anthropic or OpenRouter. You review each proposed
 message, then commit it, edit it, regenerate it, or tell the model what to change.
-`git agent pr` does the same for pull requests on GitHub.
+
+The same model also names new branches, splits a large change into several commits,
+tidies commits before you push them, and writes pull requests for GitHub. It can
+explain why code looks the way it does, or what a set of commits changed.
 
 ## Why I made git-agent
 
@@ -74,7 +77,9 @@ git agent --push           # review, then push after committing
 git agent --commit --push  # commit and push, no review
 git agent --raw            # print just the message, e.g. for `| git commit -F -`
 git agent -- --signoff     # pass extra arguments to `git commit`
+git agent branch fix login # name a new branch after what it is for, then create it
 git agent split            # split the changes into several commits
+git agent tidy             # reword unclear messages and fold fixes, before you push
 git agent pr               # write a pull request for the branch, then create it
 git agent why src/fit.rs:120  # explain why a line is the way it is
 git agent explain          # explain the last commit, a range, a branch or a pull
@@ -104,6 +109,41 @@ git-agent shows the proposed message and waits for one of these keys:
 When `git commit` fails, for example because a hook rejects it, git-agent saves the
 message to `.git/GIT_AGENT_MSG`. You can reuse it with
 `git commit --file .git/GIT_AGENT_MSG`.
+
+## Starting a branch
+
+`git agent branch` names a new branch after what it is for, creates it and switches
+to it.
+
+```sh
+git agent branch fix login timeout        # name it after a description
+git agent branch 42                       # after GitHub issue #42, looked up with gh
+git agent branch                          # after the uncommitted changes
+git agent branch -c add dark mode         # create it right away, no review
+git agent branch --from origin/main ...   # start it at origin/main instead of HEAD
+git agent branch --raw fix login timeout  # print just the name
+```
+
+The name starts with the kind of work, as in `fix/login-timeout` or
+`feat/42-dark-mode`. The model sees your recent branches and follows their pattern, so
+in a repository with branches like `feature/PROJ-12-avatars`, the names look like
+`feature/dark-mode`. A name has an issue number or ticket key only when the
+description or the issue has one; git-agent removes any that the model makes up or
+copies from another branch.
+
+Without a description, git-agent names the branch after your uncommitted changes. That
+helps when you started on main and want the work on a branch of its own. The changes
+come along to the new branch.
+
+The review works like the one for commit messages: `c` creates the branch, `e` lets
+you edit the name in place, `r` asks for a new name and `f` tells the model what to
+change. git-agent won't create a branch with the name of an existing local or remote
+branch.
+
+The new branch starts at HEAD, or where `--from` says, and has no upstream yet. Its
+first push sets an upstream of the same name, so it never pushes to the branch it
+started from. Looking up an issue needs the [GitHub CLI](https://cli.github.com), as
+pull requests do.
 
 ## Splitting a change into commits
 

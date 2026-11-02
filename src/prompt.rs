@@ -2,6 +2,7 @@
 
 use crate::fit::{self, FileFit};
 use crate::git::Changes;
+use crate::github::Issue;
 use crate::server::Message;
 use std::fmt::Write;
 
@@ -55,6 +56,104 @@ How to answer:
 - If the developer asks a question, answer it.
 - Write plain text for a terminal, without headings, tables or bold."#;
 
+/// Instructions for naming a branch (`git agent branch`).
+pub const BRANCH_PROMPT: &str = r#"You name a new git branch for the work a developer is about to do.
+
+Rules for the name:
+- Start with the kind of work and a slash. If existing branches are listed, use the prefixes they use, spelled the same way: feature/ rather than feat/ if they use feature/. Otherwise use feat/, fix/, docs/, refactor/, perf/, test/ or chore/.
+- Then two to five words that say what the work is, in lowercase, separated by hyphens.
+- Put an issue number or ticket key right after the slash only when the work names one, e.g. fix/42-login-timeout. Never make one up.
+- Use only letters, digits, hyphens and slashes, and keep the name under 50 characters.
+
+Reply with the branch name only: no quotes, no code fences and no explanation."#;
+
+/// Most bytes of an issue's description to send.
+const ISSUE_BYTES: usize = 3000;
+/// Most bytes of the changes to send when naming a branch after them: a name
+/// needs only their gist.
+const BRANCH_CHANGES_BYTES: usize = 12_000;
+
+/// What a new branch is for.
+pub enum Work<'a> {
+    /// The developer's own description.
+    Described(&'a str),
+    Issue(&'a Issue),
+    /// The uncommitted changes.
+    Changes(&'a Changes),
+}
+
+/// The conversation asking for the name of a branch for `work`, in the
+/// style of the repository's `examples` of branch names.
+pub fn branch_messages(
+    work: &Work,
+    examples: &[&str],
+    context_length: usize,
+    max_output_tokens: usize,
+) -> Vec<Message> {
+    let mut user = String::new();
+    if !examples.is_empty() {
+        let _ = writeln!(
+            user,
+            "Existing branches, most recent first:\n{}\n",
+            examples.join("\n")
+        );
+    }
+    match work {
+        Work::Described(text) => {
+            let _ = writeln!(user, "The work: {text}");
+        }
+        Work::Issue(issue) => {
+            let _ = writeln!(
+                user,
+                "The work is GitHub issue #{}: {}",
+                issue.number, issue.title
+            );
+            if !issue.labels.is_empty() {
+                let _ = writeln!(user, "Labels: {}", issue.labels.join(", "));
+            }
+            let body = format!("{}\n", issue.body.trim());
+            if !body.trim().is_empty() {
+                let shown = fit::head_lines(&body, ISSUE_BYTES);
+                let _ = write!(user, "\nIssue description:\n{shown}");
+                if shown.len() < body.len() {
+                    user.push_str("[… rest of the description not shown]\n");
+                }
+            }
+        }
+        Work::Changes(changes) => {
+            user.push_str("The work is in these uncommitted changes.\n\n");
+            let room = room(BRANCH_PROMPT, context_length, max_output_tokens);
+            user = describe_changes(user, changes, room.min(BRANCH_CHANGES_BYTES)).0;
+        }
+    }
+    vec![Message::system(BRANCH_PROMPT), Message::user(user)]
+}
+
+/// Instructions for planning a tidy-up of unpushed commits (`git agent tidy`).
+/// The new messages come later, one commit at a time, from the commit message prompt.
+pub const TIDY_PROMPT: &str = r#"You help a developer tidy their commits before they push them. You get the commits that aren't pushed yet, oldest first and numbered, each with its message and its changes. Long changes are cut short.
+
+Choose an action for each commit:
+- "keep": the message says what the commit does. Most commits should be kept as they are.
+- "reword": the message doesn't say what the commit does, such as "wip", "fix", "update", "changes" or "asdf". A new message will be written from the commit's changes.
+- "fold": the commit only corrects or finishes an earlier commit in the list, such as "fix typo", "oops" or "address review" changing the same lines or files as that commit. Give the earlier commit's number as "into". The two become one commit with the earlier commit's message.
+
+Don't fold a commit that does something of its own, however small it is.
+
+Reply with JSON only, without any other text, in this form:
+{"commits": [{"commit": 1, "action": "keep"}, {"commit": 2, "action": "reword"}, {"commit": 3, "action": "fold", "into": 1}]}"#;
+
+/// The conversation asking for a tidy-up plan for the numbered `commits`.
+pub fn tidy_messages(commits: &str, hint: Option<&str>) -> Vec<Message> {
+    let user = format!("{}Commits, oldest first:\n{commits}", notes(hint));
+    vec![Message::system(TIDY_PROMPT), Message::user(user)]
+}
+
+/// Bytes the author's notes take in the user message.
+pub fn notes_bytes(hint: Option<&str>) -> usize {
+    notes(hint).len()
+}
+
 /// Instructions for grouping a change into commits (`git agent split`). The
 /// messages come later, one commit at a time, from the commit message prompt.
 pub const SPLIT_PROMPT: &str = r#"You split a developer's uncommitted changes into a series of small, logical commits, the way a careful developer would before pushing.
@@ -92,13 +191,14 @@ pub fn refine_plan(base: &[Message], plan: &str, feedback: &str) -> Vec<Message>
     messages
 }
 
-/// Continues `base` with a reply that wasn't a readable plan, and why.
-pub fn retry_plan(base: &[Message], reply: &str, problem: &str) -> Vec<Message> {
+/// Continues `base` with a reply that wasn't a readable plan, why, and the
+/// `rule` the plan must follow, e.g. "with every unit in exactly one commit".
+pub fn retry_plan(base: &[Message], reply: &str, problem: &str, rule: &str) -> Vec<Message> {
     let mut messages = base.to_vec();
     messages.push(Message::assistant(reply));
     messages.push(Message::user(format!(
         "That reply could not be read as a plan ({problem}). Reply with the JSON only, in the \
-         form shown, with every unit in exactly one commit."
+         form shown, {rule}."
     )));
     messages
 }
@@ -446,6 +546,17 @@ fn strip_code_fence(text: &str) -> &str {
     body.trim_end().strip_suffix("```").unwrap_or(body)
 }
 
+/// `message` with a blank line between its subject and its body, which git
+/// needs to tell them apart. Models sometimes leave it out.
+pub fn separate_subject(message: &str) -> String {
+    match message.split_once('\n') {
+        Some((subject, body)) if !body.starts_with('\n') && !body.trim().is_empty() => {
+            format!("{subject}\n\n{body}")
+        }
+        _ => message.to_owned(),
+    }
+}
+
 /// Trims trailing whitespace from every line and blank lines around the text.
 pub fn normalize(text: &str) -> String {
     let lines: Vec<&str> = text.lines().map(str::trim_end).collect();
@@ -633,6 +744,41 @@ mod tests {
     }
 
     #[test]
+    fn asks_for_a_branch_name_in_the_repository_style() {
+        let messages = branch_messages(
+            &Work::Described("fix login timeout"),
+            &["feature/split", "bugfix/pr-base"],
+            8192,
+            REPLY,
+        );
+        assert_eq!(messages[0].content, BRANCH_PROMPT);
+        assert_eq!(
+            messages[1].content,
+            "Existing branches, most recent first:\nfeature/split\nbugfix/pr-base\n\n\
+             The work: fix login timeout\n"
+        );
+
+        let issue = Issue {
+            number: 42,
+            title: "Login times out".into(),
+            body: format!("It hangs.\n{}", "More detail.\n".repeat(400)),
+            labels: vec!["bug".into()],
+        };
+        let user = &branch_messages(&Work::Issue(&issue), &[], 8192, REPLY)[1].content;
+        assert!(user.starts_with(
+            "The work is GitHub issue #42: Login times out\nLabels: bug\n\n\
+             Issue description:\nIt hangs.\n"
+        ));
+        assert!(user.ends_with("[… rest of the description not shown]\n"));
+        assert!(user.len() < ISSUE_BYTES + 200);
+
+        let big = changes(&diff(5000));
+        let user = &branch_messages(&Work::Changes(&big), &[], 131_072, REPLY)[1].content;
+        assert!(user.starts_with("The work is in these uncommitted changes.\n\nChanged files:\n"));
+        assert!(user.len() <= BRANCH_CHANGES_BYTES + 200);
+    }
+
+    #[test]
     fn asks_for_a_plan_and_continues_it() {
         let messages = split_messages("[1] a.rs (+1)\n+x\n", Some("cleanup"));
         assert_eq!(messages[0].content, SPLIT_PROMPT);
@@ -643,8 +789,32 @@ mod tests {
         let refined = refine_plan(&messages, "{\"commits\": []}", "fewer commits");
         assert_eq!(refined.len(), 4);
         assert!(refined[3].content.contains("fewer commits"));
-        let retried = retry_plan(&messages, "oops", "not JSON");
+        let retried = retry_plan(
+            &messages,
+            "oops",
+            "not JSON",
+            "with every unit in one commit",
+        );
         assert!(retried[3].content.contains("(not JSON)"));
+        assert!(
+            retried[3]
+                .content
+                .ends_with("form shown, with every unit in one commit.")
+        );
+        let tidy = tidy_messages("Commit 1 (a1b2c3d):\n    wip\n", Some("fixes #3"));
+        assert_eq!(tidy[0].content, TIDY_PROMPT);
+        assert_eq!(
+            tidy[1].content,
+            "Notes from the author:\nfixes #3\n\nCommits, oldest first:\nCommit 1 (a1b2c3d):\n    wip\n"
+        );
+        assert_eq!(notes_bytes(None), 0);
+    }
+
+    #[test]
+    fn separates_the_subject_from_the_body() {
+        assert_eq!(separate_subject("feat: a\nWhy a."), "feat: a\n\nWhy a.");
+        assert_eq!(separate_subject("feat: a\n\nWhy a."), "feat: a\n\nWhy a.");
+        assert_eq!(separate_subject("feat: a"), "feat: a");
     }
 
     #[test]

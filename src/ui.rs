@@ -38,6 +38,8 @@ pub struct Review<T: 'static> {
     pub noun: &'static str,
     /// What the model is asked to revise, e.g. "commit message".
     pub what: &'static str,
+    /// Help for editing, e.g. "edit the message in your editor".
+    pub edit: &'static str,
     /// Typed as their first letter or in full; "y" picks the first.
     pub accept: &'static [Choice<T>],
     /// Help for quitting, e.g. "quit without committing".
@@ -251,7 +253,7 @@ fn help<T>(review: &Review<T>) -> String {
         .iter()
         .map(|choice| format!("  {}  {}", &choice.word[..1], choice.help))
         .collect();
-    lines.push(format!("  e  edit the {} in your editor", review.noun));
+    lines.push(format!("  e  {}", review.edit));
     lines.push(format!("  r  generate a new {}", review.noun));
     lines.push("  f  tell the model what to change, e.g. `f mention the API change`".to_owned());
     lines.push(format!("  q  {}", review.quit));
@@ -297,9 +299,24 @@ pub fn edit_message(repo: &Repo, message: &str) -> Result<Option<String>> {
     Ok((!edited.is_empty()).then_some(edited))
 }
 
-/// Lets the user edit a split plan in their editor, and returns what they saved.
-pub fn edit_plan(repo: &Repo, text: &str) -> Result<String> {
-    edit(&repo.git_path("GIT_AGENT_SPLIT_PLAN")?, text)
+/// Lets the user edit `text` in place on one line. Returns `None` if they
+/// emptied it or pressed Esc.
+pub fn edit_line(label: &str, text: &str) -> Result<Option<String>> {
+    let prompt = inquire::Text::new(label).with_initial_value(text);
+    let edited = match prompt.prompt_skippable() {
+        // Ctrl-C quits at once, as it does elsewhere in the review.
+        Err(inquire::InquireError::OperationInterrupted) => std::process::exit(130),
+        result => result?,
+    };
+    Ok(edited
+        .map(|edited| edited.trim().to_owned())
+        .filter(|edited| !edited.is_empty()))
+}
+
+/// Lets the user edit a plan in their editor, in the file `name` in the git
+/// directory, and returns what they saved.
+pub fn edit_plan(repo: &Repo, name: &str, text: &str) -> Result<String> {
+    edit(&repo.git_path(name)?, text)
 }
 
 /// Lets the user edit a pull request's title and description in their editor.
@@ -366,6 +383,7 @@ mod tests {
         first_line: "title",
         noun: "thing",
         what: "thing",
+        edit: "edit the thing in your editor",
         accept: &[
             Choice {
                 word: "create",

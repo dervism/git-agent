@@ -502,6 +502,133 @@ impl Repo {
         .is_ok()
     }
 
+    /// The names of the local and remote branches, those committed to most
+    /// recently first, each once and without the remote's name.
+    pub fn branch_names(&self) -> Result<Vec<String>> {
+        let remotes = self.git(&["remote"])?;
+        let prefixes: Vec<String> = remotes
+            .lines()
+            .map(|remote| format!("refs/remotes/{remote}/"))
+            .collect();
+        let refs = self.git(&[
+            "for-each-ref",
+            "--sort=-committerdate",
+            "--format=%(refname)",
+            "refs/heads",
+            "refs/remotes",
+        ])?;
+        let mut names: Vec<String> = Vec::new();
+        for full in refs.lines() {
+            let name = full.strip_prefix("refs/heads/").or_else(|| {
+                prefixes
+                    .iter()
+                    .find_map(|prefix| full.strip_prefix(prefix.as_str()))
+            });
+            if let Some(name) = name
+                && name != "HEAD"
+                && !names.iter().any(|known| known == name)
+            {
+                names.push(name.to_owned());
+            }
+        }
+        Ok(names)
+    }
+
+    /// Whether git accepts `name` as the name of a branch.
+    pub fn is_valid_branch_name(&self, name: &str) -> bool {
+        !name.starts_with('-') && self.git(&["check-ref-format", "--branch", name]).is_ok()
+    }
+
+    /// Creates the branch `name` at `start`, or at HEAD, and switches to it.
+    /// Uncommitted changes come along. The branch doesn't track `start`, so
+    /// its first push sets an upstream of its own name.
+    pub fn create_branch(&self, name: &str, start: Option<&str>) -> Result<()> {
+        let mut command = self.command(&["switch", "--no-track", "--create", name]);
+        if let Some(start) = start {
+            command.arg(start);
+        }
+        // Uses the terminal, so git reports the switch, or what stands in its way.
+        let status = command.status().context("failed to run git switch")?;
+        if !status.success() {
+            bail!("`git switch --create {name}` failed ({status})");
+        }
+        Ok(())
+    }
+
+    /// The commits HEAD has that no remote-tracking branch has, oldest first.
+    pub fn unpushed(&self) -> Result<Vec<String>> {
+        let list = self.git(&["rev-list", "--reverse", "HEAD", "--not", "--remotes"])?;
+        Ok(list.lines().map(str::to_owned).collect())
+    }
+
+    /// The commits on HEAD after `base`, oldest first.
+    pub fn commits_after(&self, base: &str) -> Result<Vec<String>> {
+        let list = self.git(&["rev-list", "--reverse", &format!("{base}..HEAD")])?;
+        Ok(list.lines().map(str::to_owned).collect())
+    }
+
+    pub fn has_remotes(&self) -> Result<bool> {
+        Ok(!self.git(&["remote"])?.trim().is_empty())
+    }
+
+    /// Whether any commit in `range` is a merge.
+    pub fn has_merges(&self, range: &str) -> Result<bool> {
+        let merges = self.git(&["rev-list", "--merges", "--max-count=1", range])?;
+        Ok(!merges.trim().is_empty())
+    }
+
+    /// The hash of the tree of `commit`.
+    pub fn tree(&self, commit: &str) -> Result<String> {
+        Ok(self
+            .git(&["rev-parse", &format!("{commit}^{{tree}}")])?
+            .trim()
+            .to_owned())
+    }
+
+    /// Replays the commits from `head` back to `base` (or to the first commit
+    /// if `base` is `None`) as the `git rebase -i` list `todo` says, and
+    /// returns the new tip. The rebase runs in a temporary worktree without
+    /// hooks, so this repository's work tree, index and branches are left alone.
+    pub fn rewrite(&self, head: &str, base: Option<&str>, todo: &str) -> Result<String> {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |elapsed| elapsed.as_nanos());
+        let dir =
+            std::env::temp_dir().join(format!("git-agent-rewrite-{}-{unique}", std::process::id()));
+        let dir_text = dir.to_string_lossy().into_owned();
+        let todo_path = std::path::absolute(self.git_path("GIT_AGENT_TODO")?)?;
+        fs::write(&todo_path, todo)
+            .with_context(|| format!("failed to write {}", todo_path.display()))?;
+        let added = self.git(&[
+            "-c", NO_HOOKS, "worktree", "add", "--detach", "--quiet", &dir_text, head,
+        ]);
+        let result = added.and_then(|_| rebase(&dir, base, &todo_path));
+        let _ = self.git(&["worktree", "remove", "--force", &dir_text]);
+        if dir.exists() {
+            let _ = fs::remove_dir_all(&dir);
+            let _ = self.git(&["worktree", "prune"]);
+        }
+        let _ = fs::remove_file(&todo_path);
+        result
+    }
+
+    /// Moves the current branch, or a detached HEAD, from `old` to `new`,
+    /// failing if it has moved from `old` meanwhile.
+    pub fn move_head(&self, old: &str, new: &str, reason: &str) -> Result<()> {
+        let moved = match self.current_branch() {
+            Ok(branch) => self.git(&[
+                "update-ref",
+                "-m",
+                reason,
+                &format!("refs/heads/{branch}"),
+                new,
+                old,
+            ]),
+            Err(_) => self.git(&["update-ref", "-m", reason, "--no-deref", "HEAD", new, old]),
+        };
+        moved.map(drop)
+    }
+
     /// The branch new branches most likely start from: the remote's default
     /// branch (e.g. `origin/main`), else `main` or `master`.
     pub fn default_base(&self) -> Result<String> {

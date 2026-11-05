@@ -7,11 +7,20 @@
 //! HEAD and the hunks of its units, so the real index keeps the changes that
 //! are still to be committed.
 
+pub mod check;
+pub mod command;
+pub mod dry_run;
+pub mod flow;
+pub mod kinds;
+pub mod signals;
+
 use crate::fit;
+use crate::git::{lossless, names};
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashSet};
 use std::fmt::Write;
+use std::ops::Range;
 
 /// Room for the note that replaces the end of a shortened unit.
 const NOTE_BYTES: usize = 40;
@@ -74,7 +83,7 @@ pub fn parse(patch: &str, included: &HashSet<String>) -> Vec<FilePatch> {
     fit::split_files(patch)
         .into_iter()
         .map(|text| {
-            let path = fit::path(text);
+            let path = names::of_diff(text);
             let hunks_start = text.find("\n@@").map_or(text.len(), |newline| newline + 1);
             let (header, hunks) = text.split_at(hunks_start);
             FilePatch {
@@ -98,12 +107,11 @@ fn status(header: &str) -> Option<&'static str> {
         ("GIT binary patch", "binary"),
         ("Binary files", "binary"),
     ];
-    header.lines().find_map(|line| {
-        KINDS
-            .iter()
-            .find(|(start, _)| line.starts_with(start))
-            .map(|(_, kind)| *kind)
-    })
+    // By the order of the list, because a renamed file can also change its mode.
+    KINDS
+        .iter()
+        .find(|(start, _)| header.lines().any(|line| line.starts_with(start)))
+        .map(|(_, kind)| *kind)
 }
 
 fn parse_hunks(text: &str) -> Vec<Hunk> {
@@ -245,7 +253,7 @@ fn name(files: &[FilePatch], unit: Unit) -> String {
             let _ = write!(name, " (+{added} -{removed})");
         }
     }
-    name
+    lossless::readable(&name)
 }
 
 /// The lines of a unit's hunks the model sees, with the unchanged lines around
@@ -260,11 +268,12 @@ fn lines(files: &[FilePatch], unit: Unit) -> String {
         Some(index) => &file.hunks[index..=index],
         None => &file.hunks[..],
     };
-    hunks
+    let shown: String = hunks
         .iter()
         .flat_map(|hunk| hunk.body.split_inclusive('\n'))
         .filter(|line| !line.starts_with('\\'))
-        .collect()
+        .collect();
+    lossless::readable(&shown)
 }
 
 /// `text` in at most about `room` bytes, ending with a note if it was cut.
@@ -325,9 +334,75 @@ pub fn parse_plan(reply: &str, files: &[FilePatch], units: &[Unit]) -> Result<Se
     let end = reply
         .rfind(['}', ']'])
         .context("the model's plan is cut off")?;
-    let value: Value = serde_json::from_str(reply.get(start..=end).unwrap_or_default())
-        .context("the model's plan is not valid JSON")?;
-    let commits = match &value {
+    let after_plan = reply.get(end + 1..).unwrap_or_default();
+    let (value, repaired) = read_json(reply.get(start..=end).unwrap_or_default(), after_plan)?;
+    let raw = raw_commits(&value)?;
+    let mut settled = settle(raw, files, units);
+    if repaired {
+        settled.notes.insert(
+            0,
+            "the plan's JSON had its closing brackets wrong, so git-agent fixed them".to_owned(),
+        );
+    }
+    Ok(settled)
+}
+
+/// Reads the JSON of a plan, and says if it had to fix closing brackets the
+/// model got wrong. A reply that goes on after the last bracket was cut off, so
+/// what's there can't be trusted, and one that names no units is no plan.
+fn read_json(text: &str, after_plan: &str) -> Result<(Value, bool)> {
+    let error = match serde_json::from_str(text) {
+        Ok(value) => return Ok((value, false)),
+        Err(error) => error,
+    };
+    let is_cut_off = !after_plan.trim().trim_matches('`').trim().is_empty();
+    (!is_cut_off)
+        .then(|| closed_brackets(text))
+        .flatten()
+        .and_then(|closed| serde_json::from_str::<Value>(&closed).ok())
+        .filter(|value| {
+            raw_commits(value).is_ok_and(|raw| raw.iter().any(|(_, units)| !units.is_empty()))
+        })
+        .map(|value| (value, true))
+        .ok_or(error)
+        .context("the model's plan is not valid JSON")
+}
+
+/// `text` with its brackets closed, if that's all it lacks: those left open at
+/// the end, and those a closing bracket passes over, as in `[{"a":[1]]`. Not if
+/// it ends inside a string, or a closing bracket matches nothing that's open.
+fn closed_brackets(text: &str) -> Option<String> {
+    let mut open: Vec<char> = Vec::new();
+    let mut closed = String::with_capacity(text.len());
+    let (mut in_string, mut escaped) = (false, false);
+    for character in text.chars() {
+        match character {
+            _ if escaped => escaped = false,
+            '\\' if in_string => escaped = true,
+            '"' => in_string = !in_string,
+            _ if in_string => {}
+            '{' => open.push('}'),
+            '[' => open.push(']'),
+            '}' | ']' => {
+                let matching = open.iter().rposition(|&closer| closer == character)?;
+                closed.extend(open.drain(matching + 1..).rev());
+                open.pop();
+            }
+            _ => {}
+        }
+        closed.push(character);
+    }
+    if in_string {
+        return None;
+    }
+    closed.extend(open.iter().rev());
+    (closed != text).then_some(closed)
+}
+
+/// The titles and 1-based unit numbers of a plan's commits, in any of the forms
+/// models write them.
+fn raw_commits(value: &Value) -> Result<Vec<(String, Vec<usize>)>> {
+    let commits = match value {
         Value::Array(commits) => commits,
         Value::Object(plan) => plan
             .get("commits")
@@ -335,7 +410,7 @@ pub fn parse_plan(reply: &str, files: &[FilePatch], units: &[Unit]) -> Result<Se
             .context("the model's plan has no \"commits\" list")?,
         _ => bail!("the model's plan is not a list of commits"),
     };
-    let raw = commits
+    Ok(commits
         .iter()
         .map(|commit| {
             let title = ["title", "message", "summary", "subject"]
@@ -358,8 +433,7 @@ pub fn parse_plan(reply: &str, files: &[FilePatch], units: &[Unit]) -> Result<Se
                 .unwrap_or_default();
             (title, numbers)
         })
-        .collect();
-    Ok(settle(raw, files, units))
+        .collect())
 }
 
 /// Adds the unit numbers in `value` to `found`. Besides plain numbers, models
@@ -542,6 +616,70 @@ pub fn from_text(text: &str, files: &[FilePatch], units: &[Unit]) -> (Plan, Vec<
     (settled.plan, settled.notes)
 }
 
+/// A commit that may hold several of a plan's commits.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Merged {
+    pub commit: Planned,
+    /// Which of the plan's commits it holds. The last one's tree is its tree.
+    pub from: Range<usize>,
+}
+
+/// Merges each commit whose result didn't pass into the next one. `passed` says
+/// for each commit whether the tree it leaves is good. The last commit always
+/// ends a merge, because the caller knows the whole change is what it is, and
+/// a commit `passed` says nothing about counts as failed.
+pub fn merge_failed(plan: &Plan, passed: &[bool]) -> Vec<Merged> {
+    let mut merged = Vec::new();
+    let mut start = 0;
+    for end in 1..=plan.commits.len() {
+        let is_last = end == plan.commits.len();
+        if is_last || passed.get(end - 1).copied().unwrap_or(false) {
+            merged.push(merge(&plan.commits, start..end));
+            start = end;
+        }
+    }
+    merged
+}
+
+fn merge(commits: &[Planned], from: Range<usize>) -> Merged {
+    let parts = &commits[from.clone()];
+    let titles: Vec<&str> = parts.iter().map(|commit| commit.title.as_str()).collect();
+    Merged {
+        commit: Planned {
+            title: titles.join("; "),
+            units: parts
+                .iter()
+                .flat_map(|commit| commit.units.iter().copied())
+                .collect(),
+        },
+        from,
+    }
+}
+
+/// The commits of `merged` as a plan.
+pub fn merged_plan(merged: &[Merged]) -> Plan {
+    Plan {
+        commits: merged.iter().map(|merge| merge.commit.clone()).collect(),
+    }
+}
+
+/// What merging did to `plan`, for the user. Commits go by their titles, because
+/// their numbers change as they merge.
+pub fn merge_notes(plan: &Plan, merged: &[Merged]) -> Vec<String> {
+    merged
+        .iter()
+        .filter(|merge| merge.from.len() > 1)
+        .map(|merge| {
+            let titles: Vec<String> = plan.commits[merge.from.clone()]
+                .iter()
+                .map(|commit| format!("\"{}\"", commit.title))
+                .collect();
+            let (last, others) = titles.split_last().expect("a merge holds commits");
+            format!("{} and {last} became one commit", others.join(", "))
+        })
+        .collect()
+}
+
 /// A patch that adds a commit's units to HEAD.
 pub struct Patch {
     pub text: String,
@@ -626,30 +764,12 @@ pub fn patch(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::git::test_support::{numbered_lines as lines, run};
     use crate::git::{Repo, Scope};
     use std::fs;
     use std::path::Path;
     use std::process::Command;
     use tempfile::TempDir;
-
-    fn run(dir: &Path, args: &[&str]) -> String {
-        let output = Command::new("git")
-            .current_dir(dir)
-            .args(args)
-            .output()
-            .unwrap();
-        assert!(
-            output.status.success(),
-            "git {args:?}: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        String::from_utf8_lossy(&output.stdout).into_owned()
-    }
-
-    /// A file of `count` numbered lines.
-    fn lines(count: usize) -> String {
-        (1..=count).map(|n| format!("line {n}\n")).collect()
-    }
 
     /// A repository with lib.txt (40 lines), notes.txt and Cargo.lock committed.
     fn setup() -> (TempDir, Repo) {
@@ -836,6 +956,106 @@ mod tests {
     }
 
     #[test]
+    fn closes_the_brackets_a_model_left_off_its_plan() {
+        let (dir, repo) = setup();
+        change(dir.path());
+        let files = files(&repo);
+        let units = describe(&files, 100_000).unwrap().units;
+        let reply = "{\"commits\":[{\"title\":\"Brackets ] } [ { in a \\\"title\\\"\",\"units\":[1,2,3]},\
+                     {\"title\":\"The rest\",\"units\":[4,5,6]}]";
+        let settled = parse_plan(reply, &files, &units).unwrap();
+        assert_eq!(settled.plan.commits.len(), 2);
+        assert_eq!(
+            settled.plan.commits[0].title,
+            "Brackets ] } [ { in a \"title\""
+        );
+        assert!(settled.missing.is_empty());
+        assert!(
+            settled.notes[0].contains("closing brackets"),
+            "{:?}",
+            settled.notes
+        );
+
+        // A list of commits without the object around it, missing its own end.
+        let bare = "[{\"title\":\"All\",\"units\":[1,2,3,4,5,6]}";
+        let settled = parse_plan(bare, &files, &units).unwrap();
+        assert_eq!(settled.plan.commits.len(), 1);
+
+        // A closing bracket that passes over the object it should have ended.
+        let passed_over = "{\"commits\":[{\"title\":\"All\",\"units\":[1,2,3,4,5,6]]}";
+        let settled = parse_plan(passed_over, &files, &units).unwrap();
+        assert_eq!(settled.plan.commits[0].units.len(), 6);
+
+        // A code fence after the plan doesn't count as more of it.
+        let fenced = "```json\n{\"commits\":[{\"title\":\"All\",\"units\":[1,2,3,4,5,6]}]\n```";
+        assert_eq!(
+            parse_plan(fenced, &files, &units)
+                .unwrap()
+                .plan
+                .commits
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn doesnt_add_a_note_to_a_plan_that_needed_no_repair() {
+        let (dir, repo) = setup();
+        change(dir.path());
+        let files = files(&repo);
+        let units = describe(&files, 100_000).unwrap().units;
+        let reply = "{\"commits\":[{\"title\":\"All\",\"units\":[1,2,3,4,5,6]}]}";
+        assert!(parse_plan(reply, &files, &units).unwrap().notes.is_empty());
+    }
+
+    #[test]
+    fn wont_repair_a_reply_that_is_no_plan() {
+        let (dir, repo) = setup();
+        change(dir.path());
+        let files = files(&repo);
+        let units = describe(&files, 100_000).unwrap().units;
+        for reply in [
+            "{\"commits\": [",
+            "{\"commits\": []",
+            "{\"commits\": [{\"title\": \"No units\"}",
+            "{\"commits\": [{\"title\": \"Empty\", \"units\": []}",
+            "{\"commits\": [{\"title\": \"Cut in a string",
+            "[{\"title\": \"A closer with nothing to close\", \"units\": [1]}]}]",
+            "{\"commits\":[{\"title\":\"Cut\",\"units\":[1]},{\"title\":\"B\",\"units\":[3",
+            "{\"plan\": [{\"title\": \"Other key\", \"units\": [1]}]",
+            "[3",
+            "no json at all",
+        ] {
+            assert!(parse_plan(reply, &files, &units).is_err(), "{reply}");
+        }
+    }
+
+    #[test]
+    fn closes_only_what_is_open() {
+        assert_eq!(
+            closed_brackets("{\"a\":[1]").as_deref(),
+            Some("{\"a\":[1]}")
+        );
+        assert_eq!(closed_brackets("[[1]").as_deref(), Some("[[1]]"));
+        assert_eq!(
+            closed_brackets("{\"a\":\"]\"").as_deref(),
+            Some("{\"a\":\"]\"}")
+        );
+        assert_eq!(closed_brackets("{\"a\":1}"), None);
+        assert_eq!(closed_brackets("{\"a\":\"open"), None);
+        assert_eq!(closed_brackets("[1}"), None);
+        assert_eq!(
+            closed_brackets("{\"a\":[1}").as_deref(),
+            Some("{\"a\":[1]}")
+        );
+        assert_eq!(
+            closed_brackets("{\"c\":[{\"u\":[1]]}").as_deref(),
+            Some("{\"c\":[{\"u\":[1]}]}")
+        );
+        assert_eq!(closed_brackets(""), None);
+    }
+
+    #[test]
     fn reads_back_a_plan_the_user_edited() {
         let (dir, repo) = setup();
         change(dir.path());
@@ -872,6 +1092,325 @@ mod tests {
             serde_json::from_str::<Value>(&plan.to_json()).unwrap()["commits"][0]["units"],
             json!([2, 3, 4])
         );
+    }
+
+    /// Commits `name` with 40 lines, then stages a change in two separate places.
+    fn change_two_places(dir: &Path, name: &str) {
+        if let Some(folder) = Path::new(name).parent() {
+            fs::create_dir_all(dir.join(folder)).unwrap();
+        }
+        fs::write(dir.join(name), lines(40)).unwrap();
+        run(dir, &["add", "--all"]);
+        run(dir, &["commit", "-q", "-m", "add the file"]);
+        let changed = lines(40)
+            .replace("line 2\n", "line 2 changed\n")
+            .replace("line 37\n", "line 37 changed\n");
+        fs::write(dir.join(name), changed).unwrap();
+        run(dir, &["add", "--all"]);
+    }
+
+    /// Applies every unit in order, as commits would, to a temporary index,
+    /// and returns the tree it ends with.
+    fn tree_of_all_units(dir: &Path, repo: &Repo, files: &[FilePatch], units: &[Unit]) -> String {
+        let index = repo.with_index(dir.join(".git/split-test-index"));
+        index.read_tree("HEAD").unwrap();
+        let chosen: Vec<usize> = (0..units.len()).collect();
+        let patch = patch(files, units, &chosen, &Committed::default());
+        index.apply_to_index(&patch.text).unwrap();
+        index.write_tree().unwrap()
+    }
+
+    #[test]
+    fn shows_and_splits_files_with_norwegian_names_whatever_the_setting_is() {
+        for setting in [None, Some("true"), Some("false")] {
+            let (dir, repo) = setup();
+            if let Some(setting) = setting {
+                run(dir.path(), &["config", "core.quotePath", setting]);
+            }
+            change_two_places(dir.path(), "kjøring/Mønster æøå.txt");
+            let files = files(&repo);
+            assert_eq!(files[0].path, "kjøring/Mønster æøå.txt", "{setting:?}");
+            assert!(!files[0].excluded, "{setting:?}");
+            assert_eq!(files[0].hunks.len(), 2);
+            let described = describe(&files, 100_000).unwrap();
+            assert_eq!(described.units.len(), 2);
+            assert!(
+                described
+                    .text
+                    .starts_with("Unit 1: kjøring/Mønster æøå.txt, change 1 of 2"),
+                "{}",
+                described.text
+            );
+            assert!(described.text.contains("+line 37 changed"));
+            assert_eq!(
+                tree_of_all_units(dir.path(), &repo, &files, &described.units),
+                repo.write_tree().unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn keeps_excluding_a_lockfile_with_a_norwegian_name() {
+        let (dir, repo) = setup();
+        change_two_places(dir.path(), "låsefil.lock");
+        let patch = repo.patch(Scope::Staged).unwrap();
+        let exclude = ["*.lock".to_owned()];
+        let files = parse(
+            &patch,
+            &repo.included_paths(Scope::Staged, &exclude).unwrap(),
+        );
+        assert_eq!(files[0].path, "låsefil.lock");
+        assert!(files[0].excluded);
+    }
+
+    #[test]
+    fn keeps_control_characters_out_of_what_the_model_and_the_user_see() {
+        for (name, shown) in [
+            ("tab\there.txt", "tab\\there.txt"),
+            ("quo\"te.txt", "quo\"te.txt"),
+            ("back\\slash.txt", "back\\slash.txt"),
+            ("ny\nUnit 9: linje.txt", "ny\\nUnit 9: linje.txt"),
+            ("farge\u{1b}[31m.txt", "farge\\033[31m.txt"),
+        ] {
+            let (dir, repo) = setup();
+            change_two_places(dir.path(), name);
+            let files = files(&repo);
+            assert_eq!(files[0].path, shown);
+            assert!(!files[0].excluded, "{name:?} counted as excluded");
+            let described = describe(&files, 100_000).unwrap();
+            assert!(!described.text.contains('\u{1b}'));
+            assert!(!described.text.contains("\nUnit 9"), "{}", described.text);
+            assert_eq!(described.units.len(), 2, "{name:?}");
+            assert_eq!(
+                tree_of_all_units(dir.path(), &repo, &files, &described.units),
+                repo.write_tree().unwrap(),
+                "{name:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn replays_a_name_that_isnt_utf8_to_the_same_tree() {
+        for setting in [None, Some("true"), Some("false")] {
+            let (dir, repo) = setup();
+            if let Some(setting) = setting {
+                run(dir.path(), &["config", "core.quotePath", setting]);
+            }
+            // Only in the index, because not every file system accepts such a name.
+            let blob = |text: &str| {
+                let mut child = Command::new("git")
+                    .current_dir(dir.path())
+                    .args(["hash-object", "-w", "--stdin"])
+                    .stdin(std::process::Stdio::piped())
+                    .stdout(std::process::Stdio::piped())
+                    .spawn()
+                    .unwrap();
+                std::io::Write::write_all(child.stdin.as_mut().unwrap(), text.as_bytes()).unwrap();
+                let output = child.wait_with_output().unwrap();
+                String::from_utf8(output.stdout).unwrap().trim().to_owned()
+            };
+            let put = |text: &str| {
+                let mut child = Command::new("git")
+                    .current_dir(dir.path())
+                    .args(["update-index", "--index-info"])
+                    .stdin(std::process::Stdio::piped())
+                    .spawn()
+                    .unwrap();
+                let mut line = format!("100644 blob {}\t", blob(text)).into_bytes();
+                line.extend_from_slice(b"Kj\xf8re.txt\n");
+                std::io::Write::write_all(child.stdin.as_mut().unwrap(), &line).unwrap();
+                assert!(child.wait().unwrap().success());
+            };
+            put("one\n");
+            run(dir.path(), &["commit", "-q", "-m", "add the file"]);
+            put("two\n");
+            let files = files(&repo);
+            assert_eq!(files[0].path, "Kj\u{fffd}re.txt", "{setting:?}");
+            assert!(!files[0].excluded, "{setting:?}");
+            let units = describe(&files, 100_000).unwrap().units;
+            assert_eq!(
+                tree_of_all_units(dir.path(), &repo, &files, &units),
+                repo.write_tree().unwrap(),
+                "{setting:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn builds_a_commit_from_a_subfolder_with_every_file_in_it() {
+        let (dir, _) = setup();
+        fs::create_dir(dir.path().join("sub")).unwrap();
+        fs::write(dir.path().join("sub/in.txt"), "a\n").unwrap();
+        run(dir.path(), &["add", "--all"]);
+        run(dir.path(), &["commit", "-q", "-m", "add the folder"]);
+        fs::write(dir.path().join("sub/in.txt"), "b\n").unwrap();
+        fs::write(dir.path().join("notes.txt"), "b\n").unwrap();
+        run(dir.path(), &["add", "--all"]);
+
+        let repo = Repo::open_at_top(dir.path().join("sub")).unwrap();
+        let files = files(&repo);
+        let units = describe(&files, 100_000).unwrap().units;
+        assert_eq!(units.len(), 2);
+        let index = repo.with_index(repo.git_path("split-test-index").unwrap());
+        index.read_tree("HEAD").unwrap();
+        let everything = patch(&files, &units, &[0, 1], &Committed::default());
+        index.apply_to_index(&everything.text).unwrap();
+        assert_eq!(index.write_tree().unwrap(), repo.write_tree().unwrap());
+    }
+
+    /// `text` in Latin-1: each character is one byte, so it isn't valid UTF-8.
+    fn latin1(text: &str) -> Vec<u8> {
+        text.chars().map(|character| character as u8).collect()
+    }
+
+    #[test]
+    fn splits_a_file_that_isnt_utf8_and_keeps_its_bytes() {
+        let (dir, repo) = setup();
+        let before: String = (1..=40).map(|n| format!("nøkkel{n}=blå\n")).collect();
+        let after = before
+            .replace("nøkkel2=blå\n", "nøkkel2=grønn\n")
+            .replace("nøkkel37=blå\n", "nøkkel37=rød\nnøkkel37b=rød\n");
+        fs::write(dir.path().join("tekst.properties"), latin1(&before)).unwrap();
+        run(dir.path(), &["add", "--all"]);
+        run(dir.path(), &["commit", "-q", "-m", "add the file"]);
+        fs::write(dir.path().join("tekst.properties"), latin1(&after)).unwrap();
+        run(dir.path(), &["add", "--all"]);
+
+        let files = files(&repo);
+        let described = describe(&files, 100_000).unwrap();
+        assert_eq!(described.units.len(), 2);
+        assert!(
+            described.text.contains("+n\u{fffd}kkel2=gr\u{fffd}nn"),
+            "{}",
+            described.text
+        );
+        let plan = Plan {
+            commits: vec![Planned {
+                title: "Change".into(),
+                units: vec![0, 1],
+            }],
+        };
+        let edited = to_text(&plan, &files, &described.units);
+        assert!(
+            edited
+                .chars()
+                .all(|c| !('\u{10ef80}'..='\u{10efff}').contains(&c))
+        );
+
+        let original = run(dir.path(), &["write-tree"]);
+        let index = repo.with_index(dir.path().join(".git/split-test-index"));
+        let mut committed = Committed::default();
+        for (unit, message) in [(1, "the last change"), (0, "the first change")] {
+            let patch = patch(&files, &described.units, &[unit], &committed);
+            index.read_tree("HEAD").unwrap();
+            index.apply_to_index(&patch.text).unwrap();
+            index.commit(message, Scope::Staged, &[]).unwrap();
+            committed.record(&patch);
+        }
+        assert_eq!(run(dir.path(), &["rev-parse", "HEAD^{tree}"]), original);
+    }
+
+    #[test]
+    fn keeps_utf8_text_that_uses_the_private_characters() {
+        let (dir, repo) = setup();
+        let private = "\u{10ef80}\u{10efff}";
+        let before: String = (1..=40)
+            .map(|n| format!("line {n} {private} æ\n"))
+            .collect();
+        let after = before
+            .replace("line 2 ", "line two ")
+            .replace("line 37 ", "line thirty seven ");
+        fs::write(dir.path().join("private.txt"), before).unwrap();
+        run(dir.path(), &["add", "--all"]);
+        run(dir.path(), &["commit", "-q", "-m", "add the file"]);
+        fs::write(dir.path().join("private.txt"), after).unwrap();
+        run(dir.path(), &["add", "--all"]);
+
+        let files = files(&repo);
+        let units = describe(&files, 100_000).unwrap().units;
+        assert_eq!(units.len(), 2);
+        assert_eq!(
+            tree_of_all_units(dir.path(), &repo, &files, &units),
+            repo.write_tree().unwrap()
+        );
+    }
+
+    /// A plan of `count` commits, each with one unit named after its number.
+    fn numbered_plan(count: usize) -> Plan {
+        Plan {
+            commits: (0..count)
+                .map(|index| Planned {
+                    title: format!("c{}", index + 1),
+                    units: vec![index],
+                })
+                .collect(),
+        }
+    }
+
+    /// Where each commit that comes of merging starts and ends in the plan.
+    fn merges(count: usize, passed: &[bool]) -> Vec<(usize, usize)> {
+        merge_failed(&numbered_plan(count), passed)
+            .into_iter()
+            .map(|merge| (merge.from.start, merge.from.end))
+            .collect()
+    }
+
+    #[test]
+    fn merges_each_failed_commit_into_the_next() {
+        // All pass: nothing changes.
+        assert_eq!(merges(3, &[true, true, true]), [(0, 1), (1, 2), (2, 3)]);
+        // All fail: one commit, because the last always ends a merge.
+        assert_eq!(merges(3, &[false, false, false]), [(0, 3)]);
+        // The first fails.
+        assert_eq!(merges(3, &[false, true, true]), [(0, 2), (2, 3)]);
+        // The one before last fails.
+        assert_eq!(merges(3, &[true, false, true]), [(0, 1), (1, 3)]);
+        // Every second one fails.
+        assert_eq!(merges(4, &[false, true, false, true]), [(0, 2), (2, 4)]);
+        // One commit, passed or not.
+        assert_eq!(merges(1, &[true]), [(0, 1)]);
+        assert_eq!(merges(1, &[false]), [(0, 1)]);
+        // No commits at all.
+        assert!(merges(0, &[]).is_empty());
+        // A commit it says nothing about counts as failed.
+        assert_eq!(merges(3, &[true]), [(0, 1), (1, 3)]);
+        assert_eq!(merges(2, &[true, true, true, true]), [(0, 1), (1, 2)]);
+    }
+
+    #[test]
+    fn says_which_commits_became_one_by_their_titles() {
+        let plan = numbered_plan(6);
+        let merged = merge_failed(&plan, &[false, true, true, false, false, true]);
+        assert_eq!(
+            merge_notes(&plan, &merged),
+            [
+                "\"c1\" and \"c2\" became one commit",
+                "\"c4\", \"c5\" and \"c6\" became one commit"
+            ]
+        );
+        assert!(merge_notes(&plan, &merge_failed(&plan, &[true; 6])).is_empty());
+    }
+
+    #[test]
+    fn keeps_every_unit_and_title_in_order_when_merging() {
+        let merged = merge_failed(&numbered_plan(4), &[false, false, true, true]);
+        let plan = merged_plan(&merged);
+        assert_eq!(plan.commits[0].units, [0, 1, 2]);
+        assert_eq!(plan.commits[0].title, "c1; c2; c3");
+        assert_eq!(plan.commits[1].units, [3]);
+        assert_eq!(plan.commits[1].title, "c4");
+    }
+
+    #[test]
+    fn tells_a_rename_with_a_mode_change_as_a_rename() {
+        let header = "diff --git a/tool.sh b/guide.md\nold mode 100644\nnew mode 100755\n\
+                      similarity index 100%\nrename from tool.sh\nrename to guide.md\n";
+        assert_eq!(status(header), Some("renamed"));
+        assert_eq!(
+            status("diff --git a/x b/x\nold mode 100644\n"),
+            Some("mode changed")
+        );
+        assert_eq!(status("diff --git a/x b/x\nindex 1..2\n"), None);
     }
 
     #[test]

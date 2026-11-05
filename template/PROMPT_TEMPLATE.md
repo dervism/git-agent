@@ -151,7 +151,8 @@ The script works these out itself:
 │   │   ├── ROADMAP.md
 │   │   └── backlog/
 │   │       ├── BACKLOG.md
-│   │       └── items/
+│   │       ├── items/
+│   │       └── finished/
 │   ├── iterations/                  private: git-ignored
 │   ├── architecture/
 │   │   ├── design/                  private: git-ignored

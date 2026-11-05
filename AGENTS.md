@@ -60,6 +60,12 @@ The modules for single commands:
 | Module | What it does |
 | --- | --- |
 | `split.rs` | `git agent split`: cuts a change into units (hunks or whole files) and settles the model's plan into commits. |
+| `split/flow.rs` | The steps of `git agent split`, from the changes to the commits. |
+| `split/dry_run.rs` | Builds the tree each planned commit will leave, in a temporary index, before any commit is made. |
+| `split/check.rs` | `split --check`: which trees to run the command on, in what order, and what each result means. |
+| `split/command.rs` | Runs the `--check` command once, and stops it at the time limit or on a signal. |
+| `split/signals.rs` | The signals that stop a check, and keeping them working after one. |
+| `split/kinds.rs` | Tells commits with only documentation or only tests by their files, for their order and type. |
 | `tidy.rs` | `git agent tidy`: plans which unpushed commits to reword or fold, and writes the rebase todo. |
 | `branch.rs` | `git agent branch`: names a branch after a description, a GitHub issue or the uncommitted changes. |
 | `why.rs` | `git agent why`: reads the target (a line, a range of lines or a function), and describes its blame and history for the model. |
@@ -73,6 +79,10 @@ The modules the commands share:
 | --- | --- |
 | `cli.rs` | The command-line arguments, with clap. |
 | `git.rs` | The wrapper around the `git` command line (`Repo`). |
+| `git/names.rs` | How git writes file names, and the readable form git-agent shows them in. |
+| `git/lossless.rs` | Text that holds any bytes, so a patch of a file that isn't UTF-8 reaches `git apply` unchanged. |
+| `git/worktree.rs` | `TempWorktree`: a temporary checkout that leaves the user's work tree, index and branches alone. |
+| `temp.rs` | `PrivateDir`: a temporary folder only the owner can enter. |
 | `github.rs` | Pull requests and issues through the GitHub CLI, `gh`. |
 | `prompt.rs` | Builds the conversation sent to the model for every command, and cleans up its replies. |
 | `server/` | Model servers: the `ModelServer` interface (`mod.rs`), `openai.rs`, `anthropic.rs` and `http.rs`. |
@@ -103,8 +113,7 @@ export TMPDIR="$PWD/tmp" GIT_CEILING_DIRECTORIES="$PWD/tmp"   # from the reposit
 ```
 
 The tests create their repositories in `TMPDIR` (through the `tempfile` crate), and
-git-agent itself puts some files there (`std::env::temp_dir()` in `src/menu.rs` and
-`src/git.rs`). Because `tmp/` is inside this repository, `GIT_CEILING_DIRECTORIES` stops git
+git-agent itself puts some files there (`std::env::temp_dir()` in `src/temp.rs`). Because `tmp/` is inside this repository, `GIT_CEILING_DIRECTORIES` stops git
 in a test directory from walking up into this repository.
 
 ## Testing and checks
@@ -440,10 +449,11 @@ item is one unit of work, with an optional list of subtasks, and is marked OPEN,
 IN_PROGRESS, DONE, BLOCKED or PARKED. The roadmap's items use the same statuses.
 
 Each item is a Markdown document in `docs/planning/backlog/items/`, named
-`{NNNN}-{title}.md`, where NNNN is an incremental identifier that never changes.
-`BACKLOG.md` is only the index and overview. When we tidy up and groom the backlog, or
-reprioritize items, you update the Priority field in each item's metadata table (section
-2.2.1).
+`{NNNN}-{title}.md`, where NNNN is an incremental identifier that never changes. When an
+item is DONE, move it to `docs/planning/backlog/finished/`, and update the links to it.
+`BACKLOG.md` is only the index and overview, and it lists finished items too. When we tidy
+up and groom the backlog, or reprioritize items, you update the Priority field in each
+item's metadata table (section 2.2.1).
 
 An item can belong to one group, a named batch of work, through the Group field in its
 metadata. Group names are lower-case words joined by hyphens, such as `search-rewrite`. An

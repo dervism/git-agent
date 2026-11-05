@@ -331,10 +331,11 @@ item is one unit of work, with an optional list of subtasks, and is marked OPEN,
 IN_PROGRESS, DONE, BLOCKED or PARKED. The roadmap's items use the same statuses.
 
 Each item is a Markdown document in `docs/planning/backlog/items/`, named
-`{NNNN}-{title}.md`, where NNNN is an incremental identifier that never changes.
-`BACKLOG.md` is only the index and overview. When we tidy up and groom the backlog, or
-reprioritize items, you update the Priority field in each item's metadata table (section
-2.2.1).
+`{NNNN}-{title}.md`, where NNNN is an incremental identifier that never changes. When an
+item is DONE, move it to `docs/planning/backlog/finished/`, and update the links to it.
+`BACKLOG.md` is only the index and overview, and it lists finished items too. When we tidy
+up and groom the backlog, or reprioritize items, you update the Priority field in each
+item's metadata table (section 2.2.1).
 
 An item can belong to one group, a named batch of work, through the Group field in its
 metadata. Group names are lower-case words joined by hyphens, such as `search-rewrite`. An

@@ -13,6 +13,7 @@ mod redact;
 mod secrets;
 mod server;
 mod split;
+mod temp;
 mod tidy;
 mod ui;
 mod untracked;
@@ -22,7 +23,7 @@ use anyhow::{Context, Result, bail};
 use clap::Parser;
 use cli::{
     BranchArgs, Cli, Command, ConfigCommand, ExplainArgs, GenerateArgs, PrArgs, SettingArgs,
-    SplitArgs, TidyArgs, WhyArgs,
+    TidyArgs, WhyArgs,
 };
 use config::{Config, OnSecrets};
 use fit::Kept;
@@ -32,7 +33,7 @@ use models::{ContextSource, Model, Pick};
 use prompt::{Fit, Work};
 use redact::{Change, Finding};
 use server::{Message, ModelServer, Server};
-use split::{FilePatch, Plan, Unit};
+use split::signals::Stopped;
 use std::fs;
 use std::io::{self, IsTerminal};
 use std::path::{Path, PathBuf};
@@ -81,53 +82,6 @@ const PULL_REQUEST_REVIEW: Review<bool> = Review {
         },
     ],
     quit: "quit without creating it",
-};
-
-/// Accepting the plan of a split: the value says whether to review each message.
-const PLAN_REVIEW: Review<bool> = Review {
-    heading: "Proposed commits",
-    first_line: "first line",
-    noun: "plan",
-    what: "plan",
-    edit: "edit the plan in your editor",
-    accept: &[
-        Choice {
-            word: "all commits",
-            help: "make all the commits, without stopping to review their messages",
-            value: false,
-        },
-        Choice {
-            word: "commit",
-            help: "make the commits one at a time, reviewing each message",
-            value: true,
-        },
-    ],
-    quit: "quit without committing anything",
-};
-
-/// A plan that leaves out at least this many parts is asked for once more.
-const ASK_AGAIN_MISSING: usize = 3;
-
-/// Accepting one commit of a split: the value says whether to make it.
-const SPLIT_COMMIT_REVIEW: Review<bool> = Review {
-    heading: "Proposed commit message",
-    first_line: "subject line",
-    noun: "message",
-    what: "commit message",
-    edit: "edit the message in your editor",
-    accept: &[
-        Choice {
-            word: "commit",
-            help: "commit these changes with this message",
-            value: true,
-        },
-        Choice {
-            word: "skip",
-            help: "leave these changes uncommitted and go on to the next commit",
-            value: false,
-        },
-    ],
-    quit: "stop here; the commits made so far stay, and the rest stays uncommitted",
 };
 
 /// Accepting the plan of a tidy-up.
@@ -190,7 +144,7 @@ async fn main() -> ExitCode {
     let cli = Cli::parse();
     let result = match cli.command {
         None => generate(&cli.generate, &cli.settings).await,
-        Some(Command::Split(args)) => split_changes(&args, &cli.settings).await,
+        Some(Command::Split(args)) => split::flow::run(&args, &cli.settings).await,
         Some(Command::Pr(args)) => pull_request(&args, &cli.settings).await,
         Some(Command::Branch(args)) => new_branch(&args, &cli.settings).await,
         Some(Command::Tidy(args)) => tidy_commits(&args, &cli.settings).await,
@@ -209,7 +163,8 @@ async fn main() -> ExitCode {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
             ui::error(&err);
-            ExitCode::FAILURE
+            err.downcast_ref::<Stopped>()
+                .map_or(ExitCode::FAILURE, |Stopped(code)| ExitCode::from(*code))
         }
     }
 }
@@ -325,351 +280,6 @@ async fn generate(args: &GenerateArgs, settings: &SettingArgs) -> Result<()> {
         push(&repo, true).context(NOT_PUSHED)?;
     }
     Ok(())
-}
-
-async fn split_changes(args: &SplitArgs, settings: &SettingArgs) -> Result<()> {
-    const NOT_PUSHED: &str = "the commits were made, but not pushed";
-
-    let config = Config::load(settings)?.config;
-    let repo = Repo::open(".")?;
-    if let Some(operation) = repo.operation_in_progress()? {
-        bail!("{operation} is in progress; finish or abort it before splitting changes");
-    }
-    let ask = !args.commit && io::stdin().is_terminal();
-    if args.all && !stage_all(&repo, ask)? {
-        ui::info("Nothing staged or committed.");
-        return Ok(());
-    }
-    let Some((scope, changes)) = repo.changes(&config.exclude)? else {
-        ui::info("✨ No changes to split.");
-        return Ok(());
-    };
-    let redacted = redact::diff(&changes.diff);
-    if config.on_secrets == OnSecrets::Reject {
-        reject_added(
-            &redacted.findings,
-            "the changes add what look like secrets, so git-agent didn't split them",
-            "Take them out of the changes.",
-        )?;
-    }
-    report_secrets(
-        &redacted.findings,
-        "If they are real, take them out of the files before you commit.",
-    );
-
-    let files = split::parse(
-        &repo.patch(scope)?,
-        &repo.included_paths(scope, &config.exclude)?,
-    );
-    let (server, model) = connect(&config).await?;
-    let room = prompt::room(
-        prompt::SPLIT_PROMPT,
-        model.context_length,
-        config.max_output_tokens,
-    );
-    let described = split::describe(&files, room)?;
-    if described.units.len() < 2 {
-        ui::info(
-            "✨ The changes are a single hunk, so there is nothing to split; commit them with \
-             `git agent`.",
-        );
-        return Ok(());
-    }
-    let summary = changes.stat.lines().last().unwrap_or_default().trim();
-    match scope {
-        Scope::Staged => ui::info(format!("🔍 Staged changes: {summary}")),
-        Scope::Tracked => ui::info(format!(
-            "🔍 Nothing staged; splitting all changes to tracked files: {summary}"
-        )),
-    }
-    if described.by_file {
-        ui::info(ui::dim(
-            "   There are too many changes to show the model one by one, so it groups whole files.",
-        ));
-    }
-    let text = redact::text(&described.text, "changes").text;
-    let conversation = prompt::split_messages(&text, args.hint.as_deref());
-    report_model(&model, conversation_tokens(&conversation));
-
-    let splitter = Splitter {
-        repo: &repo,
-        scope,
-        config: &config,
-        args,
-        files: &files,
-        units: &described.units,
-        server: &server,
-        model: &model,
-    };
-    let mut plan = splitter.ask_for_plan(&conversation).await?;
-    let mut review_messages = !args.commit;
-    if args.commit {
-        ui::show_framed(PLAN_REVIEW.heading, &splitter.show(&plan));
-    } else if !io::stdin().is_terminal() {
-        ui::show_framed(PLAN_REVIEW.heading, &splitter.show(&plan));
-        ui::info(ui::dim(
-            "Input is not a terminal, so not asking for review. \
-             Use --commit to make these commits directly.",
-        ));
-        return Ok(());
-    } else {
-        match splitter.review_plan(plan, &conversation).await? {
-            Some((reviewed, review)) => {
-                plan = reviewed;
-                review_messages = review;
-            }
-            None => {
-                ui::info("Nothing committed.");
-                return Ok(());
-            }
-        }
-    }
-
-    let outcome = splitter
-        .make_commits(&plan, review_messages)
-        .await
-        .context(
-            "the split stopped; the commits made so far stay, and the rest of the changes are as \
-         they were",
-        )?;
-    if outcome.made > 0 {
-        ui::info(ui::green(&format!("\n✅ Made {} commit(s):", outcome.made)));
-        for line in repo.recent_commits(outcome.made)?.iter().rev() {
-            ui::info(format!("   {line}"));
-        }
-    }
-    let left = match scope {
-        Scope::Staged => repo.has_staged_changes()?,
-        Scope::Tracked => repo.has_uncommitted_changes()?,
-    };
-    if left {
-        let place = match scope {
-            Scope::Staged => "staged",
-            Scope::Tracked => "uncommitted",
-        };
-        if outcome.skipped > 0 || outcome.stopped {
-            ui::info(format!("The changes you didn't commit are still {place}."));
-        } else {
-            ui::warn(format!(
-                "the commits don't hold all of the changes; the rest are still {place} \
-                 (see `git status`)"
-            ));
-        }
-    }
-    if args.push && outcome.made > 0 {
-        check_outgoing(&repo, &config).context(NOT_PUSHED)?;
-        push(&repo, !args.commit).context(NOT_PUSHED)?;
-    }
-    Ok(())
-}
-
-/// What making the commits of a split needs.
-struct Splitter<'a> {
-    repo: &'a Repo,
-    scope: Scope,
-    config: &'a Config,
-    args: &'a SplitArgs,
-    files: &'a [FilePatch],
-    units: &'a [Unit],
-    server: &'a Server,
-    model: &'a Model,
-}
-
-/// How a split ended.
-#[derive(Default)]
-struct Outcome {
-    made: usize,
-    skipped: usize,
-    /// Whether the user stopped before the last commit.
-    stopped: bool,
-}
-
-impl Splitter<'_> {
-    fn show(&self, plan: &Plan) -> String {
-        split::show(plan, self.files, self.units)
-    }
-
-    /// Asks the model for a plan, reminding it once of the form if its first
-    /// reply can't be read, and once more of the parts if it leaves out several.
-    async fn ask_for_plan(&self, conversation: &[Message]) -> Result<Plan> {
-        let mut reply = generate_message(self.server, self.model, conversation).await?;
-        let mut settled = match split::parse_plan(&reply, self.files, self.units) {
-            Ok(settled) => settled,
-            Err(err) => {
-                let retry = prompt::retry_plan(
-                    conversation,
-                    &reply,
-                    &format!("{err:#}"),
-                    "with every unit in exactly one commit",
-                );
-                reply = generate_message(self.server, self.model, &retry).await?;
-                split::parse_plan(&reply, self.files, self.units)
-                    .context("the model didn't reply with a plan git-agent could read")?
-            }
-        };
-        if settled.missing.len() >= ASK_AGAIN_MISSING {
-            ui::info(ui::dim(&format!(
-                "   The plan left out {} of {} parts; asking the model to place them.",
-                settled.missing.len(),
-                self.units.len()
-            )));
-            let again =
-                prompt::complete_plan(conversation, &reply, &settled.missing, &settled.repeated);
-            let completed = generate_message(self.server, self.model, &again)
-                .await
-                .and_then(|reply| split::parse_plan(&reply, self.files, self.units));
-            // Keep whichever plan leaves out fewer parts.
-            match completed {
-                Ok(completed) if completed.missing.len() < settled.missing.len() => {
-                    settled = completed
-                }
-                Ok(_) => {}
-                Err(err) => ui::warn(format!("{err:#}; keeping the first plan")),
-            }
-        }
-        for note in settled.notes {
-            ui::warn(note);
-        }
-        Ok(settled.plan)
-    }
-
-    /// Lets the user review the plan until they accept or quit it. Returns
-    /// the accepted plan and whether to review each message, or `None` on quit.
-    async fn review_plan(
-        &self,
-        mut plan: Plan,
-        conversation: &[Message],
-    ) -> Result<Option<(Plan, bool)>> {
-        loop {
-            ui::show_framed(PLAN_REVIEW.heading, &self.show(&plan));
-            let revised = match ui::ask_action(&PLAN_REVIEW)? {
-                Action::Accept(review) => return Ok(Some((plan, review))),
-                Action::Quit => return Ok(None),
-                Action::Edit => self.edit_plan(&plan),
-                Action::Regenerate => self.ask_for_plan(conversation).await.map(Some),
-                Action::Refine(feedback) => {
-                    let refined = prompt::refine_plan(conversation, &plan.to_json(), &feedback);
-                    self.ask_for_plan(&refined).await.map(Some)
-                }
-            };
-            // A failed edit or generation keeps the current plan so the review can go on.
-            match revised {
-                Ok(Some(revised)) => plan = revised,
-                Ok(None) => ui::warn("the edited plan has no commits; keeping the previous one"),
-                Err(err) => ui::error(&err),
-            }
-        }
-    }
-
-    fn edit_plan(&self, plan: &Plan) -> Result<Option<Plan>> {
-        let text = ui::edit_plan(
-            self.repo,
-            "GIT_AGENT_SPLIT_PLAN",
-            &split::to_text(plan, self.files, self.units),
-        )?;
-        let (edited, notes) = split::from_text(&text, self.files, self.units);
-        for note in notes {
-            ui::warn(note);
-        }
-        Ok((!edited.commits.is_empty()).then_some(edited))
-    }
-
-    /// Makes the planned commits one by one, each built in a temporary index
-    /// from HEAD and its own changes, so the real index is left alone. With
-    /// `review_messages`, the user reviews each commit's message.
-    async fn make_commits(&self, plan: &Plan, review_messages: bool) -> Result<Outcome> {
-        let path = self.repo.git_path("GIT_AGENT_SPLIT_INDEX")?;
-        let index = self.repo.with_index(path.clone());
-        let outcome = self.commit_each(plan, &index, review_messages).await;
-        let _ = fs::remove_file(&path);
-        // Nothing was staged before the split, so the real index stays at HEAD.
-        if self.scope == Scope::Tracked {
-            self.repo.reset_index()?;
-        }
-        outcome
-    }
-
-    async fn commit_each(
-        &self,
-        plan: &Plan,
-        index: &Repo,
-        review_messages: bool,
-    ) -> Result<Outcome> {
-        let mut committed = split::Committed::default();
-        let mut outcome = Outcome::default();
-        let total = plan.commits.len();
-        for (number, planned) in (1..).zip(&plan.commits) {
-            ui::info(format!(
-                "\n📦 Commit {number} of {total}: {}",
-                planned.title
-            ));
-            let files = split::files_of(planned, self.files, self.units);
-            ui::info(ui::dim(&format!("   {}", files.join(", "))));
-            let patch = split::patch(self.files, self.units, &planned.units, &committed);
-            index.read_tree("HEAD")?;
-            index
-                .apply_to_index(&patch.text)
-                .with_context(|| format!("could not stage commit {number} of {total}"))?;
-            let Some((_, mut changes)) = index.changes(&self.config.exclude)? else {
-                ui::warn("these changes are already committed; skipping them");
-                continue;
-            };
-            changes.diff = redact::diff(&changes.diff).text;
-            let mut hint = format!(
-                "This commit is one of several that split a larger change. It should: {}",
-                planned.title
-            );
-            if let Some(extra) = &self.args.hint {
-                hint = format!("{hint}\n{extra}");
-            }
-            let (conversation, fit) = prompt::initial_messages(
-                &self.config.system_prompt,
-                &changes,
-                Some(&hint),
-                self.model.context_length,
-                self.config.max_output_tokens,
-            );
-            if !fit.is_complete() {
-                report_fit(self.model, &fit, "message", None);
-            }
-            let message = commit_message(self.server, self.model, &conversation).await?;
-            ui::show_proposal(&SPLIT_COMMIT_REVIEW, &message);
-            let (make, message) = if !review_messages {
-                (true, message)
-            } else {
-                let edit = |message: &str| ui::edit_message(self.repo, message);
-                let reviewed = review(
-                    &SPLIT_COMMIT_REVIEW,
-                    message,
-                    self.server,
-                    self.model,
-                    &conversation,
-                    edit,
-                    separated,
-                )
-                .await?;
-                match reviewed {
-                    Some(reviewed) => reviewed,
-                    None => {
-                        outcome.stopped = true;
-                        break;
-                    }
-                }
-            };
-            if !make {
-                ui::info("Skipped; these changes stay uncommitted.");
-                outcome.skipped += 1;
-                continue;
-            }
-            commit(index, &message, Scope::Staged, &self.args.git_args)?;
-            committed.record(&patch);
-            outcome.made += 1;
-            if self.scope == Scope::Tracked {
-                self.repo.reset_index()?;
-            }
-        }
-        Ok(outcome)
-    }
 }
 
 async fn pull_request(args: &PrArgs, settings: &SettingArgs) -> Result<()> {
@@ -1572,17 +1182,24 @@ fn stage_all(repo: &Repo, ask: bool) -> Result<bool> {
         return Ok(true);
     }
     match ui::ask_untracked()? {
-        ui::UntrackedChoice::Ignore => {
-            let added = untracked::add_to_gitignore(&top, &findings)?;
-            if !added.is_empty() {
-                ui::info(format!("📝 Added to .gitignore: {}", added.join(", ")));
-            }
-            repo.stage_all()?;
-        }
+        ui::UntrackedChoice::Ignore => ignore_and_stage_the_rest(repo, &top, &findings)?,
         ui::UntrackedChoice::Commit => repo.stage_all()?,
         ui::UntrackedChoice::Quit => return Ok(false),
     }
     Ok(true)
+}
+
+/// Adds `findings` to `.gitignore`, and stages everything else.
+fn ignore_and_stage_the_rest(
+    repo: &Repo,
+    top: &Path,
+    findings: &[untracked::Finding],
+) -> Result<()> {
+    let added = untracked::add_to_gitignore(top, findings)?;
+    if !added.is_empty() {
+        ui::info(format!("📝 Added to .gitignore: {}", added.join(", ")));
+    }
+    repo.stage_all_except(&untracked::exclude_what_gitignore_cant_hold(findings))
 }
 
 /// Connects to the configured server and picks the model to use.
@@ -2045,4 +1662,30 @@ fn show_config(settings: &SettingArgs) -> Result<()> {
     }
     print!("\n{}", toml::to_string_pretty(&loaded.config)?);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::git::test_support::{isolated_repo, run};
+
+    #[test]
+    fn keeps_a_file_that_gitignore_cant_name_out_of_what_it_stages() {
+        let (dir, repo) = isolated_repo();
+        fs::write(dir.path().join("x\ny.pem"), "key\n").unwrap();
+        fs::write(dir.path().join("plain.pem"), "key\n").unwrap();
+        fs::write(dir.path().join("other.txt"), "text\n").unwrap();
+        let untracked = repo.untracked_files().unwrap();
+        let findings = untracked::check(dir.path(), &untracked);
+        assert_eq!(findings.len(), 2, "{findings:?}");
+
+        ignore_and_stage_the_rest(&repo, dir.path(), &findings).unwrap();
+        let staged = run(dir.path(), &["diff", "--cached", "--name-only", "-z"]);
+        let staged: Vec<&str> = staged.split('\0').filter(|name| !name.is_empty()).collect();
+        assert_eq!(staged, [".gitignore", "other.txt"]);
+        assert_eq!(
+            fs::read_to_string(dir.path().join(".gitignore")).unwrap(),
+            "/plain.pem\n"
+        );
+    }
 }

@@ -7,6 +7,7 @@
 //! changes. Cutting the diff as a whole would drop every file after the first
 //! few large ones.
 
+use crate::git::names;
 use std::fmt::Write;
 
 /// Least room worth giving a file: its header and a few changed lines.
@@ -53,7 +54,7 @@ pub struct Fitted {
 /// and files with no room left are named at the end.
 pub fn fit(diff: &str, limit: usize) -> Fitted {
     let sections = split_files(diff);
-    let paths: Vec<String> = sections.iter().map(|file| path(file)).collect();
+    let paths: Vec<String> = sections.iter().map(|file| names::of_diff(file)).collect();
     let mut files: Vec<String> = sections.iter().map(|file| compact_header(file)).collect();
     let size = |files: &[String]| files.iter().map(String::len).sum::<usize>();
 
@@ -149,17 +150,6 @@ pub fn split_files(diff: &str) -> Vec<&str> {
         .map(|(&start, end)| &diff[start..end])
         .filter(|file| !file.is_empty())
         .collect()
-}
-
-/// The file's path from its "diff --git a/<path> b/<path>" header.
-pub fn path(file: &str) -> String {
-    let header = file.lines().next().unwrap_or_default();
-    let names = header.strip_prefix("diff --git ").unwrap_or(header);
-    let path = names
-        .rsplit_once(" b/")
-        .or_else(|| names.rsplit_once(" \"b/"))
-        .map_or(names, |(_, path)| path.trim_end_matches('"'));
-    path.to_owned()
 }
 
 /// Drops header lines the model doesn't need: the blob hashes on the `index`

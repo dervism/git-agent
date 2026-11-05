@@ -148,6 +148,21 @@ pub struct SplitArgs {
     #[arg(short = 'H', long, value_name = "TEXT")]
     pub hint: Option<String>,
 
+    /// Run this command on each planned commit in a clean checkout, and merge
+    /// a commit that fails it into the next one, e.g. `cargo check`
+    #[arg(long, value_name = "COMMAND", value_parser = clap::builder::NonEmptyStringValueParser::new())]
+    pub check: Option<String>,
+
+    /// How long one run of the --check command may take
+    #[arg(
+        long,
+        value_name = "SECONDS",
+        default_value_t = 600,
+        requires = "check",
+        value_parser = clap::value_parser!(u64).range(1..),
+    )]
+    pub check_timeout: u64,
+
     /// Extra arguments for each `git commit`, e.g. `-- --signoff`
     #[arg(last = true, value_name = "GIT_COMMIT_ARGS")]
     pub git_args: Vec<String>,

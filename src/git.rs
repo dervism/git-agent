@@ -1,11 +1,16 @@
 //! Wrapper around the `git` command line.
 
+pub mod lossless;
+pub mod names;
+pub mod worktree;
+
 use anyhow::{Context, Result, anyhow, bail};
 use std::collections::HashSet;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use worktree::TempWorktree;
 
 /// Which changes the message describes, and therefore what gets committed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -98,6 +103,15 @@ const FUNCTION_DRIVERS: &str = "\
 *.tex diff=tex
 ";
 
+/// For what people and models read: file names as they are, whatever the
+/// user's setting is. It's passed per command, because `-c` values also reach
+/// `git commit` hooks.
+const READABLE_NAMES: [&str; 2] = ["-c", "core.quotePath=false"];
+
+/// For a patch that goes back to `git apply` after being read as text: a name
+/// that isn't valid UTF-8 only survives that in git's ASCII quoting.
+const QUOTED_NAMES: [&str; 2] = ["-c", "core.quotePath=true"];
+
 pub struct Repo {
     /// Directory git commands run in.
     workdir: PathBuf,
@@ -105,6 +119,8 @@ pub struct Repo {
     index: Option<PathBuf>,
     /// An attributes file to use instead of the user's own.
     attributes: Option<PathBuf>,
+    /// Whether git commands run without the user's hooks.
+    hooks_off: bool,
 }
 
 impl Repo {
@@ -113,12 +129,23 @@ impl Repo {
             workdir: workdir.into(),
             index: None,
             attributes: None,
+            hooks_off: false,
         };
         let inside = repo.git(&["rev-parse", "--is-inside-work-tree"]);
         if !inside.is_ok_and(|out| out.trim() == "true") {
             bail!("not inside a git work tree");
         }
         Ok(repo)
+    }
+
+    /// The repository around `dir`, with git commands running at the top of its
+    /// work tree. Commands that use another index need this, because git reads
+    /// a relative index path from the top, and `git apply --cached` skips
+    /// paths outside the folder it runs in.
+    pub fn open_at_top(dir: impl Into<PathBuf>) -> Result<Self> {
+        let repo = Self::open(dir)?;
+        let workdir = repo.toplevel()?;
+        Ok(Self { workdir, ..repo })
     }
 
     /// The same repository with the index file at `index`, so commits can be
@@ -128,6 +155,16 @@ impl Repo {
             workdir: self.workdir.clone(),
             index: Some(index),
             attributes: self.attributes.clone(),
+            hooks_off: self.hooks_off,
+        }
+    }
+
+    /// The same repository for work the user shouldn't hear about from their
+    /// hooks, such as on a temporary index.
+    pub fn without_hooks(self) -> Repo {
+        Repo {
+            hooks_off: true,
+            ..self
         }
     }
 
@@ -138,6 +175,7 @@ impl Repo {
             workdir: self.workdir.clone(),
             index: self.index.clone(),
             attributes: Some(attributes),
+            hooks_off: self.hooks_off,
         }
     }
 
@@ -169,6 +207,9 @@ impl Repo {
     fn command(&self, args: &[&str]) -> Command {
         let mut command = Command::new("git");
         command.current_dir(&self.workdir);
+        if self.hooks_off {
+            command.args(["-c", NO_HOOKS]);
+        }
         if let Some(attributes) = &self.attributes {
             command
                 .arg("-c")
@@ -183,6 +224,12 @@ impl Repo {
 
     /// Runs git and returns its stdout, failing with its stderr.
     fn git(&self, args: &[&str]) -> Result<String> {
+        let output = self.git_bytes(args)?;
+        Ok(String::from_utf8_lossy(&output).into_owned())
+    }
+
+    /// Runs git and returns its stdout as it is, failing with its stderr.
+    fn git_bytes(&self, args: &[&str]) -> Result<Vec<u8>> {
         let output = self
             .command(args)
             .output()
@@ -194,12 +241,17 @@ impl Repo {
                 String::from_utf8_lossy(&output.stderr).trim()
             );
         }
-        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+        Ok(output.stdout)
+    }
+
+    /// Runs git like [`Repo::git`], for output that names files to people or models.
+    fn git_readable(&self, args: &[&str]) -> Result<String> {
+        self.git(&[&READABLE_NAMES[..], args].concat())
     }
 
     fn has_diff(&self, args: &[&str]) -> Result<bool> {
         let output = self
-            .command(&["diff", "--quiet"])
+            .command(&["diff", "--quiet", "--no-ext-diff"])
             .args(args)
             .output()
             .context("failed to run git; is it installed?")?;
@@ -267,9 +319,11 @@ impl Repo {
 
     /// The changes in `scope` as a patch that `git apply` can replay: with
     /// binary files, and with fixed prefixes and context, whatever the user's
-    /// diff settings are.
+    /// diff settings are. Bytes that aren't valid UTF-8 stay in it, in the form
+    /// [`lossless`] describes, which [`Repo::apply_to_index`] takes.
     pub fn patch(&self, scope: Scope) -> Result<String> {
-        let mut args = vec![
+        let mut args = QUOTED_NAMES.to_vec();
+        args.extend([
             "diff",
             "--no-color",
             "--no-ext-diff",
@@ -277,17 +331,19 @@ impl Repo {
             "--binary",
             "--unified=3",
             "--find-renames",
+            "--submodule=short",
             "--src-prefix=a/",
             "--dst-prefix=b/",
-        ];
+        ]);
         if scope == Scope::Staged {
             args.push("--cached");
         }
-        self.git(&args)
+        let patch = lossless::to_text(&self.git_bytes(&args)?);
+        Ok(without_dirty_submodules(&patch))
     }
 
-    /// The paths in `scope` whose diffs aren't left out by `exclude`. A
-    /// renamed file is named by its new path.
+    /// The paths in `scope` whose diffs aren't left out by `exclude`, in the
+    /// form [`names::of_diff`] gives. A renamed file is named by its new path.
     pub fn included_paths(&self, scope: Scope, exclude: &[String]) -> Result<HashSet<String>> {
         let excludes = exclude_pathspecs(exclude);
         let mut args = vec!["diff", "--name-only", "--find-renames", "-z"];
@@ -300,8 +356,31 @@ impl Repo {
         Ok(names
             .split('\0')
             .filter(|name| !name.is_empty())
-            .map(str::to_owned)
+            .map(names::printable)
             .collect())
+    }
+
+    /// Writes the index as a tree and returns its hash.
+    pub fn write_tree(&self) -> Result<String> {
+        Ok(self.git(&["write-tree"])?.trim().to_owned())
+    }
+
+    /// Whether the changes in `scope` differ from what they'd be if `tree` were
+    /// committed: the index for staged changes, and the work tree for tracked
+    /// ones. It goes by the same settings as the changes themselves, so a file
+    /// marked to be left out counts as it does there.
+    pub fn differs_from_tree(&self, scope: Scope, tree: &str) -> Result<bool> {
+        match scope {
+            Scope::Staged => self.has_diff(&["--cached", tree]),
+            // The work tree can't show which commit a submodule should be at: only
+            // the index says that, and a moved one isn't in the index yet.
+            Scope::Tracked => self.has_diff(&["--ignore-submodules=all", tree]),
+        }
+    }
+
+    /// Whether the index holds conflicts that aren't resolved yet.
+    pub fn has_unmerged_paths(&self) -> Result<bool> {
+        Ok(!self.git(&["ls-files", "--unmerged"])?.trim().is_empty())
     }
 
     /// Replaces the index with the tree of `tree_ish`, e.g. `HEAD`.
@@ -323,7 +402,7 @@ impl Repo {
             .stdin
             .take()
             .context("git apply has no input")?
-            .write_all(patch.as_bytes());
+            .write_all(&lossless::to_bytes(patch));
         let output = child
             .wait_with_output()
             .context("failed to wait for git apply")?;
@@ -377,13 +456,13 @@ impl Repo {
     /// diffs of files matching `exclude`.
     fn diff(&self, range: &[&str], exclude: &[String]) -> Result<Changes> {
         let base = ["diff", "--no-color", "--no-ext-diff"];
-        let stat = self.git(&[&base[..], range, &["--stat=120"]].concat())?;
+        let stat = self.git_readable(&[&base[..], range, &["--stat=120"]].concat())?;
 
         let excludes = exclude_pathspecs(exclude);
         // A deleted file's old content says little about the change; its name is enough.
         let mut diff_args = [&base[..], range, &["--irreversible-delete", "--", ":/"]].concat();
         diff_args.extend(excludes.iter().map(String::as_str));
-        let diff = self.git(&diff_args)?;
+        let diff = self.git_readable(&diff_args)?;
 
         Ok(Changes { stat, diff })
     }
@@ -403,7 +482,7 @@ impl Repo {
         args.extend_from_slice(range);
         args.extend(["--", ":/"]);
         args.extend(excludes.iter().map(String::as_str));
-        let log = self.git(&args)?;
+        let log = self.git_readable(&args)?;
         let commits = log.split('\x1e').filter_map(|record| {
             let mut parts = record.splitn(3, '\x1f');
             let hash = parts.next()?.trim();
@@ -621,24 +700,11 @@ impl Repo {
     /// returns the new tip. The rebase runs in a temporary worktree without
     /// hooks, so this repository's work tree, index and branches are left alone.
     pub fn rewrite(&self, head: &str, base: Option<&str>, todo: &str) -> Result<String> {
-        let unique = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |elapsed| elapsed.as_nanos());
-        let dir =
-            std::env::temp_dir().join(format!("git-agent-rewrite-{}-{unique}", std::process::id()));
-        let dir_text = dir.to_string_lossy().into_owned();
         let todo_path = std::path::absolute(self.git_path("GIT_AGENT_TODO")?)?;
         fs::write(&todo_path, todo)
             .with_context(|| format!("failed to write {}", todo_path.display()))?;
-        let added = self.git(&[
-            "-c", NO_HOOKS, "worktree", "add", "--detach", "--quiet", &dir_text, head,
-        ]);
-        let result = added.and_then(|_| rebase(&dir, base, &todo_path));
-        let _ = self.git(&["worktree", "remove", "--force", &dir_text]);
-        if dir.exists() {
-            let _ = fs::remove_dir_all(&dir);
-            let _ = self.git(&["worktree", "prune"]);
-        }
+        let result = TempWorktree::add(self, head)
+            .and_then(|worktree| rebase(worktree.path(), base, &todo_path));
         let _ = fs::remove_file(&todo_path);
         result
     }
@@ -726,7 +792,7 @@ impl Repo {
     /// `120,140` or `:name`) of `path` as it is in the work tree. Whitespace
     /// changes and moved or copied lines don't count as changes.
     pub fn blame(&self, path: &str, range: &str) -> Result<String> {
-        self.git(&[
+        self.git_readable(&[
             "blame",
             "--porcelain",
             "-w",
@@ -741,7 +807,7 @@ impl Repo {
 
     /// The lines of `path` that differ from HEAD, as `git diff --unified=0` hunks.
     pub fn uncommitted_hunks(&self, path: &str) -> Result<String> {
-        self.git(&[
+        self.git_readable(&[
             "diff",
             "--no-color",
             "--no-ext-diff",
@@ -755,7 +821,7 @@ impl Repo {
     /// The newest `limit` commits that changed the lines `range` of `path` at
     /// HEAD (`git log -L`), each followed by its diff of those lines.
     pub fn line_history(&self, path: &str, range: &str, limit: usize) -> Result<String> {
-        self.git(&[
+        self.git_readable(&[
             "log",
             "--no-color",
             "--no-ext-diff",
@@ -1037,6 +1103,28 @@ pub fn edit_file(path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// `patch` without what a commit can't hold: that a submodule has uncommitted work
+/// of its own, which git writes as `-dirty` after its commit. The patch stays as
+/// git wrote it otherwise, which respects the user's settings for submodules.
+fn without_dirty_submodules(patch: &str) -> String {
+    crate::fit::split_files(patch)
+        .into_iter()
+        .filter_map(without_dirty_submodule)
+        .collect()
+}
+
+/// The part of a patch about one file, without `-dirty` if it's a submodule, or
+/// `None` if that's all that changed.
+fn without_dirty_submodule(file: &str) -> Option<String> {
+    let line_after = |start: &str| file.lines().find_map(|line| line.strip_prefix(start));
+    let is_submodule = line_after("index ").is_none_or(|index| index.ends_with(" 160000"));
+    let new = line_after("+Subproject commit ").filter(|_| is_submodule);
+    let Some((new, commit)) = new.and_then(|new| Some((new, new.strip_suffix("-dirty")?))) else {
+        return Some(file.to_owned());
+    };
+    (line_after("-Subproject commit ") != Some(commit)).then(|| file.replace(new, commit))
+}
+
 /// Pathspecs that leave `patterns` out of a diff, matched from the repository root.
 fn exclude_pathspecs(patterns: &[String]) -> Vec<String> {
     patterns
@@ -1049,6 +1137,88 @@ fn exclude_pathspecs(patterns: &[String]) -> Vec<String> {
             }
         })
         .collect()
+}
+
+/// What the tests of this module and its submodules share.
+#[cfg(test)]
+pub mod test_support {
+    use super::*;
+    use tempfile::TempDir;
+
+    /// Runs git in `dir`, panicking on failure, and returns its stdout.
+    pub fn run(dir: &Path, args: &[&str]) -> String {
+        let output = Command::new("git")
+            .current_dir(dir)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).into_owned()
+    }
+
+    /// A text of `count` numbered lines.
+    pub fn numbered_lines(count: usize) -> String {
+        (1..=count).map(|n| format!("line {n}\n")).collect()
+    }
+
+    /// A repository with lib.rs committed, without the user's global settings
+    /// for signing and hooks.
+    pub fn isolated_repo() -> (TempDir, Repo) {
+        let dir = TempDir::new().unwrap();
+        run(dir.path(), &["init", "-q", "--initial-branch", "main"]);
+        run(dir.path(), &["config", "user.name", "Test"]);
+        run(dir.path(), &["config", "user.email", "test@example.com"]);
+        run(dir.path(), &["config", "commit.gpgsign", "false"]);
+        run(dir.path(), &["config", "core.hooksPath", "no-hooks"]);
+        fs::write(dir.path().join("lib.rs"), "fn a() {}\n").unwrap();
+        run(dir.path(), &["add", "lib.rs"]);
+        run(dir.path(), &["commit", "-q", "-m", "init"]);
+        let repo = Repo::open(dir.path()).unwrap();
+        (dir, repo)
+    }
+
+    /// A repository with a submodule, and that submodule's folder and a new commit
+    /// there, for moving it.
+    pub fn with_submodule() -> (TempDir, Repo, TempDir, String) {
+        let (dir, repo) = isolated_repo();
+        let library = TempDir::new().unwrap();
+        run(library.path(), &["init", "-q", "--initial-branch", "main"]);
+        run(library.path(), &["config", "user.name", "Test"]);
+        run(
+            library.path(),
+            &["config", "user.email", "test@example.com"],
+        );
+        run(
+            library.path(),
+            &["commit", "-q", "--allow-empty", "-m", "one"],
+        );
+        let url = library.path().to_string_lossy().into_owned();
+        run(
+            dir.path(),
+            &[
+                "-c",
+                "protocol.file.allow=always",
+                "submodule",
+                "add",
+                "-q",
+                &url,
+                "library",
+            ],
+        );
+        run(dir.path(), &["commit", "-q", "-m", "add the library"]);
+        run(
+            library.path(),
+            &["commit", "-q", "--allow-empty", "-m", "two"],
+        );
+        let moved = run(library.path(), &["rev-parse", "HEAD"])
+            .trim()
+            .to_owned();
+        (dir, repo, library, moved)
+    }
 }
 
 #[cfg(test)]
@@ -1088,6 +1258,14 @@ mod tests {
         run(dir.path(), &["commit", "-q", "-m", "init"]);
         let repo = Repo::open(dir.path()).unwrap();
         (dir, repo)
+    }
+
+    /// Commits a file with Norwegian letters in its name, then changes it.
+    fn change_norwegian_file(dir: &Path) {
+        fs::write(dir.join("Kjøre.txt"), "en\n").unwrap();
+        run(dir, &["add", "--all"]);
+        run(dir, &["commit", "-q", "-m", "add the file"]);
+        fs::write(dir.join("Kjøre.txt"), "to\n").unwrap();
     }
 
     /// Adds a bare repository as `origin` and pushes to it, setting the upstream.
@@ -1554,6 +1732,199 @@ mod tests {
         run(dir.path(), &["switch", "-q", "--detach"]);
         let err = repo.current_branch().unwrap_err();
         assert!(err.to_string().contains("detached"));
+    }
+
+    #[test]
+    fn shows_file_names_as_they_are_whatever_the_setting_is() {
+        for setting in [None, Some("true"), Some("false")] {
+            let (dir, repo) = setup();
+            if let Some(setting) = setting {
+                run(dir.path(), &["config", "core.quotePath", setting]);
+            }
+            change_norwegian_file(dir.path());
+            let (_, changes) = repo.changes(&[]).unwrap().unwrap();
+            assert!(
+                changes.diff.contains("a/Kjøre.txt b/Kjøre.txt"),
+                "{setting:?}"
+            );
+            assert!(changes.stat.contains("Kjøre.txt"), "{setting:?}");
+            assert!(!changes.stat.contains("303"), "{setting:?}");
+            let hunks = repo.uncommitted_hunks("Kjøre.txt").unwrap();
+            assert!(hunks.contains("a/Kjøre.txt b/Kjøre.txt"), "{setting:?}");
+            run(dir.path(), &["add", "--all"]);
+            run(dir.path(), &["commit", "-q", "-m", "change the file"]);
+            let patches = repo.commit_patches(&["-1"], &[]).unwrap();
+            assert!(
+                patches[0].patch.contains("a/Kjøre.txt b/Kjøre.txt"),
+                "{setting:?}"
+            );
+            let between = repo.changes_between(&["HEAD~1", "HEAD"], &[]).unwrap();
+            assert!(
+                between.diff.contains("a/Kjøre.txt b/Kjøre.txt"),
+                "{setting:?}"
+            );
+            let history = repo.line_history("Kjøre.txt", "1,1", 1).unwrap();
+            assert!(history.contains("a/Kjøre.txt b/Kjøre.txt"), "{setting:?}");
+        }
+    }
+
+    #[test]
+    fn keeps_a_patch_in_ascii_whatever_the_setting_is() {
+        for setting in [None, Some("true"), Some("false")] {
+            let (dir, repo) = setup();
+            if let Some(setting) = setting {
+                run(dir.path(), &["config", "core.quotePath", setting]);
+            }
+            change_norwegian_file(dir.path());
+            let patch = repo.patch(Scope::Tracked).unwrap();
+            assert!(
+                patch.starts_with("diff --git \"a/Kj\\303\\270re.txt\" \"b/Kj\\303\\270re.txt\""),
+                "{setting:?}: {patch}"
+            );
+        }
+    }
+
+    #[test]
+    fn lists_included_paths_in_the_form_a_parsed_patch_names_them() {
+        let (dir, repo) = setup();
+        for name in ["Kjøre.txt", "tab\there.txt", "skip.lock"] {
+            fs::write(dir.path().join(name), "en\n").unwrap();
+        }
+        run(dir.path(), &["add", "--all"]);
+        let included = repo
+            .included_paths(Scope::Staged, &["*.lock".to_owned()])
+            .unwrap();
+        let expected = ["Kjøre.txt", "tab\\there.txt"].map(str::to_owned);
+        assert_eq!(included, HashSet::from(expected));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn leaves_the_quoting_setting_alone_for_commit_hooks() {
+        let (dir, repo) = setup();
+        let hooks = dir.path().join("hooks");
+        fs::create_dir(&hooks).unwrap();
+        let seen = dir.path().join("seen.txt");
+        let script = format!(
+            "#!/bin/sh\nprintf '%s' \"$GIT_CONFIG_PARAMETERS\" > {}\n",
+            shell_quote(&seen.to_string_lossy())
+        );
+        let hook = hooks.join("pre-commit");
+        fs::write(&hook, script).unwrap();
+        let executable = std::os::unix::fs::PermissionsExt::from_mode(0o755);
+        fs::set_permissions(&hook, executable).unwrap();
+        run(dir.path(), &["config", "core.hooksPath", "hooks"]);
+        fs::write(dir.path().join("lib.rs"), "fn b() {}\n").unwrap();
+        run(dir.path(), &["add", "lib.rs"]);
+        repo.commit("change", Scope::Staged, &[]).unwrap();
+        assert!(!fs::read_to_string(seen).unwrap().contains("quotePath"));
+    }
+
+    #[test]
+    fn leaves_only_a_submodules_commit_in_a_patch() {
+        let old = "a".repeat(40);
+        let new = "b".repeat(40);
+        let header = "diff --git a/library b/library\n";
+        let moved = format!(
+            "{header}index aaaaaaa..bbbbbbb 160000\n--- a/library\n+++ b/library\n@@ -1 +1 @@\n\
+             -Subproject commit {old}\n+Subproject commit {new}\n"
+        );
+        let dirty_too = moved.replace(
+            &format!("+Subproject commit {new}"),
+            &format!("+Subproject commit {new}-dirty"),
+        );
+        let only_dirty = format!(
+            "{header}--- a/library\n+++ b/library\n@@ -1 +1 @@\n\
+             -Subproject commit {old}\n+Subproject commit {old}-dirty\n"
+        );
+        let other = "diff --git a/a.txt b/a.txt\nindex 1..2 100644\n--- a/a.txt\n+++ b/a.txt\n\
+                     @@ -1 +1 @@\n-a\n+b\n";
+        // A file whose text only looks like this stays as it is.
+        let lookalike = format!(
+            "diff --git a/n.txt b/n.txt\nindex 1..2 100644\n--- a/n.txt\n+++ b/n.txt\n@@ -1 +1 @@\n\
+             -Subproject commit {old}\n+Subproject commit {old}-dirty\n"
+        );
+        assert_eq!(without_dirty_submodules(&moved), moved);
+        assert_eq!(without_dirty_submodules(&dirty_too), moved);
+        assert_eq!(without_dirty_submodules(&only_dirty), "");
+        assert_eq!(without_dirty_submodules(other), other);
+        assert_eq!(without_dirty_submodules(&lookalike), lookalike);
+        assert_eq!(
+            without_dirty_submodules(&format!("{only_dirty}{other}{dirty_too}")),
+            format!("{other}{moved}")
+        );
+        assert_eq!(without_dirty_submodules(""), "");
+    }
+
+    #[test]
+    fn tells_when_a_conflict_is_unresolved() {
+        let (dir, repo) = setup();
+        assert!(!repo.has_unmerged_paths().unwrap());
+        let blob = run(dir.path(), &["rev-parse", "HEAD:lib.rs"]);
+        let entry = format!("100644,{},lib.rs", blob.trim());
+        run(dir.path(), &["update-index", "--force-remove", "lib.rs"]);
+        run(
+            dir.path(),
+            &["update-index", "--add", "--cacheinfo", &entry],
+        );
+        assert!(!repo.has_unmerged_paths().unwrap());
+        let mut child = Command::new("git")
+            .current_dir(dir.path())
+            .args(["update-index", "--index-info"])
+            .stdin(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let unmerged = format!(
+            "0 {} 0\tlib.rs\n100644 {} 2\tlib.rs\n",
+            "0".repeat(40),
+            blob.trim()
+        );
+        child
+            .stdin
+            .as_mut()
+            .unwrap()
+            .write_all(unmerged.as_bytes())
+            .unwrap();
+        assert!(child.wait().unwrap().success());
+        assert!(repo.has_unmerged_paths().unwrap());
+    }
+
+    #[test]
+    fn sees_changes_whatever_an_external_diff_says() {
+        let (dir, repo) = setup();
+        run(dir.path(), &["config", "diff.external", "true"]);
+        run(dir.path(), &["config", "diff.trustExitCode", "true"]);
+        assert!(repo.changes(&[]).unwrap().is_none());
+        fs::write(dir.path().join("lib.rs"), "fn b() {}\n").unwrap();
+        assert!(repo.changes(&[]).unwrap().is_some());
+        let tree = repo.tree("HEAD").unwrap();
+        assert!(repo.differs_from_tree(Scope::Tracked, &tree).unwrap());
+    }
+
+    #[test]
+    fn keeps_hooks_off_for_a_scratch_index() {
+        let (dir, repo) = setup();
+        let hooks = dir.path().join("hooks");
+        fs::create_dir(&hooks).unwrap();
+        let mark = dir.path().join("hook-ran");
+        let hook = hooks.join("post-index-change");
+        let script = format!(
+            "#!/bin/sh\ntouch {}\n",
+            shell_quote(&mark.to_string_lossy())
+        );
+        fs::write(&hook, script).unwrap();
+        let executable = std::os::unix::fs::PermissionsExt::from_mode(0o755);
+        fs::set_permissions(&hook, executable).unwrap();
+        run(dir.path(), &["config", "core.hooksPath", "hooks"]);
+        let scratch = repo
+            .with_index(dir.path().join(".git/scratch"))
+            .without_hooks();
+        scratch.read_tree("HEAD").unwrap();
+        assert!(!mark.exists());
+        repo.with_index(dir.path().join(".git/other"))
+            .read_tree("HEAD")
+            .unwrap();
+        assert!(mark.exists());
     }
 
     #[test]

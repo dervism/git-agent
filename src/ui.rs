@@ -12,6 +12,14 @@ use std::path::Path;
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
+/// Writes a line to stderr, for the user. Unlike `eprintln!`, it doesn't panic
+/// when the terminal has gone away, so that a hangup can end the program properly.
+macro_rules! say {
+    ($($line:tt)*) => {{
+        let _ = writeln!(io::stderr(), $($line)*);
+    }};
+}
+
 const SUBJECT_LIMIT: usize = 72;
 
 const EDIT_HELP: &str = "\
@@ -119,15 +127,15 @@ pub fn bytes(count: u64) -> String {
 }
 
 pub fn info(message: impl Display) {
-    eprintln!("{message}");
+    say!("{message}");
 }
 
 pub fn warn(message: impl Display) {
-    eprintln!("{} {message}", yellow("warning:"));
+    say!("{} {message}", yellow("warning:"));
 }
 
 pub fn error(err: &anyhow::Error) {
-    eprintln!("{} {err:#}", red("error:"));
+    say!("{} {err:#}", red("error:"));
 }
 
 pub fn show_proposal<T>(review: &Review<T>, text: &str) {
@@ -188,7 +196,11 @@ impl Spinner {
             for frame in FRAMES.iter().cycle() {
                 ticks.tick().await;
                 let elapsed = started.elapsed().as_secs();
-                eprint!("\r{frame} {label} {}", dim(&format!("{elapsed}s")));
+                let _ = write!(
+                    io::stderr(),
+                    "\r{frame} {label} {}",
+                    dim(&format!("{elapsed}s"))
+                );
             }
         });
         Self(Some(task))
@@ -199,7 +211,7 @@ impl Drop for Spinner {
     fn drop(&mut self) {
         if let Some(task) = self.0.take() {
             task.abort();
-            eprint!("\r\x1b[2K");
+            let _ = write!(io::stderr(), "\r\x1b[2K");
         }
     }
 }
@@ -245,8 +257,8 @@ pub fn ask_action<T: Copy>(review: &Review<T>) -> Result<Action<T>> {
             }
             "q" | "quit" | "n" | "no" => return Ok(Action::Quit),
             "" => {}
-            "?" | "h" | "help" => eprintln!("{}", help(review)),
-            other => eprintln!("Unknown choice {other:?}. Type ? for help."),
+            "?" | "h" | "help" => say!("{}", help(review)),
+            other => say!("Unknown choice {other:?}. Type ? for help."),
         }
     }
 }
@@ -283,7 +295,7 @@ fn help<T>(review: &Review<T>) -> String {
 
 /// Prompts on stderr and reads a trimmed line, or `None` at end of input.
 fn read_line(prompt: &str) -> Result<Option<String>> {
-    eprint!("{prompt} ");
+    let _ = write!(io::stderr(), "{prompt} ");
     io::stderr().flush()?;
     let mut line = String::new();
     let read = io::stdin()
@@ -291,7 +303,7 @@ fn read_line(prompt: &str) -> Result<Option<String>> {
         .read_line(&mut line)
         .context("failed to read input")?;
     if read == 0 {
-        eprintln!();
+        say!();
         return Ok(None);
     }
     Ok(Some(line.trim().to_owned()))
@@ -322,7 +334,7 @@ pub fn ask_untracked() -> Result<UntrackedChoice> {
             "" | "y" | "yes" => return Ok(UntrackedChoice::Ignore),
             "n" | "no" => return Ok(UntrackedChoice::Commit),
             "q" | "quit" => return Ok(UntrackedChoice::Quit),
-            _ => eprintln!("Please answer y, n or q."),
+            _ => say!("Please answer y, n or q."),
         }
     }
 }
@@ -336,7 +348,7 @@ pub fn confirm(question: &str) -> Result<bool> {
         match answer.to_lowercase().as_str() {
             "" | "y" | "yes" => return Ok(true),
             "n" | "no" => return Ok(false),
-            _ => eprintln!("Please answer y or n."),
+            _ => say!("Please answer y or n."),
         }
     }
 }

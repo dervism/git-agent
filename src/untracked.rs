@@ -6,6 +6,7 @@
 //! them out, and `git add --all` would commit them. No model is involved:
 //! the rules below decide.
 
+use crate::git::names;
 use crate::ui::{bytes, thousands};
 use anyhow::{Context, Result};
 use std::collections::HashMap;
@@ -264,6 +265,23 @@ fn literal(path: &str) -> String {
     format!(":(top,exclude,literal){path}")
 }
 
+/// `path` as a `.gitignore` line takes it, so a character in it that means
+/// something there can't make the line cover other files.
+fn ignore_pattern_for(path: &str) -> String {
+    let mut pattern = String::with_capacity(path.len());
+    for character in path.chars() {
+        if matches!(character, '\\' | '*' | '?' | '[' | ']') {
+            pattern.push('\\');
+        }
+        pattern.push(character);
+    }
+    if pattern.ends_with(' ') {
+        pattern.pop();
+        pattern.push_str("\\ ");
+    }
+    pattern
+}
+
 /// A pathspec that leaves out every file matching `pattern`, wherever it is.
 fn anywhere(pattern: &str) -> String {
     format!(":(top,exclude,glob)**/{pattern}")
@@ -285,7 +303,7 @@ fn classify(top: &Path, path: &str, markers: &mut Markers) -> Option<Classified>
         let pattern = if rule.anywhere {
             format!("{name}/")
         } else {
-            format!("/{directory}/")
+            format!("/{}/", ignore_pattern_for(&directory))
         };
         return Some((
             directory.clone(),
@@ -329,18 +347,24 @@ fn classify(top: &Path, path: &str, markers: &mut Markers) -> Option<Classified>
         return kind("compiled files", format!("*.{extension}"));
     }
     if is_env_file(name) {
-        return single("environment file; it may hold secrets", name.to_owned());
+        return single(
+            "environment file; it may hold secrets",
+            ignore_pattern_for(name),
+        );
     }
     if SSH_KEYS.contains(&name)
         || extension
             .as_deref()
             .is_some_and(|extension| KEY_FILES.contains(&extension))
     {
-        return single("private key or key store", format!("/{path}"));
+        return single(
+            "private key or key store",
+            format!("/{}", ignore_pattern_for(path)),
+        );
     }
     let size = fs::symlink_metadata(top.join(path)).map_or(0, |meta| meta.len());
     if size >= LARGE_FILE_BYTES {
-        return single("large file", format!("/{path}"));
+        return single("large file", format!("/{}", ignore_pattern_for(path)));
     }
     None
 }
@@ -392,7 +416,7 @@ pub fn list(findings: &[Finding]) -> String {
     let width = findings
         .iter()
         .take(MOST_LISTED)
-        .map(|finding| finding.label.chars().count())
+        .map(|finding| names::printable(&finding.label).chars().count())
         .max()
         .unwrap_or(0);
     let mut out = String::new();
@@ -404,7 +428,8 @@ pub fn list(findings: &[Finding]) -> String {
         if finding.files > 1 || finding.bytes >= 1024 * 1024 {
             details.push(bytes(finding.bytes));
         }
-        let _ = writeln!(out, "   {:width$}  {}", finding.label, details.join(", "));
+        let label = names::printable(&finding.label);
+        let _ = writeln!(out, "   {label:width$}  {}", details.join(", "));
     }
     if findings.len() > MOST_LISTED {
         let _ = writeln!(out, "   … and {} more", findings.len() - MOST_LISTED);
@@ -420,6 +445,22 @@ pub fn exclude(findings: &[Finding]) -> Vec<String> {
         .collect()
 }
 
+/// A line of `.gitignore` can't hold a line break, and what's after one would
+/// be a pattern of its own.
+fn fits_gitignore(finding: &Finding) -> bool {
+    !finding.pattern.chars().any(char::is_control)
+}
+
+/// Pathspecs that leave out the findings [`add_to_gitignore`] can't add. Only
+/// those: `git add` refuses a pathspec that names an ignored file.
+pub fn exclude_what_gitignore_cant_hold(findings: &[Finding]) -> Vec<String> {
+    findings
+        .iter()
+        .filter(|finding| !fits_gitignore(finding))
+        .flat_map(|finding| finding.exclude.iter().cloned())
+        .collect()
+}
+
 /// Adds the findings' patterns to the `.gitignore` at `top`, creating it if
 /// needed, and returns the patterns it added.
 pub fn add_to_gitignore(top: &Path, findings: &[Finding]) -> Result<Vec<String>> {
@@ -431,7 +472,7 @@ pub fn add_to_gitignore(top: &Path, findings: &[Finding]) -> Result<Vec<String>>
     };
     let existing: Vec<&str> = text.lines().map(str::trim).collect();
     let mut added: Vec<String> = Vec::new();
-    for finding in findings {
+    for finding in findings.iter().filter(|finding| fits_gitignore(finding)) {
         if !existing.contains(&finding.pattern.as_str()) && !added.contains(&finding.pattern) {
             added.push(finding.pattern.clone());
         }
@@ -478,6 +519,58 @@ mod tests {
                 )
             })
             .collect()
+    }
+
+    #[test]
+    fn writes_a_gitignore_line_that_covers_only_the_file_it_names() {
+        assert_eq!(ignore_pattern_for("plain/name.pem"), "plain/name.pem");
+        assert_eq!(ignore_pattern_for("k*y.pem"), "k\\*y.pem");
+        assert_eq!(ignore_pattern_for("a\\b?[c].key"), "a\\\\b\\?\\[c\\].key");
+        assert_eq!(ignore_pattern_for("space "), "space\\ ");
+
+        let (dir, _repo) = crate::git::test_support::isolated_repo();
+        let path = dir.path();
+        fs::write(path.join("k*y.pem"), "key\n").unwrap();
+        fs::write(path.join("kaaay.pem"), "my own\n").unwrap();
+        let line = format!("/{}\n", ignore_pattern_for("k*y.pem"));
+        fs::write(path.join(".gitignore"), line).unwrap();
+        let ignored = |name: &str| {
+            std::process::Command::new("git")
+                .current_dir(path)
+                .args(["check-ignore", "--quiet", name])
+                .status()
+                .unwrap()
+                .success()
+        };
+        assert!(ignored("k*y.pem"));
+        assert!(!ignored("kaaay.pem"));
+    }
+
+    #[test]
+    fn keeps_a_name_with_a_line_break_out_of_gitignore_and_off_the_terminal() {
+        let top = tempfile::TempDir::new().unwrap();
+        let hostile = Finding {
+            label: "secret.env\n*\u{1b}[31m".to_owned(),
+            reason: "environment file".to_owned(),
+            pattern: "/secret.env\n*".to_owned(),
+            exclude: Vec::new(),
+            files: 1,
+            bytes: 1,
+        };
+        let plain = Finding {
+            label: "other.env".to_owned(),
+            pattern: "/other.env".to_owned(),
+            ..hostile.clone()
+        };
+        let added = add_to_gitignore(top.path(), &[hostile.clone(), plain]).unwrap();
+        assert_eq!(added, ["/other.env"]);
+        assert_eq!(
+            fs::read_to_string(top.path().join(".gitignore")).unwrap(),
+            "/other.env\n"
+        );
+        let shown = list(&[hostile]);
+        assert!(shown.contains("secret.env\\n*\\033[31m"), "{shown}");
+        assert!(!shown.contains('\u{1b}'));
     }
 
     #[test]

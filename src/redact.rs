@@ -7,7 +7,7 @@
 //! `your-api-key` and references such as `${TOKEN}` are left alone, and so are
 //! secrets in formats none of the rules know.
 
-use crate::fit;
+use crate::git::names;
 use regex_lite::Regex;
 use std::sync::LazyLock;
 
@@ -213,7 +213,7 @@ pub fn diff(diff: &str) -> Redacted {
     let mut in_hunk = false;
     for line in diff.split_inclusive('\n') {
         if line.starts_with("diff --git ") {
-            path = fit::path(line);
+            path = names::of_diff(line);
             in_hunk = false;
             scanner = Scanner::default();
         } else if line.starts_with("@@") {
@@ -654,6 +654,18 @@ mod tests {
             "irc://alex:alex@alex.example.com:6667/foo",
         ] {
             assert_eq!(redacted(line), (line.to_owned(), Vec::new()), "{line}");
+        }
+    }
+
+    #[test]
+    fn names_a_file_with_norwegian_letters_in_a_finding() {
+        let secret = format!("ghp_{}", noise(36));
+        for header in [
+            "diff --git a/Kjøre.txt b/Kjøre.txt\n",
+            "diff --git \"a/Kj\\303\\270re.txt\" \"b/Kj\\303\\270re.txt\"\n",
+        ] {
+            let found = diff(&format!("{header}@@ -1 +1 @@\n+token = {secret}\n"));
+            assert_eq!(found.findings[0].place, "Kjøre.txt");
         }
     }
 

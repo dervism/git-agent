@@ -11,6 +11,7 @@ use crate::config::{
 use crate::models::FALLBACK_CONTEXT_LENGTH;
 use crate::providers::{self, PROVIDERS};
 use crate::server::{ModelInfo, ModelServer, Server};
+use crate::temp::PrivateDir;
 use crate::ui::{self, thousands};
 use crate::{git, secrets};
 use anyhow::{Context, Result, bail};
@@ -21,7 +22,7 @@ use inquire::{
 use std::fmt;
 use std::fs;
 use std::io::{self, IsTerminal};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process;
 
 /// Width of the setting names in the menu.
@@ -815,18 +816,78 @@ fn system_prompt_setting(current: &str) -> Result<Option<String>> {
 
 /// Opens `text` in the user's git editor and returns what they saved.
 fn edit_text(name: &str, text: &str) -> Result<String> {
-    let path = std::env::temp_dir().join(format!("git-agent-{name}-{}.txt", process::id()));
+    edit_text_with(name, text, git::edit_file)
+}
+
+/// Writes `text` to a file in a private folder, runs `open` on the file, and
+/// returns what it holds then.
+fn edit_text_with(
+    name: &str,
+    text: &str,
+    open: impl FnOnce(&Path) -> Result<()>,
+) -> Result<String> {
+    let folder = PrivateDir::create("edit")?;
+    let path = folder.path().join(format!("{name}.txt"));
     fs::write(&path, text).with_context(|| format!("failed to write {}", path.display()))?;
-    let edited = git::edit_file(&path).and_then(|()| {
-        fs::read_to_string(&path).with_context(|| format!("failed to read {}", path.display()))
-    });
-    let _ = fs::remove_file(&path);
-    edited
+    open(&path)?;
+    fs::read_to_string(&path).with_context(|| format!("failed to read {}", path.display()))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn returns_what_the_editor_saved_from_a_private_folder() {
+        let saved = edit_text_with("notes", "before", |path| {
+            assert_eq!(fs::read_to_string(path).unwrap(), "before");
+            assert_eq!(path.file_name().unwrap(), "notes.txt");
+            let folder = path.parent().unwrap();
+            let mode = std::os::unix::fs::PermissionsExt::mode(
+                &fs::metadata(folder).unwrap().permissions(),
+            );
+            assert_eq!(mode & 0o777, 0o700);
+            fs::write(path, "after").map_err(Into::into)
+        });
+        assert_eq!(saved.unwrap(), "after");
+    }
+
+    #[test]
+    fn returns_what_an_editor_saved_by_replacing_the_file() {
+        let saved = edit_text_with("notes", "before", |path| {
+            let replacement = path.with_extension("new");
+            fs::write(&replacement, "replaced")?;
+            fs::rename(&replacement, path).map_err(Into::into)
+        });
+        assert_eq!(saved.unwrap(), "replaced");
+    }
+
+    #[test]
+    fn removes_the_folder_after_the_edit_and_after_a_failed_editor() {
+        let mut seen = None;
+        edit_text_with("notes", "text", |path| {
+            seen = Some(path.parent().unwrap().to_owned());
+            Ok(())
+        })
+        .unwrap();
+        assert!(!seen.as_ref().unwrap().exists());
+
+        let mut seen = None;
+        let failed = edit_text_with("notes", "text", |path| {
+            seen = Some(path.parent().unwrap().to_owned());
+            bail!("the editor failed")
+        });
+        assert!(failed.is_err());
+        assert!(!seen.as_ref().unwrap().exists());
+    }
+
+    #[test]
+    fn fails_when_the_editor_leaves_no_file() {
+        let edited = edit_text_with("notes", "text", |path| {
+            fs::remove_file(path).map_err(Into::into)
+        });
+        assert!(edited.is_err());
+    }
 
     #[test]
     fn parses_one_pattern_per_line() {

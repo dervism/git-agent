@@ -154,6 +154,16 @@ pub fn notes_bytes(hint: Option<&str>) -> usize {
     notes(hint).len()
 }
 
+/// What the model is told about one commit of a split, for its message.
+pub fn split_commit_hint(title: &str, author_hint: Option<&str>) -> String {
+    let hint =
+        format!("This commit is one of several that split a larger change. It should: {title}");
+    match author_hint {
+        Some(author_hint) => format!("{hint}\n{author_hint}"),
+        None => hint,
+    }
+}
+
 /// Instructions for grouping a change into commits (`git agent split`). The
 /// messages come later, one commit at a time, from the commit message prompt.
 pub const SPLIT_PROMPT: &str = r#"You split a developer's uncommitted changes into a series of small, logical commits, the way a careful developer would before pushing.
@@ -871,6 +881,24 @@ mod tests {
         assert_eq!(
             split_title("# Title: **feat: add b**  \n"),
             ("feat: add b".to_owned(), String::new())
+        );
+    }
+
+    #[test]
+    fn tells_the_model_what_a_commit_of_a_split_should_do() {
+        let hint = split_commit_hint("Add a cache", None);
+        assert_eq!(
+            hint,
+            "This commit is one of several that split a larger change. It should: Add a cache"
+        );
+    }
+
+    #[test]
+    fn adds_the_authors_own_hint_last() {
+        let hint = split_commit_hint("Add a cache", Some("It's for the parser."));
+        assert!(
+            hint.ends_with("It should: Add a cache\nIt's for the parser."),
+            "{hint}"
         );
     }
 }

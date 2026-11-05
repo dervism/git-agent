@@ -186,6 +186,7 @@ git agent split --all          # stage everything, including untracked files, fi
 git agent split -H "why"       # give the model extra context
 git agent split --commit       # make the commits without any review
 git agent split --push         # push after the last commit
+git agent split --check "cargo check"   # make sure each commit builds
 git agent split -- --signoff   # pass extra arguments to each `git commit`
 ```
 
@@ -199,7 +200,7 @@ commits, ordered so that each builds on those before it. If the plan leaves out 
 or more parts, git-agent asks the model once more to place them, and keeps whichever
 plan leaves out fewer. A part still left out joins the commit with the rest of its file,
 or a last commit. When the hunks are too many to show the model one by one, it groups
-whole files instead.
+whole files instead. Commits that only change documentation go last in a new plan.
 
 ### Reviewing the plan
 
@@ -230,10 +231,59 @@ any other, with two differences: `c` commits, and `s` skips the commit and leave
 its changes as they were. `q` stops; the commits made so far stay. Changes that aren't committed stay
 where they were, staged or not.
 
-git-agent doesn't build or test the commits in between, so a commit may not compile
-on its own if the plan separates code that belongs together. Secrets are checked as
-for any commit, and git-agent won't split changes while a merge or rebase is in
-progress.
+git-agent keeps to the changes as they were when you started: what you save or stage while
+it waits for the model stays uncommitted. If another commit lands on the branch before
+the split is done, it stops, and the commits it made so far stay. A commit hook that
+changes a commit is fine, but the check doesn't cover what the hook did.
+
+Before the first commit, git-agent works out what each commit will hold. A commit that
+can't be made on its own, such as one that adds a file to a folder that a later commit
+still has to clear, merges with the next one. If the plan doesn't add up to your changes,
+git-agent stops and commits nothing. A commit with only documentation or only tests gets
+the type `docs` or `test`, if its message has a Conventional Commits type.
+
+Secrets are checked as for any commit, and git-agent won't split changes while a merge
+or rebase is in progress. You can run `git agent split` from any folder of the repository.
+
+### Checking that each commit builds
+
+Without `--check`, git-agent doesn't build the commits, so a commit may not compile on
+its own if the plan separates code that belongs together. With `--check`, it runs a
+command you choose on each planned commit:
+
+```sh
+git agent split --check "cargo check --all-targets"
+git agent split --check "mvn -o -q test-compile" --check-timeout 1200
+git agent split --check "test -d node_modules || npm ci; npm run build"
+```
+
+The check runs after you accept the plan and before any message is written. It starts
+with the whole change, and if that fails, git-agent stops and commits nothing. Then it
+checks each earlier commit in order. A commit that fails merges with the next one, and
+git-agent shows which commits became one and the line of the output that says why.
+
+The command runs in a clean temporary checkout of your project, through `sh`, with no
+input and without your hooks. Ignored files aren't there, such as `node_modules`, `.env`
+and generated code, and submodule folders are empty, so the command has to install or
+generate what it needs. Build output is removed after the whole change, and before a
+commit that deletes or renames a file, so it can't hide what a commit lacks.
+
+Each run may take 600 seconds, or what `--check-timeout` says. A timeout stops the split
+with nothing committed, and so does Ctrl-C, a command that a signal ends, or one that can't
+start on the whole change. On an earlier commit, a command that can't start counts as a
+failure, because a later commit may be what adds it. If you skip a commit when you review the messages, the
+commits after it weren't checked without it.
+
+The check runs your project's code, as any build does. The command only ever comes from
+the flag, so a repository you clone can't choose one.
+
+### Which model to use
+
+A check makes up for a plan's weak boundaries with any model, but not for its messages.
+In our tests, `gemma-4-12b` and `qwen3.8-27b` wrote more accurate messages than the small
+`gemma-4-e4b`, which sometimes described changes that weren't in the diff, but they took
+minutes per message instead of seconds. `gpt-oss-20b` was fast, and its accuracy varied
+with the change. Use a larger model for `split` when the messages matter and you can wait.
 
 ## Tidying commits before you push
 
@@ -676,6 +726,10 @@ GIT_AGENT_BASE_URL=http://localhost:11434/v1 git agent -m llama3.2   # Ollama
   Deleted files are sent by name, without their old content.
 - git-agent removes reasoning blocks (`<think>…</think>`) and code fences around the
   model's reply.
+- File names can hold letters from any language, whatever `core.quotePath` says. Control
+  characters in a name stay escaped, as in `\033`.
+- `git agent split` commits files that aren't UTF-8, such as Latin-1, byte for byte. The
+  model sees `�` for the bytes it can't read.
 - Set `NO_COLOR` to turn off colored output.
 
 ## Contributing

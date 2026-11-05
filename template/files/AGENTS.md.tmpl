@@ -22,10 +22,10 @@ work.
 <!-- if FRONTEND_IN_SUBDIR -->
 | `{{FRONTEND_DIR}}/` | The frontend. |
 <!-- end FRONTEND_IN_SUBDIR -->
-| `docs/planning/` | `ROADMAP.md`, and the backlog in `backlog/` (section 2.2). |
-| `docs/iterations/` | One folder per iteration (section 2.1). |
+| `docs/planning/` | `ROADMAP.md`, and the backlog in `backlog/` (section 2.2). Private. |
+| `docs/iterations/` | One folder per iteration (section 2.1). Private. |
 | `docs/templates/` | The templates for the roadmap, iterations, backlog items, design documents and decision records. |
-| `docs/architecture/design/` | Design documents, one folder per iteration (section 2.4.1). |
+| `docs/architecture/design/` | Design documents, one folder per iteration (section 2.4.1). Private. |
 | `docs/architecture/decisions/` | Architecture decision records (section 2.4.2). |
 | `docs/architecture/c4/` | C4 diagrams, as Mermaid or D2 sources. |
 | `docs/security/` | The threat model, and how security standards are met (section 2.4.3). |
@@ -46,6 +46,20 @@ work.
 | `.opencode/`, `opencode.json` | OpenCode's agent files and settings. |
 <!-- end OPENCODE -->
 | `tmp/` | The only place for temporary files. Git ignores everything in it except `.gitkeep`. |
+
+### Private documents
+
+`docs/planning/`, `docs/iterations/` and `docs/architecture/design/` are in `.gitignore`, so
+they can hold information that shouldn't be public, and nothing in them reaches GitHub. They
+exist only on this machine, which has these consequences:
+
+- Don't run `git clean -x` or `git clean -X`, because those delete ignored files.
+- A fresh clone or a git worktree doesn't have them. Give an agent working in one what it
+  needs in its prompt.
+- Search tools such as `rg` skip ignored files, so read these by path, or use
+  `rg --no-ignore docs/`.
+- Public text doesn't link to them or quote them: the README, the website, issue forms, commit
+  messages and pull requests.
 
 ## Building, testing and checks
 
@@ -194,7 +208,8 @@ Security problems never go into a GitHub issue. `.github/SECURITY.md` asks peopl
 report them privately<!-- if PUBLIC -->, through GitHub's private vulnerability
 reporting<!-- end PUBLIC -->. The same goes for us: tell me about a vulnerability you find, and we decide together how to track and fix
 it.<!-- if PUBLIC --> The repository is public, so never write its details in an issue, a
-pull request, a commit message, the backlog, the docs or the website.<!-- end PUBLIC -->
+pull request, a commit message, a tracked file or the website.<!-- end PUBLIC --> Track it as a
+backlog item, which stays private (see "Private documents").
 
 ## Strict rules for you and all subagents
 
@@ -284,7 +299,7 @@ prompt, or have a person follow the brief, so the review stays independent.
 ## 2.0 Overall work process
 
 Our work is organized in iterations, following `docs/planning/ROADMAP.md`. An iteration
-holds one or more items from the backlog. After an iteration (section 2.1) is completed,
+holds single backlog items, one or more groups of items, or both. After an iteration (section 2.1) is completed,
 we run these stages:
 
 1. Update the documentation and the Unreleased section of `CHANGELOG.md`.
@@ -293,14 +308,16 @@ we run these stages:
 4. Prepare for the next iteration. At this point you pause, and wait for my signal to
    continue.
 
-`ROADMAP.md` follows `docs/templates/roadmap.md`.
+`ROADMAP.md` is a document of ideas. It never holds sensitive information, which belongs in a
+backlog item. It follows `docs/templates/roadmap.md`.
 
 ## 2.1 Iterations
 
-Before an iteration starts, we agree which items from the backlog to include. Iterations
+Before an iteration starts, we agree which single items and groups from the backlog to
+include. Iterations
 are numbered `iteration-NNN`, where NNN is an incremental number, and each one has a
 document at `docs/iterations/NNN/iteration-NNN.md`. Keep the document purposely concise,
-with a list of the items included.
+with a list of what it includes.
 
 Start each one from `docs/templates/iteration.md`.
 
@@ -318,6 +335,12 @@ Each item is a Markdown document in `docs/planning/backlog/items/`, named
 `BACKLOG.md` is only the index and overview. When we tidy up and groom the backlog, or
 reprioritize items, you update the Priority field in each item's metadata table (section
 2.2.1).
+
+An item can belong to one group, a named batch of work, through the Group field in its
+metadata. Group names are lower-case words joined by hyphens, such as `search-rewrite`. An
+item outside any group has `-` there, and is a single item. An iteration can include single
+items, one or more groups, or both. Including a group includes all its items that aren't
+DONE, BLOCKED or PARKED.
 
 An item marked DONE is never reopened. When bugs, updates or refactoring touch code that
 an item delivered, we open new items in the backlog, and add references to the relevant
@@ -345,8 +368,8 @@ Start each item from `docs/templates/backlog-item.md`.
 
 ### 2.3.3 When BACKLOG.md has open items
 
-1. Suggest a group of backlog items that are not DONE, BLOCKED or PARKED for the next
-   iteration. This starts a new iteration.
+1. Suggest the single items and groups for the next iteration, leaving out items that are
+   DONE, BLOCKED or PARKED. This starts a new iteration.
 2. Design a solution. Analyse the source code, and identify the significant
    requirements, and the possible solutions and their trade-offs when there is more than
    one. Consider an external library or framework only when the language's standard
@@ -383,8 +406,8 @@ Start each item from `docs/templates/backlog-item.md`.
 
 ### 2.3.4 Backlog grooming
 
-1. After each iteration, we update the roadmap and the backlog. We update the statuses,
-   and reprioritize where what we have learned calls for it.
+1. After each iteration, we update the roadmap and the backlog. We update the statuses and
+   the groups, and reprioritize where what we have learned calls for it.
 
 ## 2.4 Architecture and security documents
 

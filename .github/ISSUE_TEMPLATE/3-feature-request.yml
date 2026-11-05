@@ -5,7 +5,7 @@ body:
   - type: markdown
     attributes:
       value: |
-        Check the [roadmap](https://github.com/dervism/git-agent/blob/master/docs/planning/ROADMAP.md) first: your idea may already be planned. To change how an existing command behaves, use the "Improvement" form.
+        Check the [open issues](https://github.com/dervism/git-agent/issues) first: your idea may already be suggested. To change how an existing command behaves, use the "Improvement" form.
   - type: textarea
     id: problem
     attributes:
@@ -45,5 +45,5 @@ body:
     attributes:
       label: Before you submit
       options:
-        - label: I searched the existing issues and the roadmap, and this isn't suggested yet.
+        - label: I searched the existing issues, and this isn't suggested yet.
           required: true

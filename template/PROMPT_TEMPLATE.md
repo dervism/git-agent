@@ -147,14 +147,14 @@ The script works these out itself:
 ├── docs/
 │   ├── agents/                      the agent team's briefs, as plain Markdown
 │   ├── templates/                   the templates for the documents the process creates
-│   ├── planning/
+│   ├── planning/                    private: git-ignored
 │   │   ├── ROADMAP.md
 │   │   └── backlog/
 │   │       ├── BACKLOG.md
-│   │       └── items/.gitkeep
-│   ├── iterations/.gitkeep
+│   │       └── items/
+│   ├── iterations/                  private: git-ignored
 │   ├── architecture/
-│   │   ├── design/.gitkeep
+│   │   ├── design/                  private: git-ignored
 │   │   ├── decisions/.gitkeep       architecture decision records
 │   │   └── c4/.gitkeep              C4 diagrams, as Mermaid or D2 sources
 │   └── security/
@@ -211,6 +211,9 @@ It only warns about these, and carries on:
   exception: an existing `.gitignore` gets the entries it's missing. A stack whose manifest
   is already there isn't scaffolded again. The same rules make it safe to run the setup
   again after a failure.
+- If git already tracks `docs/planning/`, `docs/iterations/` or `docs/architecture/design/`,
+  ask, then stop tracking them with `git rm -r --cached`, because `.gitignore` alone doesn't.
+  Their earlier commits stay in the history, so warn when the repository is public.
 
 ### 3. Scaffold the source (script)
 
@@ -279,7 +282,7 @@ stack's own ignore entries are kept. A frontend in a subfolder keeps its tool's 
 ### 4. Write the shared files (script)
 
 Write the files that the table in "File templates" lists for step 4, then the empty folders
-from "What gets created", each with a `.gitkeep`. Scripts are written executable. Fill in
+from "What gets created". Those that git tracks get a `.gitkeep`. Scripts are written executable. Fill in
 `LICENSE` and `CODE_OF_CONDUCT.md` from GitHub's API, as that section shows.
 
 `release.sh`, `publish.sh` and `rollback.sh` follow "The scripts". Their templates aren't
@@ -547,6 +550,7 @@ npx oxfmt
 writes. Then check these:
 
 - `scripts/check.sh` passes on the new scaffold.
+- `git check-ignore docs/planning docs/iterations docs/architecture/design` lists all three.
 - No file holds a leftover parameter, or a condition marker.
 - After `scripts/check.sh` has run, `git ls-files --others --exclude-standard tmp` lists only
   `tmp/.gitkeep`.
@@ -641,6 +645,11 @@ write permissions. To deploy again by hand, run `ci.yml` on `{{MAIN_BRANCH}}`.
 - `release.sh`, `publish.sh` and `rollback.sh` are written when `project init` is built,
   because testing them properly needs a real GitHub repository. That includes what Maven
   Central needs in `pom.xml`: Sonatype's plugin, sources, Javadoc and signing.
+- `docs/planning/`, `docs/iterations/` and `docs/architecture/design/` are git-ignored in every
+  project, public or private, so they can hold information that shouldn't be public. The
+  generated `AGENTS.md` explains what follows from that.
+- A backlog item can belong to one group, through the Group field in its metadata, and an
+  iteration can include single items, one or more groups, or both.
 - The setup doesn't need a coding agent. The first version has add-ons for Claude Code,
   Codex, Cursor and OpenCode.
 - A repository holds one backend stack and an optional frontend, and all their manifests
@@ -758,6 +767,8 @@ their own default model.
 
 ### Notes on the files
 
+- `docs/planning/ROADMAP.md` and `docs/planning/backlog/BACKLOG.md`: the setup writes these
+  even though they are git-ignored, so they exist only on the owner's machine.
 - `docs/templates/NOTICE`: a new project has no code or assets from others, so there is no
   `NOTICE` at the root until it includes some. It starts from this file.
 - `.gitattributes`: git has no brace patterns here, so each extension gets its own line.

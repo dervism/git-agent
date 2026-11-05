@@ -21,9 +21,9 @@ we work.
 | --- | --- |
 | `src/` | The application: one binary crate, `git-agent`. There is no library crate and no `tests/` folder. |
 | `site/` | The website, published to GitHub Pages. |
-| `docs/planning/` | `ROADMAP.md`, and the backlog in `backlog/` (section 2.2). |
-| `docs/iterations/` | One folder per iteration (section 2.1). |
-| `docs/architecture/design/` | Design documents, one folder per iteration (section 2.3.3). |
+| `docs/planning/` | `ROADMAP.md`, and the backlog in `backlog/` (section 2.2). Private. |
+| `docs/iterations/` | One folder per iteration (section 2.1). Private. |
+| `docs/architecture/design/` | Design documents, one folder per iteration (section 2.3.3). Private. |
 | `scripts/release.sh` | The release script. |
 | `template/` | The setup for new projects, for the planned `git agent project init`. |
 | `.github/workflows/pages.yml` | The workflow that builds and deploys the website. |
@@ -35,6 +35,20 @@ we work.
 | `README.md` | The user documentation. The website's docs page is made from it. |
 | `Cargo.toml`, `Cargo.lock` | The crate manifest and the locked dependency versions. |
 | `LICENSE` | The MIT License, for the application. |
+
+### Private documents
+
+`docs/planning/`, `docs/iterations/` and `docs/architecture/design/` are in `.gitignore`, so
+they can hold information that shouldn't be public, and nothing in them reaches GitHub. They
+exist only on this machine, which has these consequences:
+
+- Don't run `git clean -x` or `git clean -X`, because those delete ignored files.
+- A fresh clone or a git worktree doesn't have them. Give an agent working in one what it
+  needs in its prompt.
+- Search tools such as `rg` skip ignored files, so read these by path, or use
+  `rg --no-ignore docs/`.
+- Public text doesn't link to them or quote them: the README, the website, issue forms, commit
+  messages and pull requests.
 
 ### Modules
 
@@ -245,8 +259,9 @@ label that doesn't exist. Keep their lists of commands and providers in step wit
 Security problems never go into a GitHub issue. `.github/SECURITY.md` asks people to
 report them privately, through GitHub's private vulnerability reporting, which is turned
 on for the repository. The same goes for us. The repository is public, so never write the
-details of a vulnerability in an issue, a pull request, a commit message, the backlog, the
-docs or the website. Tell me instead, and we decide together how to track and fix it.
+details of a vulnerability in an issue, a pull request, a commit message, a tracked file or
+the website. Tell me, and track it as a backlog item, which stays private (see "Private
+documents").
 
 ## Strict rules for you and all subagents
 
@@ -331,7 +346,7 @@ it what it needs in the prompt.
 ## 2.0 Overall work process
 
 Our work is organized in iterations, following `docs/planning/ROADMAP.md`. An iteration
-holds one or more items from the backlog. After an iteration (section 2.1) is completed,
+holds single backlog items, one or more groups of items, or both. After an iteration (section 2.1) is completed,
 we run these stages:
 
 1. Update the documentation and the website.
@@ -340,7 +355,7 @@ we run these stages:
 4. Prepare for the next iteration. At this point you pause, and wait for my signal to
    continue.
 
-`ROADMAP.md` has this format:
+`ROADMAP.md` is a document of ideas. It never holds sensitive information, which belongs in a backlog item. It has this format:
 
 ```markdown
 # Roadmap
@@ -362,10 +377,11 @@ we run these stages:
 
 ## 2.1 Iterations
 
-Before an iteration starts, we agree which items from the backlog to include. Iterations
+Before an iteration starts, we agree which single items and groups from the backlog to
+include. Iterations
 are numbered `iteration-NNN`, where NNN is an incremental number, and each one has a
 document at `docs/iterations/NNN/iteration-NNN.md`. Keep the document purposely concise,
-with a list of the items included.
+with a list of what it includes.
 
 Use this format for iteration documents:
 
@@ -396,7 +412,14 @@ concise, without clutter, and run the humanizer on the list.]
 
 ## Items included
 
+[Leave out a heading that isn't used, and repeat the group heading for each group.]
+
+### Single items
+
 - NNNN-title-of-item-one
+
+### Group: [group-name]
+
 - NNNN-title-of-another-item
 
 ## Log
@@ -422,6 +445,12 @@ Each item is a Markdown document in `docs/planning/backlog/items/`, named
 reprioritize items, you update the Priority field in each item's metadata table (section
 2.2.1).
 
+An item can belong to one group, a named batch of work, through the Group field in its
+metadata. Group names are lower-case words joined by hyphens, such as `search-rewrite`. An
+item outside any group has `-` there, and is a single item. An iteration can include single
+items, one or more groups, or both. Including a group includes all its items that aren't
+DONE, BLOCKED or PARKED.
+
 `BACKLOG.md` has this layout:
 
 ```markdown
@@ -429,8 +458,8 @@ reprioritize items, you update the Priority field in each item's metadata table 
 
 ## Items
 
-| Item priority | Item number | Item title | Item status |
-| --- | --- | --- | --- |
+| Item priority | Item number | Item title | Item group | Item status |
+| --- | --- | --- | --- | --- |
 ```
 
 An item marked DONE is never reopened. When bugs, updates or refactoring touch code that
@@ -449,6 +478,7 @@ Document each item with this template:
 | Field | Value |
 | --- | --- |
 | Iteration | [NNN] |
+| Group | [group-name, or - for a single item] |
 | Priority | [NNN] |
 | Date started | [DD-MM-YYYY] |
 | Date finished | [DD-MM-YYYY] |
@@ -494,8 +524,8 @@ The humanizer is the `humanizer:humanizer` skill.
 
 ### 2.3.3 When BACKLOG.md has open items
 
-1. Suggest a group of backlog items that are not DONE, BLOCKED or PARKED for the next
-   iteration. This starts a new iteration.
+1. Suggest the single items and groups for the next iteration, leaving out items that are
+   DONE, BLOCKED or PARKED. This starts a new iteration.
 2. Design a solution. Analyse the source code, and identify the significant requirements,
    and the possible solutions and their trade-offs when there is more than one. Consider
    an external library or framework only when the Rust standard library can't provide what
@@ -531,5 +561,5 @@ The humanizer is the `humanizer:humanizer` skill.
 
 ### 2.3.4 Backlog grooming
 
-1. After each iteration, we update the roadmap and the backlog. We update the statuses,
-   and reprioritize where what we have learned calls for it.
+1. After each iteration, we update the roadmap and the backlog. We update the statuses and
+   the groups, and reprioritize where what we have learned calls for it.

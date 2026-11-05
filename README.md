@@ -15,9 +15,7 @@ explain why code looks the way it does, or what a set of commits changed.
 
 I made git-agent mainly to get the commit message generation from IntelliJ IDEA
 without running IDEA. IDEA uses nearly 3-4 GB of RAM, and I need that memory for
-running local language models. git-agent also has stronger automation features, for
-use in pipelines or with lightweight code editors. The app was developed using
-Gemma 4 locally, and has been restructured and refactored with Claude.
+running local language models. git-agent has since evolved into more than just generating single commit messages; it now has advanced features to help you automate more of your workflow and chores in a git repo.
 
 ## Install
 

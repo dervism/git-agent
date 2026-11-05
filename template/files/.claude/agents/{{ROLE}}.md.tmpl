@@ -1,0 +1,16 @@
+---
+name: {{ROLE}}
+description: "{{ROLE_DESCRIPTION}}"
+model: {{ROLE_CLAUDE_MODEL}}
+effort: {{ROLE_CLAUDE_EFFORT}}
+color: {{ROLE_CLAUDE_COLOR}}
+<!-- if ROLE_USES_DESIGN_SKILL -->
+skills:
+  - {{DESIGN_SKILL}}
+<!-- end ROLE_USES_DESIGN_SKILL -->
+<!-- if READ_ONLY -->
+disallowedTools: Edit, Write, NotebookEdit
+<!-- end READ_ONLY -->
+---
+
+Read `docs/agents/{{ROLE}}.md` and follow it.

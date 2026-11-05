@@ -1,0 +1,83 @@
+name: Bug report
+description: "{{PROJECT_NAME}} did something wrong, crashed, or showed an error."
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting a bug. Found a security vulnerability? Please don't open an issue. Report it privately, as the [security policy](https://github.com/{{REPOSITORY}}/security/policy) describes.
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What you did, what happened, and what you expected to happen.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: The fewest steps that show the bug.
+      placeholder: |
+        1. ...
+        2. ...
+    validations:
+      required: true
+  - type: textarea
+    id: output
+    attributes:
+      label: Output
+      description: Error messages or logs. Remove anything you don't want public. It's formatted as code, so you don't need backticks.
+      render: shell
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: The version of {{PROJECT_NAME}} you use.
+      placeholder: "{{INITIAL_VERSION}}"
+    validations:
+      required: true
+  - type: dropdown
+    id: install
+    attributes:
+      label: Installed with
+      options:
+<!-- if CRATES -->
+        - crates.io
+<!-- end CRATES -->
+<!-- if MAVEN -->
+        - Maven Central
+<!-- end MAVEN -->
+<!-- if NPM -->
+        - npm
+<!-- end NPM -->
+<!-- if HACKAGE -->
+        - Hackage
+<!-- end HACKAGE -->
+        - From source
+        - Other
+    validations:
+      required: true
+  - type: input
+    id: os
+    attributes:
+      label: Operating system
+      placeholder: macOS 26, Ubuntu 24.04, Windows 11
+    validations:
+      required: true
+<!-- if FRONTEND -->
+  - type: input
+    id: browser
+    attributes:
+      label: Browser and device
+      placeholder: Safari 26 on an iPhone 16
+<!-- end FRONTEND -->
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Before you submit
+      options:
+        - label: I searched the existing issues, and this bug isn't reported yet.
+          required: true
+        - label: I removed secrets, private code and anything else I don't want public from what I pasted.
+          required: true

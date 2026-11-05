@@ -7,6 +7,10 @@
 *.tmp
 *.orig
 
+# Scratch space for agents and tests; only the folder itself is tracked
+/tmp/*
+!/tmp/.gitkeep
+
 # Local environment and secrets
 .env
 .env.*

@@ -1,0 +1,17 @@
+{
+  "plugins": ["typescript", "react", "jsx-a11y", <!-- if NEXTJS -->"nextjs", <!-- end NEXTJS -->"vitest"],
+  "ignorePatterns": [".agents/**"<!-- if CLAUDE_CODE -->, ".claude/**"<!-- end CLAUDE_CODE --><!-- if CODEX -->, ".codex/**"<!-- end CODEX --><!-- if CURSOR -->, ".cursor/**"<!-- end CURSOR --><!-- if OPENCODE -->, ".opencode/**"<!-- end OPENCODE -->],
+  "rules": {
+    "complexity": ["error", 10],
+    "max-lines-per-function": ["error", { "max": 60, "skipBlankLines": true, "skipComments": true }],
+    "typescript/no-floating-promises": "error"
+  },
+  "overrides": [
+    {
+      "files": ["**/*.tsx", "**/*.astro"],
+      "rules": {
+        "max-lines-per-function": ["error", { "max": 100, "skipBlankLines": true, "skipComments": true }]
+      }
+    }
+  ]
+}

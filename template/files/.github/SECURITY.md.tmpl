@@ -1,0 +1,36 @@
+# Security policy
+
+## Reporting a vulnerability
+
+<!-- if PUBLIC -->
+Please don't report a security vulnerability in a public issue, pull request or
+discussion. Report it privately through GitHub instead: open the repository's Security tab
+and choose "Report a vulnerability", or go to
+https://github.com/{{REPOSITORY}}/security/advisories/new. The report goes privately to
+the maintainers.
+<!-- end PUBLIC -->
+<!-- if PRIVATE -->
+Please don't report a security vulnerability in an issue or a pull request. Report it to
+the maintainers at {{CONDUCT_CONTACT}}.
+<!-- end PRIVATE -->
+
+A good report has:
+
+- the version of {{PROJECT_NAME}}, and your operating system
+- what an attacker controls, and what they gain
+- the steps to reproduce it, as small as you can make them
+
+## What counts
+
+- Input that makes {{PROJECT_NAME}} run commands, read or change files, or reach systems it
+  shouldn't.
+- Secrets or personal data that leak into logs, output, files or other services.
+- Ways around authentication or access control.
+<!-- if AI_APP -->
+- Text that steers the language model into making {{PROJECT_NAME}} do something it
+  shouldn't, or data sent to the model that should have stayed on the machine.
+<!-- end AI_APP -->
+
+## Supported versions
+
+Security fixes go into {{SUPPORTED_VERSIONS}}.

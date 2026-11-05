@@ -1,0 +1,535 @@
+# git-agent
+
+git-agent is a Rust command-line tool that does git chores with a language model. It
+writes commit messages, splits a large change into several commits, tidies commits before
+a push, names branches, writes pull requests for GitHub, and explains why code looks the
+way it does or what a set of commits changed. It works with local model servers (LM Studio,
+Ollama, llama.cpp, vLLM) and cloud providers, through the OpenAI-compatible API or
+Anthropic's Messages API. Because the binary is called `git-agent`, git also runs it as
+`git agent`.
+
+The application is under the MIT License. The repository also holds its website, an Astro
+site in `site/` with a license of its own.
+
+The first half of this file describes the repository: its layout, and how it is built,
+tested, released and distributed. The second half, from "Strict rules" on, describes how
+we work.
+
+## Repository layout
+
+| Path | What it holds |
+| --- | --- |
+| `src/` | The application: one binary crate, `git-agent`. There is no library crate and no `tests/` folder. |
+| `site/` | The website, published to GitHub Pages. |
+| `docs/planning/` | `ROADMAP.md`, and the backlog in `backlog/` (section 2.2). |
+| `docs/iterations/` | One folder per iteration (section 2.1). |
+| `docs/architecture/design/` | Design documents, one folder per iteration (section 2.3.3). |
+| `scripts/release.sh` | The release script. |
+| `template/` | The setup for new projects, for the planned `git agent project init`. |
+| `.github/workflows/pages.yml` | The workflow that builds and deploys the website. |
+| `.github/ISSUE_TEMPLATE/` | The issue forms (see "Issues and security reports"). |
+| `.github/SECURITY.md` | The security policy: how to report a vulnerability privately. |
+| `.claude/agents/` | The agent team (section 1.1). |
+| `.claude/launch.json` | The `site` dev server, for previews in Claude Code. |
+| `tmp/` | The only place for temporary files. Git ignores everything in it except `.gitkeep`. |
+| `README.md` | The user documentation. The website's docs page is made from it. |
+| `Cargo.toml`, `Cargo.lock` | The crate manifest and the locked dependency versions. |
+| `LICENSE` | The MIT License, for the application. |
+
+### Modules
+
+`src/main.rs` declares every module, parses the command line, and runs the flow of each
+command, including the default one that writes a commit message (`generate`).
+
+The modules for single commands:
+
+| Module | What it does |
+| --- | --- |
+| `split.rs` | `git agent split`: cuts a change into units (hunks or whole files) and settles the model's plan into commits. |
+| `tidy.rs` | `git agent tidy`: plans which unpushed commits to reword or fold, and writes the rebase todo. |
+| `branch.rs` | `git agent branch`: names a branch after a description, a GitHub issue or the uncommitted changes. |
+| `why.rs` | `git agent why`: reads the target (a line, a range of lines or a function), and describes its blame and history for the model. |
+| `explain.rs` | `git agent explain`: picks the commit, range, branch or last pull to explain. |
+| `untracked.rs` | The check of untracked files before `--all` stages them. |
+| `menu.rs` | `git agent config`: the interactive settings menu. |
+
+The modules the commands share:
+
+| Module | What it does |
+| --- | --- |
+| `cli.rs` | The command-line arguments, with clap. |
+| `git.rs` | The wrapper around the `git` command line (`Repo`). |
+| `github.rs` | Pull requests and issues through the GitHub CLI, `gh`. |
+| `prompt.rs` | Builds the conversation sent to the model for every command, and cleans up its replies. |
+| `server/` | Model servers: the `ModelServer` interface (`mod.rs`), `openai.rs`, `anthropic.rs` and `http.rs`. |
+| `providers.rs` | The servers and providers git-agent knows the address of. |
+| `models.rs` | Choosing the model, and the context size to fit the prompt into. |
+| `fit.rs` | Shortens a diff to a size limit. |
+| `redact.rs` | Finds secrets in text before it goes to a model, and replaces them with `[REDACTED]`. |
+| `secrets.rs` | API keys in the macOS Keychain, so they are never written to a file. |
+| `config.rs` | The settings, and the order of the places they come from. |
+| `ui.rs` | Terminal output and the review prompt. |
+
+## Building and running
+
+```sh
+cargo build                       # target/debug/git-agent
+cargo run -- --help               # run it without installing; its arguments go after --
+cargo install --path . --locked   # install this checkout as git-agent
+```
+
+The crate needs Rust 1.88 or newer (`rust-version` in `Cargo.toml`) and uses the 2024
+edition.
+
+Set these two variables for every command that builds, tests or runs git-agent, so that
+temporary files stay in `tmp/`:
+
+```sh
+export TMPDIR="$PWD/tmp" GIT_CEILING_DIRECTORIES="$PWD/tmp"   # from the repository root
+```
+
+The tests create their repositories in `TMPDIR` (through the `tempfile` crate), and
+git-agent itself puts some files there (`std::env::temp_dir()` in `src/menu.rs` and
+`src/git.rs`). Because `tmp/` is inside this repository, `GIT_CEILING_DIRECTORIES` stops git
+in a test directory from walking up into this repository.
+
+## Testing and checks
+
+The tests are unit tests, in a `mod tests` at the end of the module they test. Tests that
+need git create throwaway repositories and run the real `git`. None of them need a model
+server. `secrets::tests::keychain_round_trip` is ignored, because it needs the macOS
+Keychain.
+
+These checks must pass before a piece of work is done. The release script runs the same
+ones:
+
+```sh
+cargo fmt --check
+cargo clippy --all-targets -- -D warnings
+cargo test
+```
+
+To measure complexity:
+
+```sh
+cargo clippy --all-targets -- -W clippy::cognitive_complexity -W clippy::too_many_lines
+```
+
+`too_many_lines` reports functions longer than 100 lines, and `cognitive_complexity` reports
+functions that are hard to follow. No coverage or code metrics tool is installed (such as
+`cargo-llvm-cov`, `tokei` or `rust-code-analysis-cli`); ask before installing one.
+
+## The website
+
+`site/` is a static site built with Astro 7 and Tailwind CSS 4. It needs Node 22.23.4 or
+newer.
+
+```sh
+npm --prefix site install
+npm --prefix site run dev      # http://localhost:4321/git-agent/
+npm --prefix site run build    # the static site, in site/dist/
+```
+
+Set `TMPDIR` for these too, as "Building and running" shows. Node then keeps its compile
+cache in `tmp/node-compile-cache`, so delete that with the other temporary files.
+
+In Claude Code, start the dev server with the `site` configuration in `.claude/launch.json`.
+Astro 7 runs its dev server in the background when it detects a coding agent, and
+`site/AGENTS.md` shows how to stop it and read its logs.
+
+- `site/src/content/site.ts` holds what the home page says, and reads the version from
+  `Cargo.toml`.
+- `site/src/design/` is the design system: the tokens, utilities, motion and shared
+  components. Its `README.md` documents it.
+- `site/src/blocks/` holds the sections adapted from Tailwind Plus blocks, and
+  `site/src/components/` the site's own sections.
+- The docs page (`/docs/`) is the root `README.md`, loaded as a content collection
+  (`site/src/content.config.ts`). A change to the README changes the site.
+
+For current Astro APIs, use the Astro Docs MCP server's `search_astro_docs` tool, and the
+guides that `site/AGENTS.md` links to. The Astro guide for AI tools
+(https://docs.astro.build/en/guides/build-with-ai/) sets the server up with
+`claude mcp add --transport http astro-docs https://mcp.docs.astro.build/mcp`.
+
+The site is under the GPL-3.0-or-later, with the exceptions listed in `site/NOTICE`.
+`site/src/blocks/` is used under a personal Tailwind Plus license, for this website only,
+and is not open source. Never copy it out of the site, publish it on its own, or move it
+into `site/src/design/`. The logo is all rights reserved. Every file starts with an
+`SPDX-License-Identifier` line naming its license.
+
+## Releasing
+
+Make a release only when you are asked to. `scripts/release.sh` releases a version from
+`master`:
+
+```sh
+scripts/release.sh --dry-run 1.2.3   # show what would happen, and change nothing
+scripts/release.sh 1.2.3             # release, asking before publishing to crates.io
+scripts/release.sh --yes 1.2.3       # release without asking
+```
+
+It runs these steps, and skips the ones an earlier run already did:
+
+1. Checks that `git`, `cargo`, `gh` and `curl` are installed and `gh` is logged in, that
+   the working tree is clean, that the branch is the default branch and not behind
+   `origin`, and that the version is newer than the current one.
+2. Runs `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings` and `cargo test`.
+3. Sets the version in `Cargo.toml`, updates `Cargo.lock`, and commits
+   `chore(release): vX.Y.Z` with your own git identity.
+4. Runs `cargo publish --dry-run`, then publishes the crate to crates.io. Publishing can't
+   be undone. Until it happens, a failure or a "no" removes the version commit again.
+5. Tags the commit `vX.Y.Z`, and pushes the branch and the tag together.
+6. Creates the GitHub release, with notes generated by GitHub.
+7. Points the Homebrew formula at the new tag, and pushes the tap.
+
+Run it with the two variables from "Building and running" set. One step still uses the
+system temp folder: the script clones the tap with `mktemp -d`, which ignores `TMPDIR` on
+macOS. The script deletes the clone when it is done.
+
+## Distribution
+
+### crates.io
+
+The crate is `git-agent` on https://crates.io/crates/git-agent, and users install it with
+`cargo install git-agent --locked`. Publishing uses the token Cargo keeps from
+`cargo login`. The `exclude` list in `Cargo.toml` keeps `site/` and `.claude/` out of the
+package; check what the package holds with `cargo package --list` before a release.
+
+### GitHub releases
+
+Each release has a tag, `vX.Y.Z`, and a release at
+https://github.com/dervism/git-agent/releases.
+
+### Homebrew
+
+The tap is the repository `dervism/homebrew-tap`, and users install with
+`brew install dervism/tap/git-agent`. `Formula/git-agent.rb` builds git-agent from the
+tag's source archive with Homebrew's own Rust (`depends_on "rust" => :build`); there are
+no bottles. The formula's test runs `git-agent --version` and `git-agent config init`,
+which need no model server or Keychain.
+
+The release script changes only the formula's `url` and `sha256`. Other fields, such as
+`desc`, are edited by hand in the tap. The tap's CI (`brew test-bot`, in the tap's
+`.github/workflows/tests.yml`) builds and tests the formula only for pull requests. On a
+push to `main`, which is how the release script updates the tap, it only checks the tap's
+syntax.
+
+### The website
+
+The `Website` workflow (`.github/workflows/pages.yml`) builds `site/` with
+`withastro/action` and deploys it with `actions/deploy-pages` to
+https://dervism.github.io/git-agent/. It runs on pushes to `master` that change `site/`,
+`README.md`, `Cargo.toml` or the workflow, and by hand from the Actions tab. A release
+changes `Cargo.toml`, so every release also deploys the site again. `site` and `base` in
+`site/astro.config.mjs` must match the address. Follow a run with
+`gh run list --workflow pages.yml` and `gh run watch`.
+
+## Issues and security reports
+
+People open issues through the forms in `.github/ISSUE_TEMPLATE/`. `config.yml` turns blank
+issues off for everyone without write access, and links to the security policy and the
+documentation.
+
+| Form | For | Label |
+| --- | --- | --- |
+| `1-bug-report.yml` | git-agent did something wrong, crashed or printed an error. | `bug` |
+| `2-improvement.yml` | Making something git-agent already does work better. | `enhancement` |
+| `3-feature-request.yml` | A new command, option or workflow. | `enhancement` |
+| `4-model-server.yml` | Reaching or using a model server or provider. | `bug` |
+| `5-documentation.yml` | The README, the website or the `--help` text. | `documentation` |
+
+The forms only use labels that already exist in the repository, since GitHub leaves out a
+label that doesn't exist. Keep their lists of commands and providers in step with
+`src/cli.rs` and `src/providers.rs`.
+
+Security problems never go into a GitHub issue. `.github/SECURITY.md` asks people to
+report them privately, through GitHub's private vulnerability reporting, which is turned
+on for the repository. The same goes for us. The repository is public, so never write the
+details of a vulnerability in an issue, a pull request, a commit message, the backlog, the
+docs or the website. Tell me instead, and we decide together how to track and fix it.
+
+## Strict rules for you and all subagents
+
+- You must never commit or push to git or GitHub without my explicit permission. All
+  other git commands are allowed when you need them to solve a task.
+- The source code is always the truth: never make a claim without verifying it in the
+  code. For every claim, say whether you ran it (the program and its output), read it in
+  the code (`file:line`), or recall it. A recollection must be verified again against the
+  source code.
+- You are not allowed to create temporary files in the system temp folders, such as
+  `/private/tmp/`, or the `/var/folders/…/T/` folder that macOS sets as `TMPDIR`. Only use
+  the `tmp/` folder in this repository, which git ignores; this file shows how to point
+  each tool at it. Don't let temporary files pile up in `tmp/`: delete them and tidy up
+  after each iteration of work.
+- Follow the principles of Domain-Driven Design, and always package by feature.
+- Always write unit tests, and verify as many combinations of inputs and branches as
+  possible. Test as many edge cases as possible. Tests are never an afterthought: they
+  guide the design, development, build and deployment.
+- You are not allowed to take shortcuts to finish a task faster. When you are unsure
+  whether something is correct, research the codebase more deeply, with simulations and
+  verifications.
+- Code quality, good architecture, correctness, and a well thought-through domain and
+  packaging are of the utmost importance. Whenever you find bugs or possible improvements,
+  add them as items to the backlog.
+- Put special focus on code quality and code complexity, by running the measurements this
+  file describes.
+- Put special focus on readability. Code should describe itself as far as possible,
+  without comments on individual lines.
+- Choose a functional style of coding over an imperative one. In critical areas of the
+  application and its core, imperative code is allowed when it makes the code faster.
+- Strictly follow the Clean Code principles: small functions that each do one thing, and
+  modules and types (classes) with one responsibility. Make sure functions and types have
+  high cohesion and low coupling, and refactor wherever you can to increase cohesion,
+  lower coupling and reduce complexity.
+- After every iteration or unit of work, ask an independent review agent for a code
+  review. After the review, verify the findings and fix everything you can.
+
+## 1.0 Your role
+
+You are the lead developer and coordinator of this project. You implement and build the
+application, and you can delegate work to independent agents, and ask them for feedback
+and input. They have no history of our chat, our context or your memories. You must make
+sure every claim is verified with tests, probes and data taken directly from the sources,
+or from any external tool or dependency. You follow the work process in section 2.0.
+
+## 1.1 Your agent team
+
+The agents are defined in `.claude/agents/`. Each starts without our conversation, so give
+it what it needs in the prompt.
+
+- `application-architect`: a technical architect with strong skills in modeling, designing
+  and evaluating application architectures. Highly experienced in Domain-Driven Design
+  (DDD), bounded contexts and many architectural styles, such as hexagonal, microservices,
+  kernel and layered architectures. It also suggests how to restructure and refactor the
+  codebase to reduce complexity and technical debt, and to simplify it, following DDD,
+  Clean Code, Clean Architecture and the testing pyramid. An expert in designing fast,
+  memory-efficient, secure and scalable solutions, with GDPR and privacy built in from the
+  start. Strong knowledge of the C4 model in Mermaid and Mermaid C4 (supported in
+  Markdown), and in D2 with its C4 shapes. It uses the newest Opus model, at extra high
+  effort.
+- `security-architect`: responsible for risk assessment, risk mitigation, threat
+  modelling, and documenting how security standards are met. It advises you and the other
+  agents on how to stop misuse, exploits and attacks, with and without the language model
+  git-agent is connected to. It also analyzes the whole codebase, with a special focus on
+  the application core. An expert in Rust and its ecosystem and in operating systems, and
+  in the design of secure AI-driven applications. Strong skills in tracing, logging,
+  access management and privacy by design. An expert in suggesting and implementing
+  security guardrails in the app, and in the interface between the app and the language
+  model. It uses the newest Fable model, at high effort.
+- `lead-frontend-developer`: a deep expert in modern frontend development. Highly skilled
+  in TypeScript, React, CSS, semantic HTML, responsive design, accessibility and testing,
+  in Astro and Tailwind CSS, and in Node and its ecosystem. Its main responsibility is
+  reviewing your frontend implementation. For Astro, it uses the Astro Docs MCP server
+  (`search_astro_docs`). It must understand and use the local `tailwind-plus` skill. It
+  uses the newest Opus model, at extra high effort.
+- `product-ux-designer`: an expert UX designer with strong skills in high-quality, premium
+  product design. An expert in highly accessible, user-friendly products, and in
+  high-quality aesthetics, layouts, color combinations, visual elements and geometric
+  forms. Responsible for reviewing the website and suggesting design updates. It must use
+  the local `tailwind-plus` skill. It uses the newest Opus model, at extra high effort.
+
+## 2.0 Overall work process
+
+Our work is organized in iterations, following `docs/planning/ROADMAP.md`. An iteration
+holds one or more items from the backlog. After an iteration (section 2.1) is completed,
+we run these stages:
+
+1. Update the documentation and the website.
+2. Make the release.
+3. Tidy up the backlog and the roadmap.
+4. Prepare for the next iteration. At this point you pause, and wait for my signal to
+   continue.
+
+`ROADMAP.md` has this format:
+
+```markdown
+# Roadmap
+
+{description of the project}
+
+## 1. {a category of related items in the roadmap}
+
+### {roadmap item title} {status: OPEN | IN_PROGRESS | DONE | BLOCKED | PARKED}
+
+{description of the item}
+
+## 2. {a category of related items in the roadmap}
+
+### {roadmap item title} {status: OPEN | IN_PROGRESS | DONE | BLOCKED | PARKED}
+
+{description of the item}
+```
+
+## 2.1 Iterations
+
+Before an iteration starts, we agree which items from the backlog to include. Iterations
+are numbered `iteration-NNN`, where NNN is an incremental number, and each one has a
+document at `docs/iterations/NNN/iteration-NNN.md`. Keep the document purposely concise,
+with a list of the items included.
+
+Use this format for iteration documents:
+
+```markdown
+# Iteration NNN
+
+## Metadata
+
+| Field | Value |
+| --- | --- |
+| Roadmap items | [LINKS] |
+| Date started | [DD-MM-YYYY] |
+| Date finished | [DD-MM-YYYY] |
+| Target release version | [X.Y.Z, as major.minor.patch] |
+| Design documents, ADRs and architecture documents | [LINKS] |
+| Related roadmap items and backlog items | [LINKS] |
+
+## Goal
+
+[One short paragraph, of at most 3 or 4 sentences, on the intent and goal of this
+iteration.]
+
+## Success criteria and requirements
+
+[Optional. Use it when the iteration has success criteria or requirements that must be met
+before it is closed. At most 2 sentences per bullet point. Keep each point short and
+concise, without clutter, and run the humanizer on the list.]
+
+## Items included
+
+- NNNN-title-of-item-one
+- NNNN-title-of-another-item
+
+## Log
+
+- DD-MM-YYYY: [A log entry gives the latest status, the decisions we made along the way,
+  your questions to me, and my answers. Keep each entry as short as you can without
+  losing facts, knowledge and information that future agents need. Run the humanizer on
+  the log after you add an entry.]
+```
+
+An iteration is DONE when all its items are built, tested, reviewed, documented and
+verified.
+
+## 2.2 Project backlog
+
+The backlog is `docs/planning/backlog/BACKLOG.md`, our index and database of items. Each
+item is one unit of work, with an optional list of subtasks, and is marked OPEN,
+IN_PROGRESS, DONE, BLOCKED or PARKED. The roadmap's items use the same statuses.
+
+Each item is a Markdown document in `docs/planning/backlog/items/`, named
+`{NNNN}-{title}.md`, where NNNN is an incremental identifier that never changes.
+`BACKLOG.md` is only the index and overview. When we tidy up and groom the backlog, or
+reprioritize items, you update the Priority field in each item's metadata table (section
+2.2.1).
+
+`BACKLOG.md` has this layout:
+
+```markdown
+# Backlog
+
+## Items
+
+| Item priority | Item number | Item title | Item status |
+| --- | --- | --- | --- |
+```
+
+An item marked DONE is never reopened. When bugs, updates or refactoring touch code that
+an item delivered, we open new items in the backlog, and add references to the relevant
+older items in their metadata tables.
+
+### 2.2.1 Backlog item template
+
+Document each item with this template:
+
+```markdown
+# NNNN - [Title]
+
+## Metadata
+
+| Field | Value |
+| --- | --- |
+| Iteration | [NNN] |
+| Priority | [NNN] |
+| Date started | [DD-MM-YYYY] |
+| Date finished | [DD-MM-YYYY] |
+| Status | [OPEN, IN_PROGRESS, DONE, BLOCKED or PARKED] |
+| Target release version | [X.Y.Z, as major.minor.patch] |
+| Design documents, ADRs and architecture documents | [LINKS] |
+| Related roadmap items and backlog items | [LINKS] |
+
+## Description
+
+[The description of the item.]
+
+## Tasks
+
+- [ ] [A subtask; mark it [x] when it is done.]
+- [ ] [Another subtask.]
+
+## Log
+
+- DD-MM-YYYY: [A log entry gives the latest status, the decisions we made along the way,
+  your questions to me, and my answers. Keep each entry as short as you can without
+  losing facts, knowledge and information that future agents need. Run the humanizer on
+  the log after you add an entry.]
+```
+
+## 2.3 Our work process
+
+The humanizer is the `humanizer:humanizer` skill.
+
+### 2.3.1 When ROADMAP.md is empty or all its items are DONE
+
+1. We brainstorm ideas.
+2. We agree which of the ideas go into `ROADMAP.md`, as the project's strategy, vision
+   and goals.
+
+### 2.3.2 When BACKLOG.md is empty or all its items are DONE
+
+1. We agree which of the open ideas in the roadmap to build.
+2. We create backlog items and index them in `BACKLOG.md`. Each item is created from the
+   template in section 2.2.1, with its first tasks.
+3. Later, when an iteration starts, each item's task list is revisited, verified and
+   updated.
+
+### 2.3.3 When BACKLOG.md has open items
+
+1. Suggest a group of backlog items that are not DONE, BLOCKED or PARKED for the next
+   iteration. This starts a new iteration.
+2. Design a solution. Analyse the source code, and identify the significant requirements,
+   and the possible solutions and their trade-offs when there is more than one. Consider
+   an external library or framework only when the Rust standard library can't provide what
+   the implementation needs.
+3. Save the design as a Markdown document at
+   `docs/architecture/design/iteration-NNN/{title}.md`.
+4. A design document can reference other design documents. Keep it concise and brief,
+   without long paragraphs or unnecessary detail. It may contain Mermaid diagrams,
+   including Mermaid C4 models, but only where they are needed.
+5. Run the humanizer on the design document, then ask `application-architect` for a
+   design review.
+6. Wait for the review, verify what it found, and make the necessary updates to the
+   design document.
+7. Add your questions to me about the design, if you have any, to the design document.
+8. Present the design and your questions to me, and wait for my input. From my feedback,
+   update the design's solution, decisions and log. Make sure the task lists match the
+   updated design, the review and my input. Then wait for my signal to continue.
+9. Implement, test and build all the tasks in the iteration's items. Work directly on the
+   main branch (`master`) unless we agree otherwise.
+10. When all the items of the iteration are done, ask `application-architect` and
+    `security-architect` for a code review. Only if the website changed, also ask
+    `lead-frontend-developer` to review the frontend code (the changes in `site/`), and
+    `product-ux-designer` to review the design.
+11. Wait for all the reviews to finish, then read all the feedback. Fix everything you can
+    right away, and make new backlog items for issues that need more analysis or a new
+    design review.
+12. When all the issues from the reviews are fixed, show me the items you created, if
+    any, and wait for my input. We decide on and prioritize the new items, and consider
+    whether to fix them now or plan them for another iteration. Fixes made at this point
+    are code reviewed too (steps 9 to 12).
+13. Finally, when everything is implemented, we tidy up, remove temporary files, and make
+    a new release.
+
+### 2.3.4 Backlog grooming
+
+1. After each iteration, we update the roadmap and the backlog. We update the statuses,
+   and reprioritize where what we have learned calls for it.

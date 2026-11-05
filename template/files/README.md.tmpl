@@ -1,0 +1,46 @@
+# {{PROJECT_NAME}}
+
+{{DESCRIPTION}}
+
+<!-- if PUBLISH -->
+## Install
+
+<!-- if CRATES -->
+```sh
+cargo install {{PROJECT_NAME}} --locked
+```
+<!-- end CRATES -->
+<!-- if NPM -->
+```sh
+npm install {{PROJECT_NAME}}
+```
+<!-- end NPM -->
+<!-- if HACKAGE -->
+```sh
+cabal install {{PROJECT_NAME}}
+```
+<!-- end HACKAGE -->
+<!-- if MAVEN -->
+```xml
+<dependency>
+  <groupId>{{JAVA_GROUP_ID}}</groupId>
+  <artifactId>{{PROJECT_NAME}}</artifactId>
+  <version>{{INITIAL_VERSION}}</version>
+</dependency>
+```
+<!-- end MAVEN -->
+
+<!-- end PUBLISH -->
+## Usage
+
+[How to use it.]
+
+## Contributing
+
+Contributions are welcome. Read [CONTRIBUTING.md](CONTRIBUTING.md) first. Please report
+security vulnerabilities privately rather than in an issue, as the
+[security policy](https://github.com/{{REPOSITORY}}/security/policy) describes.
+
+## License
+
+{{PROJECT_NAME}} is under the [{{LICENSE}} license](LICENSE).

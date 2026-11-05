@@ -1,0 +1,64 @@
+name: Improvement
+description: Make something git-agent already does work better.
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        For something git-agent can't do at all yet, use the "Feature request" form.
+  - type: dropdown
+    id: command
+    attributes:
+      label: Command
+      description: The command the improvement is for.
+      options:
+        - git agent (commit message)
+        - git agent --all (untracked files check)
+        - git agent split
+        - git agent tidy
+        - git agent branch
+        - git agent pr
+        - git agent why
+        - git agent explain
+        - git agent models
+        - git agent config
+        - Several commands
+    validations:
+      required: true
+  - type: textarea
+    id: current
+    attributes:
+      label: What git-agent does now
+      placeholder: When `git agent tidy` folds a fixup, it keeps the message of ...
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: What it should do instead
+    validations:
+      required: true
+  - type: textarea
+    id: why
+    attributes:
+      label: Why it would be better
+      description: Who it helps, and when. A real case helps the most.
+  - type: textarea
+    id: example
+    attributes:
+      label: Example
+      description: A session that shows what git-agent does now, or how the improved version would look. It's formatted as code.
+      render: shell
+  - type: input
+    id: version
+    attributes:
+      label: git-agent version
+      description: The output of `git agent --version`.
+      placeholder: git-agent 0.9.0
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Before you submit
+      options:
+        - label: I searched the existing issues, and this isn't suggested yet.
+          required: true

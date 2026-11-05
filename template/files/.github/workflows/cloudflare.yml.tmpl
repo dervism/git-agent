@@ -1,0 +1,41 @@
+name: Deploy
+
+on:
+  workflow_call:
+    secrets:
+      CLOUDFLARE_API_TOKEN:
+        required: true
+      CLOUDFLARE_ACCOUNT_ID:
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@{{CHECKOUT_PIN}}
+      - uses: actions/setup-node@{{SETUP_NODE_PIN}}
+        with:
+          node-version-file: {{FRONTEND_DIR}}/.nvmrc
+          cache: npm
+          cache-dependency-path: {{FRONTEND_DIR}}/package-lock.json
+      - run: npm ci --ignore-scripts
+        working-directory: {{FRONTEND_DIR}}
+<!-- if VINEXT -->
+      - run: npm run deploy:vinext
+        working-directory: {{FRONTEND_DIR}}
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+<!-- end VINEXT -->
+<!-- if WRANGLER -->
+      - run: npm run build
+        working-directory: {{FRONTEND_DIR}}
+      - uses: cloudflare/wrangler-action@{{WRANGLER_ACTION_PIN}}
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          workingDirectory: {{FRONTEND_DIR}}
+<!-- end WRANGLER -->

@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Report a security vulnerability
+    url: https://github.com/dervism/git-agent/security/policy
+    about: Please don't open a public issue for a vulnerability. Report it privately, as the security policy describes.
+  - name: Read the documentation
+    url: https://dervism.github.io/git-agent/docs/
+    about: How to install, configure and use git-agent, and every setting it has.

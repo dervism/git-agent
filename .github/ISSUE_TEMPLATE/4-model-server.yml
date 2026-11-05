@@ -1,0 +1,98 @@
+name: Model server or provider problem
+description: git-agent can't reach a model server, can't list or use a model, or gets an error or an unusable reply from one.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Before you open one, check that the server is running and has a model loaded, and read "Choosing a model" in the [documentation](https://dervism.github.io/git-agent/docs/).
+
+        Found a security vulnerability? Please don't open an issue. Report it privately, as the [security policy](https://github.com/dervism/git-agent/security/policy) describes.
+  - type: dropdown
+    id: server
+    attributes:
+      label: Model server or provider
+      options:
+        - LM Studio
+        - Ollama
+        - llama.cpp
+        - vLLM
+        - OpenAI
+        - Anthropic
+        - OpenRouter
+        - Google Gemini
+        - Mistral
+        - Groq
+        - DeepSeek
+        - xAI
+        - Together AI
+        - Fireworks AI
+        - Cerebras
+        - Another OpenAI-compatible API
+    validations:
+      required: true
+  - type: input
+    id: server-version
+    attributes:
+      label: Server version
+      description: For a local server, the version you run.
+  - type: input
+    id: model
+    attributes:
+      label: Model
+      description: The model's ID, as `git agent models` lists it.
+      placeholder: google/gemma-4-e4b
+    validations:
+      required: true
+  - type: input
+    id: context
+    attributes:
+      label: Context length
+      description: The model's context window, if you know it.
+      placeholder: "131072"
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What you ran, what git-agent did, and what you expected.
+    validations:
+      required: true
+  - type: textarea
+    id: models
+    attributes:
+      label: Output of `git agent models`
+      render: shell
+  - type: textarea
+    id: output
+    attributes:
+      label: Output of the command that failed
+      description: It can include parts of your diff or code, so remove anything you don't want public.
+      render: shell
+  - type: textarea
+    id: settings
+    attributes:
+      label: Settings
+      description: The output of `git agent config show`. It says where your API key comes from, but never prints the key. Remove paths and addresses you don't want public.
+      render: toml
+  - type: input
+    id: version
+    attributes:
+      label: git-agent version
+      description: The output of `git agent --version`.
+      placeholder: git-agent 0.9.0
+    validations:
+      required: true
+  - type: input
+    id: os
+    attributes:
+      label: Operating system
+      placeholder: macOS 26, Ubuntu 24.04
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Before you submit
+      options:
+        - label: I searched the existing issues, and this problem isn't reported yet.
+          required: true
+        - label: I removed API keys, secrets, private code and anything else I don't want public from what I pasted.
+          required: true

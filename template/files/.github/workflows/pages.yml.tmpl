@@ -1,0 +1,46 @@
+name: Website
+
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@{{CHECKOUT_PIN}}
+<!-- if ASTRO -->
+      - uses: withastro/action@{{ASTRO_ACTION_PIN}}
+        with:
+          path: ./{{FRONTEND_DIR}}
+          node-version: "{{NODE_VERSION}}"
+<!-- end ASTRO -->
+<!-- if NEXTJS -->
+      - uses: actions/setup-node@{{SETUP_NODE_PIN}}
+        with:
+          node-version-file: {{FRONTEND_DIR}}/.nvmrc
+          cache: npm
+          cache-dependency-path: {{FRONTEND_DIR}}/package-lock.json
+      - run: |
+          npm ci --ignore-scripts
+          npm run build
+        working-directory: {{FRONTEND_DIR}}
+      - uses: actions/upload-pages-artifact@{{UPLOAD_PAGES_PIN}}
+        with:
+          path: {{FRONTEND_DIR}}/out
+<!-- end NEXTJS -->
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@{{DEPLOY_PAGES_PIN}}

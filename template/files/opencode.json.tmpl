@@ -1,0 +1,23 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "permission": {
+    "bash": {
+      "*": "allow",
+      "git commit": "ask",
+      "git commit *": "ask",
+      "git push": "ask",
+      "git push *": "ask",
+      "scripts/release.sh *": "ask",
+      "scripts/publish.sh *": "ask",
+      "scripts/rollback.sh *": "ask"
+    }
+  }<!-- if MCP -->,
+  "mcp": {
+<!-- if ASTRO -->
+    "astro-docs": { "type": "remote", "url": "https://mcp.docs.astro.build/mcp" }<!-- if CLOUDFLARE -->,<!-- end CLOUDFLARE -->
+<!-- end ASTRO -->
+<!-- if CLOUDFLARE -->
+    "cloudflare": { "type": "remote", "url": "https://mcp.cloudflare.com/mcp" }
+<!-- end CLOUDFLARE -->
+  }<!-- end MCP -->
+}

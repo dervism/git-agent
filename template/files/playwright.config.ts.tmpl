@@ -1,0 +1,22 @@
+// SPDX-License-Identifier: {{LICENSE}}
+import { defineConfig } from "@playwright/test";
+
+export default defineConfig({
+  testDir: "./e2e",
+<!-- if ASTRO -->
+  use: { baseURL: "http://localhost:4321{{E2E_BASE_PATH}}" },
+  webServer: {
+    command: "npm run build && npm run preview -- --ignore-lock",
+    url: "http://localhost:4321{{E2E_BASE_PATH}}",
+    reuseExistingServer: true,
+  },
+<!-- end ASTRO -->
+<!-- if NEXTJS -->
+  use: { baseURL: "http://localhost:3000{{E2E_BASE_PATH}}" },
+  webServer: {
+    command: "npm run dev",
+    url: "http://localhost:3000{{E2E_BASE_PATH}}",
+    reuseExistingServer: true,
+  },
+<!-- end NEXTJS -->
+});

@@ -1,0 +1,29 @@
+// SPDX-License-Identifier: {{LICENSE}}
+import type { NextConfig } from "next";
+
+const nextConfig: NextConfig = {
+<!-- if FRONTEND_AT_ROOT -->
+  agentRules: false,
+<!-- end FRONTEND_AT_ROOT -->
+<!-- if NO_DEPLOY -->
+  cacheComponents: true,
+  partialPrefetching: true,
+<!-- end NO_DEPLOY -->
+<!-- if STATIC_EXPORT -->
+  output: "export",
+  images: { unoptimized: true },
+<!-- end STATIC_EXPORT -->
+<!-- if PAGES_BASE -->
+  basePath: "/{{REPOSITORY_NAME}}",
+<!-- end PAGES_BASE -->
+  turbopack: {
+    rules: {
+      "*.css": {
+        loaders: ["@tailwindcss/turbopack"],
+        as: "*.css",
+      },
+    },
+  },
+};
+
+export default nextConfig;

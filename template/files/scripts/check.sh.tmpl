@@ -1,0 +1,56 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: {{LICENSE}}
+set -euo pipefail
+
+cd "$(dirname "$0")/.."
+root="$PWD"
+export TMPDIR="$root/tmp" GIT_CEILING_DIRECTORIES="$root/tmp"
+<!-- if RUST -->
+
+cargo fmt --check
+cargo clippy --all-targets -- -D warnings \
+    -W clippy::cognitive_complexity -W clippy::too_many_lines
+cargo test
+cargo deny check licenses
+<!-- end RUST -->
+<!-- if JAVA -->
+
+./mvnw verify
+<!-- end JAVA -->
+<!-- if HASKELL -->
+
+cabal build all
+cabal test all
+ormolu --no-cabal --mode check $(find app src test -name '*.hs')
+cabal-plan license-report {{PROJECT_NAME}}:lib:{{PROJECT_NAME}} > tmp/licenses.md
+if awk -F'|' '/^\| / && !/^\| (Name|---)/ && $2 !~ /\*\*/ {
+    gsub(/[`\[\] ]|\(.*\)/, "", $4); print $2, $4 }' tmp/licenses.md \
+    | grep -v -E " ({{ALLOWED_LICENSES_PIPED}})$"; then
+  exit 1
+fi
+<!-- end HASKELL -->
+<!-- if FRONTEND -->
+
+cd "$root/{{FRONTEND_DIR}}"
+npx oxfmt --check
+npx oxlint --type-aware
+<!-- if ASTRO -->
+npx astro sync
+npx tsc --noEmit --runExternalCode
+<!-- end ASTRO -->
+<!-- if NEXTJS -->
+npx next typegen
+npx tsc --noEmit
+<!-- end NEXTJS -->
+npx vitest run
+npx playwright test
+npx licensee --production --errors-only
+npm run build
+<!-- if WRANGLER -->
+npx wrangler deploy --dry-run
+<!-- end WRANGLER -->
+<!-- if VINEXT -->
+npm run build:vinext
+npx vinext-cloudflare deploy --dry-run
+<!-- end VINEXT -->
+<!-- end FRONTEND -->

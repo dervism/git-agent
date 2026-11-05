@@ -1,0 +1,92 @@
+<plugin>
+  <groupId>com.diffplug.spotless</groupId>
+  <artifactId>spotless-maven-plugin</artifactId>
+  <version>{{SPOTLESS_VERSION}}</version>
+  <configuration>
+    <java>
+      <googleJavaFormat>
+        <version>{{GOOGLE_JAVA_FORMAT_VERSION}}</version>
+      </googleJavaFormat>
+    </java>
+  </configuration>
+  <executions>
+    <execution>
+      <phase>verify</phase>
+      <goals><goal>check</goal></goals>
+    </execution>
+  </executions>
+</plugin>
+<plugin>
+  <groupId>org.apache.maven.plugins</groupId>
+  <artifactId>maven-pmd-plugin</artifactId>
+  <version>{{MAVEN_PMD_VERSION}}</version>
+  <dependencies>
+    <dependency>
+      <groupId>net.sourceforge.pmd</groupId>
+      <artifactId>pmd-core</artifactId>
+      <version>{{PMD_VERSION}}</version>
+    </dependency>
+    <dependency>
+      <groupId>net.sourceforge.pmd</groupId>
+      <artifactId>pmd-java</artifactId>
+      <version>{{PMD_VERSION}}</version>
+    </dependency>
+  </dependencies>
+  <configuration>
+    <targetJdk>{{JDK_VERSION}}</targetJdk>
+    <printFailingErrors>true</printFailingErrors>
+    <rulesets>
+      <ruleset>pmd-ruleset.xml</ruleset>
+    </rulesets>
+  </configuration>
+  <executions>
+    <execution>
+      <phase>verify</phase>
+      <goals><goal>check</goal></goals>
+    </execution>
+  </executions>
+</plugin>
+<plugin>
+  <groupId>com.mycila</groupId>
+  <artifactId>license-maven-plugin</artifactId>
+  <version>{{MYCILA_LICENSE_VERSION}}</version>
+  <configuration>
+    <licenseSets>
+      <licenseSet>
+        <inlineHeader>SPDX-License-Identifier: {{LICENSE}}</inlineHeader>
+        <includes>
+          <include>src/**/*.java</include>
+        </includes>
+      </licenseSet>
+    </licenseSets>
+  </configuration>
+  <executions>
+    <execution>
+      <phase>verify</phase>
+      <goals><goal>check</goal></goals>
+    </execution>
+  </executions>
+</plugin>
+<plugin>
+  <groupId>org.codehaus.mojo</groupId>
+  <artifactId>license-maven-plugin</artifactId>
+  <version>{{MOJO_LICENSE_VERSION}}</version>
+  <configuration>
+    <force>true</force>
+    <failOnBlacklist>true</failOnBlacklist>
+    <includedScopes>compile,runtime</includedScopes>
+    <includedLicenses>{{ALLOWED_LICENSES_PIPED}}</includedLicenses>
+    <licenseMerges>
+      <licenseMerge>Apache-2.0|Apache 2.0|Apache License 2.0|Apache License, Version 2.0|The Apache License, Version 2.0|The Apache Software License, Version 2.0</licenseMerge>
+      <licenseMerge>MIT|MIT License|The MIT License|The MIT License (MIT)</licenseMerge>
+      <licenseMerge>BSD-3-Clause|BSD 3-Clause|BSD 3-Clause License|The BSD 3-Clause License|New BSD License</licenseMerge>
+      <licenseMerge>BSD-2-Clause|BSD 2-Clause|BSD 2-Clause License|The BSD 2-Clause License</licenseMerge>
+    </licenseMerges>
+  </configuration>
+  <executions>
+    <execution>
+      <phase>verify</phase>
+      <goals><goal>add-third-party</goal></goals>
+    </execution>
+  </executions>
+</plugin>

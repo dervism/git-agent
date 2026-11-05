@@ -1,0 +1,49 @@
+name: Feature request
+description: Suggest something new for git-agent, such as a command, an option or a workflow.
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Check the [roadmap](https://github.com/dervism/git-agent/blob/master/docs/planning/ROADMAP.md) first: your idea may already be planned. To change how an existing command behaves, use the "Improvement" form.
+  - type: textarea
+    id: problem
+    attributes:
+      label: The problem
+      description: What you do by hand today, or can't do at all. Describe the situation, not only the solution.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Your proposal
+      description: How git-agent could help, the command or option it could have, and what it would do.
+    validations:
+      required: true
+  - type: textarea
+    id: example
+    attributes:
+      label: Example session
+      description: What you would type, and what git-agent would print or do. It's formatted as code.
+      render: shell
+  - type: dropdown
+    id: needs-model
+    attributes:
+      label: Does it need a language model?
+      description: Some features need no model at all, such as the check of untracked files.
+      options:
+        - "Yes"
+        - No, git alone can do it
+        - Not sure
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives
+      description: Other tools or workarounds you have tried, and what they lack.
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Before you submit
+      options:
+        - label: I searched the existing issues and the roadmap, and this isn't suggested yet.
+          required: true

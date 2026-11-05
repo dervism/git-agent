@@ -1,0 +1,28 @@
+{
+<!-- if ASTRO -->
+  "astro": true,
+<!-- end ASTRO -->
+  "ignorePatterns": [
+    "*.md",
+    "*.toml",
+    "docs/**",
+    "scripts/**",
+    ".github/**",
+<!-- if CLAUDE_CODE -->
+    ".claude/**",
+    ".mcp.json",
+<!-- end CLAUDE_CODE -->
+<!-- if CODEX -->
+    ".codex/**",
+<!-- end CODEX -->
+<!-- if CURSOR -->
+    ".cursor/**",
+<!-- end CURSOR -->
+<!-- if OPENCODE -->
+    ".opencode/**",
+    "opencode.json",
+<!-- end OPENCODE -->
+    ".agents/**",
+    "skills-lock.json"
+  ]
+}

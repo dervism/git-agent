@@ -1,0 +1,28 @@
+version: 2
+updates:
+<!-- if RUST -->
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+  - package-ecosystem: rust-toolchain
+    directory: /
+    schedule:
+      interval: weekly
+<!-- end RUST -->
+<!-- if JAVA -->
+  - package-ecosystem: maven
+    directory: /
+    schedule:
+      interval: weekly
+<!-- end JAVA -->
+<!-- if FRONTEND -->
+  - package-ecosystem: npm
+    directory: {{FRONTEND_ROOT}}
+    schedule:
+      interval: weekly
+<!-- end FRONTEND -->
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly

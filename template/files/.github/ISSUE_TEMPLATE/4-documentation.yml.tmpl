@@ -1,0 +1,27 @@
+name: Documentation
+description: "Something in the documentation is wrong, unclear or missing."
+labels: ["documentation"]
+body:
+  - type: input
+    id: location
+    attributes:
+      label: Link or section
+    validations:
+      required: true
+  - type: textarea
+    id: problem
+    attributes:
+      label: What's wrong or missing
+    validations:
+      required: true
+  - type: textarea
+    id: suggestion
+    attributes:
+      label: Suggested wording or fix
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Before you submit
+      options:
+        - label: I searched the existing issues, and this isn't reported yet.
+          required: true

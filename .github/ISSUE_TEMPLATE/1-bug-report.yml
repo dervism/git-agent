@@ -1,0 +1,127 @@
+name: Bug report
+description: git-agent did something wrong, crashed, or printed an error.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting a bug. If git-agent can't reach a model server or use a model, the "Model server or provider problem" form asks for what helps with that.
+
+        Found a security vulnerability? Please don't open an issue. Report it privately, as the [security policy](https://github.com/dervism/git-agent/security/policy) describes.
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What you ran, what git-agent did, and what you expected it to do.
+      placeholder: I ran `git agent split` with 12 staged files. The plan left out two of them, and ...
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: The fewest steps that show the bug, starting from a repository in a known state.
+      placeholder: |
+        1. git init demo && cd demo
+        2. ...
+        3. git agent ...
+    validations:
+      required: true
+  - type: dropdown
+    id: command
+    attributes:
+      label: Command
+      options:
+        - git agent (commit message)
+        - git agent --all (untracked files check)
+        - git agent split
+        - git agent tidy
+        - git agent branch
+        - git agent pr
+        - git agent why
+        - git agent explain
+        - git agent models
+        - git agent config
+        - Something else
+    validations:
+      required: true
+  - type: textarea
+    id: output
+    attributes:
+      label: Output
+      description: What git-agent printed. It can include parts of your diff or code, so remove anything you don't want public. It's formatted as code, so you don't need backticks.
+      render: shell
+  - type: input
+    id: version
+    attributes:
+      label: git-agent version
+      description: The output of `git agent --version`.
+      placeholder: git-agent 0.9.0
+    validations:
+      required: true
+  - type: dropdown
+    id: install
+    attributes:
+      label: Installed with
+      options:
+        - Homebrew (brew install dervism/tap/git-agent)
+        - crates.io (cargo install git-agent)
+        - From a checkout (cargo install --path .)
+        - Other
+    validations:
+      required: true
+  - type: input
+    id: os
+    attributes:
+      label: Operating system
+      placeholder: macOS 26, Ubuntu 24.04
+    validations:
+      required: true
+  - type: input
+    id: git
+    attributes:
+      label: git version
+      description: The output of `git --version`.
+  - type: dropdown
+    id: server
+    attributes:
+      label: Model server or provider
+      options:
+        - LM Studio
+        - Ollama
+        - llama.cpp
+        - vLLM
+        - OpenAI
+        - Anthropic
+        - OpenRouter
+        - Google Gemini
+        - Mistral
+        - Groq
+        - DeepSeek
+        - xAI
+        - Together AI
+        - Fireworks AI
+        - Cerebras
+        - Another OpenAI-compatible API
+        - No model was involved
+  - type: input
+    id: model
+    attributes:
+      label: Model
+      description: The model git-agent used, as `git agent models` marks it.
+      placeholder: google/gemma-4-e4b
+  - type: textarea
+    id: settings
+    attributes:
+      label: Settings
+      description: The output of `git agent config show`. It says where your API key comes from, but never prints the key. Remove paths and addresses you don't want public.
+      render: toml
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Before you submit
+      options:
+        - label: I searched the existing issues, and this bug isn't reported yet.
+          required: true
+        - label: I removed secrets, private code and anything else I don't want public from what I pasted.
+          required: true

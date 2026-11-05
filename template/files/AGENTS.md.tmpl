@@ -1,0 +1,420 @@
+# {{PROJECT_NAME}}
+
+{{DESCRIPTION}}
+
+The first half of this file describes the repository: its layout, and how it is built,
+tested, released and published. The second half, from "Strict rules" on, describes how we
+work.
+
+## Repository layout
+
+| Path | What it holds |
+| --- | --- |
+<!-- if RUST -->
+| `src/`, `Cargo.toml` | The Rust crate. |
+<!-- end RUST -->
+<!-- if JAVA -->
+| `src/main/java/`, `src/test/java/`, `pom.xml` | The Java application and its tests, built with Maven. |
+<!-- end JAVA -->
+<!-- if HASKELL -->
+| `app/`, `src/`, `test/`, `{{PROJECT_NAME}}.cabal` | The Haskell executable, library and tests, built with cabal. |
+<!-- end HASKELL -->
+<!-- if FRONTEND_IN_SUBDIR -->
+| `{{FRONTEND_DIR}}/` | The frontend. |
+<!-- end FRONTEND_IN_SUBDIR -->
+| `docs/planning/` | `ROADMAP.md`, and the backlog in `backlog/` (section 2.2). |
+| `docs/iterations/` | One folder per iteration (section 2.1). |
+| `docs/templates/` | The templates for the roadmap, iterations, backlog items, design documents and decision records. |
+| `docs/architecture/design/` | Design documents, one folder per iteration (section 2.4.1). |
+| `docs/architecture/decisions/` | Architecture decision records (section 2.4.2). |
+| `docs/architecture/c4/` | C4 diagrams, as Mermaid or D2 sources. |
+| `docs/security/` | The threat model, and how security standards are met (section 2.4.3). |
+| `scripts/` | `check.sh`, `release.sh`,<!-- if PUBLISH --> `publish.sh`<!-- end PUBLISH --> and `rollback.sh`. |
+| `.github/` | CI, Dependabot, the issue forms, the pull request template and the security policy. |
+| `docs/agents/` | The briefs for the agent team (section 1.1). |
+| `.agents/skills/` | Skills for any agent tool, in the Agent Skills format. |
+<!-- if CLAUDE_CODE -->
+| `.claude/`<!-- if MCP -->, `.mcp.json`<!-- end MCP --> | Claude Code's agent files and settings. |
+<!-- end CLAUDE_CODE -->
+<!-- if CODEX -->
+| `.codex/` | Codex's agent files, rules and settings. |
+<!-- end CODEX -->
+<!-- if CURSOR -->
+| `.cursor/` | Cursor's agent files, hook and settings. |
+<!-- end CURSOR -->
+<!-- if OPENCODE -->
+| `.opencode/`, `opencode.json` | OpenCode's agent files and settings. |
+<!-- end OPENCODE -->
+| `tmp/` | The only place for temporary files. Git ignores everything in it except `.gitkeep`. |
+
+## Building, testing and checks
+
+`scripts/check.sh` runs every check that must pass before a piece of work is done:
+formatting, linting, complexity, tests, and the licenses of dependencies. CI runs the same
+script on every push and pull request.
+<!-- if RUST -->
+
+### Rust
+
+```sh
+cargo build
+cargo test
+cargo fmt --check
+cargo clippy --all-targets -- -D warnings
+cargo clippy --all-targets -- -W clippy::cognitive_complexity -W clippy::too_many_lines
+cargo deny check licenses
+```
+
+`rust-toolchain.toml` pins the toolchain.
+<!-- end RUST -->
+<!-- if JAVA -->
+
+### Java
+
+```sh
+./mvnw verify                                  # tests, formatting, PMD and license checks
+./mvnw spotless:apply                          # format the code
+./mvnw com.mycila:license-maven-plugin:format  # add missing license headers
+```
+
+`pom.xml` sets the Java version: the newest stable JDK when the project was set up, without
+preview features. `.sdkmanrc`, if the project has one, pins the JDK (`sdk env install`).
+<!-- end JAVA -->
+<!-- if HASKELL -->
+
+### Haskell
+
+```sh
+cabal build all
+cabal test all
+ormolu --no-cabal --mode inplace $(find app src test -name '*.hs')
+```
+
+`cabal.project` pins GHC with `with-compiler`: the newest stable release when the project
+was set up. `cabal.project.freeze` pins the dependencies (`cabal freeze`).
+<!-- end HASKELL -->
+<!-- if FRONTEND -->
+
+### Frontend
+
+```sh
+npm --prefix {{FRONTEND_DIR}} install
+npm --prefix {{FRONTEND_DIR}} run dev
+npm --prefix {{FRONTEND_DIR}} run build
+(cd {{FRONTEND_DIR}} && npx oxfmt)                 # format the code
+```
+
+`.nvmrc` and `engines` in `package.json` pin Node. `scripts/check.sh` also runs Oxfmt,
+Oxlint, the type check, Vitest, Playwright and `licensee`. Browser tests go in `e2e/`, and
+unit tests next to the code in `src/`.
+<!-- if ASTRO -->
+`tsc --noEmit --runExternalCode` checks `.astro` files through
+`@astrojs/ts-content-mapper`. `astro check` isn't used, because it refuses TypeScript 7.
+<!-- end ASTRO -->
+<!-- end FRONTEND -->
+<!-- if PAGES -->
+
+## Deployment
+
+`.github/workflows/pages.yml` deploys the frontend to GitHub Pages. `ci.yml` calls it on
+`{{MAIN_BRANCH}}` once the checks have passed. To deploy again by hand, run `ci.yml` on
+`{{MAIN_BRANCH}}`.
+<!-- end PAGES -->
+<!-- if CLOUDFLARE -->
+
+## Deployment
+
+`.github/workflows/cloudflare.yml` deploys the frontend to Cloudflare Workers, with the
+repository secrets `CLOUDFLARE_API_TOKEN` and `CLOUDFLARE_ACCOUNT_ID`. `ci.yml` calls it on
+`{{MAIN_BRANCH}}` once the checks have passed. To deploy again by hand, run `ci.yml` on
+`{{MAIN_BRANCH}}`. On the free plan, requests for static assets are free and
+unlimited, and server code gets 100,000 requests a day and 10 ms of CPU per request.
+<!-- if VINEXT -->
+On Cloudflare, the app runs on vinext, a reimplementation of Next.js on Vite that is still
+in beta, so `npm run dev:vinext` and `npm run build:vinext` show what runs there.
+<!-- end VINEXT -->
+<!-- end CLOUDFLARE -->
+
+## Temporary files
+
+Temporary files go in `tmp/` only. The scripts set `TMPDIR` and `GIT_CEILING_DIRECTORIES`
+to it for themselves.<!-- if CLAUDE_CODE --> `.claude/settings.local.json` sets them for
+every command Claude Code runs.<!-- end CLAUDE_CODE --> For other commands, set them
+yourself, from the repository's root:
+
+```sh
+export TMPDIR="$PWD/tmp" GIT_CEILING_DIRECTORIES="$PWD/tmp"
+```
+
+- Most tools put their temporary files in `TMPDIR`. macOS `mktemp -d` ignores it, so give
+  it a template: `mktemp -d "$PWD/tmp/name.XXXXXX"`.
+- `GIT_CEILING_DIRECTORIES` stops git, in a folder under `tmp/`, from walking up into this
+  repository. Tests that create git repositories there need it.
+- Node keeps a compile cache in `TMPDIR`, at `tmp/node-compile-cache`.
+
+## Commits, versions and releases
+
+Commit messages follow Conventional Commits (https://www.conventionalcommits.org/en/v1.0.0/):
+`feat:` for a feature, `fix:` for a fix, and a `!` or a `BREAKING CHANGE:` footer for a
+breaking change. Versions follow Semantic Versioning. `CHANGELOG.md` has an Unreleased
+section, which each iteration fills in, and the release script turns into the new
+version's section.
+
+Make a release only when I ask for one.
+
+```sh
+scripts/release.sh --dry-run X.Y.Z   # show what releasing would do
+scripts/release.sh X.Y.Z             # release to GitHub: version, changelog, tag and GitHub release
+<!-- if PUBLISH -->
+scripts/publish.sh --dry-run         # show what publishing would do
+scripts/publish.sh                   # publish the release to {{PUBLISH_TARGETS}}
+<!-- end PUBLISH -->
+scripts/rollback.sh X.Y.Z            # undo a GitHub release that nothing has published yet
+```
+<!-- if PUBLISH -->
+
+Publishing to a registry can't be undone.
+<!-- end PUBLISH -->
+
+## Licensing
+
+The project is under the {{LICENSE}} license (`LICENSE`). Each new source file starts with an
+`SPDX-License-Identifier: {{LICENSE}}` comment.<!-- if JAVA --> Mycila's Maven plugin checks
+this for Java.<!-- end JAVA --> Code or assets from others keep their own license, and so does
+the SPDX line in their files. `NOTICE` lists them, starting from `docs/templates/NOTICE` the
+first time the project includes some.
+
+## Issues and security reports
+
+People open issues through the forms in `.github/ISSUE_TEMPLATE/`: a bug report, an
+improvement, a feature request and a documentation problem. Keep the forms' lists in step
+with the code.
+
+Security problems never go into a GitHub issue. `.github/SECURITY.md` asks people to
+report them privately<!-- if PUBLIC -->, through GitHub's private vulnerability
+reporting<!-- end PUBLIC -->. The same goes for us: tell me about a vulnerability you find, and we decide together how to track and fix
+it.<!-- if PUBLIC --> The repository is public, so never write its details in an issue, a
+pull request, a commit message, the backlog, the docs or the website.<!-- end PUBLIC -->
+
+## Strict rules for you and all subagents
+
+- You must never commit or push to git or GitHub without my explicit permission. All
+  other git commands are allowed when you need them to solve a task.<!-- if AGENT_TOOL -->
+  The agent tools' settings ask before `git commit`, `git push` and the release scripts, but
+  they match the command's text, so they aren't a guarantee.<!-- end AGENT_TOOL -->
+- The source code is always the truth: never make a claim without verifying it in the
+  code. For every claim, say whether you ran it (the program and its output), read it in
+  the code (`file:line`), or recall it. A recollection must be verified again against the
+  source code.
+- You are not allowed to create temporary files in the system temp folders, such as
+  `/private/tmp/`, or the `/var/folders/…/T/` folder that macOS sets as `TMPDIR`. Only use
+  the `tmp/` folder in this repository, as "Temporary files" describes. Don't let
+  temporary files pile up in `tmp/`: delete them and tidy up after each iteration of work.
+- Follow the principles of Domain-Driven Design, and always package by feature.
+- Always write unit tests, and verify as many combinations of inputs and branches as
+  possible. Test as many edge cases as possible. Tests are never an afterthought: they
+  guide the design, development, build and deployment.
+- You are not allowed to take shortcuts to finish a task faster. When you are unsure
+  whether something is correct, research the codebase more deeply, with simulations and
+  verifications.
+- Code quality, good architecture, correctness, and a well thought-through domain and
+  packaging are of the utmost importance. Whenever you find bugs or possible improvements,
+  add them as items to the backlog.
+- Put special focus on code quality and code complexity, by running the measurements in
+  `scripts/check.sh`.
+- Put special focus on readability. Code should describe itself as far as possible,
+  without comments on individual lines.
+- Choose a functional style of coding over an imperative one. In critical areas of the
+  application and its core, imperative code is allowed when it makes the code faster.
+- Strictly follow the Clean Code principles: small functions that each do one thing, and
+  modules and types (classes) with one responsibility. Make sure functions and types have
+  high cohesion and low coupling, and refactor wherever you can to increase cohesion,
+  lower coupling and reduce complexity.
+- After every iteration or unit of work, ask an independent review agent for a code
+  review. After the review, verify the findings and fix everything you can.
+
+## 1.0 Your role
+
+You are the lead developer and coordinator of this project. You implement and build the
+application, and you can delegate work to independent agents, and ask them for feedback
+and input. They have no history of our chat, our context or your memories. You must make
+sure every claim is verified with tests, probes and data taken directly from the sources,
+or from any external tool or dependency. You follow the work process in section 2.0.
+
+## 1.1 Your agent team
+
+The agents' briefs are in `docs/agents/`. Each agent starts without our conversation, so
+give it what it needs in the prompt. If your tool has subagents and is set up for this
+project, ask for the agent by name. Otherwise, start a fresh session with the brief as its
+prompt, or have a person follow the brief, so the review stays independent.
+
+- `application-architect`: a technical architect with strong skills in modeling, designing
+  and evaluating application architectures. Highly experienced in Domain-Driven Design
+  (DDD), bounded contexts and many architectural styles, such as hexagonal, microservices,
+  kernel and layered architectures. It also suggests how to restructure and refactor the
+  codebase to reduce complexity and technical debt, and to simplify it, following DDD,
+  Clean Code, Clean Architecture and the testing pyramid. An expert in designing fast,
+  memory-efficient, secure and scalable solutions, with GDPR and privacy built in from the
+  start. Strong knowledge of the C4 model in Mermaid and Mermaid C4 (supported in
+  Markdown), and in D2 with its C4 shapes.
+- `security-architect`: responsible for risk assessment, risk mitigation, threat
+  modelling, and documenting how security standards are met. It advises you and the other
+  agents on how to stop misuse, exploits and attacks<!-- if AI_APP -->, with and without
+  the language model {{PROJECT_NAME}} is connected to<!-- end AI_APP -->. It also analyzes
+  the whole codebase, with a special focus on the application core. An expert in the
+  languages of this project and their ecosystems, and in operating systems<!-- if AI_APP -->,
+  and in the design of secure AI-driven applications<!-- end AI_APP -->. Strong skills in
+  tracing, logging, access management and privacy by design. An expert in suggesting and
+  implementing security guardrails in the app<!-- if AI_APP -->, and in the interface
+  between the app and the language model<!-- end AI_APP -->.
+<!-- if FRONTEND -->
+- `lead-frontend-developer`: a deep expert in modern frontend development. Highly skilled
+  in TypeScript, React, CSS, semantic HTML, responsive design, accessibility and testing,
+  in Astro, Next.js and Tailwind CSS, and in Node and its ecosystem. Its main
+  responsibility is reviewing your frontend implementation.<!-- if ASTRO --> For Astro, it
+  checks the Astro docs, through their MCP server when it has it.<!-- end ASTRO --><!-- if DESIGN_SKILL -->
+  It must understand and use the `{{DESIGN_SKILL}}` skill.<!-- end DESIGN_SKILL -->
+- `product-ux-designer`: an expert UX designer with strong skills in high-quality, premium
+  product design. An expert in highly accessible, user-friendly products, and in
+  high-quality aesthetics, layouts, color combinations, visual elements and geometric
+  forms. Responsible for reviewing the frontend's design and suggesting design
+  updates.<!-- if DESIGN_SKILL --> It must use the `{{DESIGN_SKILL}}` skill.<!-- end DESIGN_SKILL -->
+<!-- end FRONTEND -->
+
+## 2.0 Overall work process
+
+Our work is organized in iterations, following `docs/planning/ROADMAP.md`. An iteration
+holds one or more items from the backlog. After an iteration (section 2.1) is completed,
+we run these stages:
+
+1. Update the documentation and the Unreleased section of `CHANGELOG.md`.
+2. Make the release.
+3. Tidy up the backlog and the roadmap.
+4. Prepare for the next iteration. At this point you pause, and wait for my signal to
+   continue.
+
+`ROADMAP.md` follows `docs/templates/roadmap.md`.
+
+## 2.1 Iterations
+
+Before an iteration starts, we agree which items from the backlog to include. Iterations
+are numbered `iteration-NNN`, where NNN is an incremental number, and each one has a
+document at `docs/iterations/NNN/iteration-NNN.md`. Keep the document purposely concise,
+with a list of the items included.
+
+Start each one from `docs/templates/iteration.md`.
+
+An iteration is DONE when all its items are built, tested, reviewed, documented and
+verified.
+
+## 2.2 Project backlog
+
+The backlog is `docs/planning/backlog/BACKLOG.md`, our index and database of items. Each
+item is one unit of work, with an optional list of subtasks, and is marked OPEN,
+IN_PROGRESS, DONE, BLOCKED or PARKED. The roadmap's items use the same statuses.
+
+Each item is a Markdown document in `docs/planning/backlog/items/`, named
+`{NNNN}-{title}.md`, where NNNN is an incremental identifier that never changes.
+`BACKLOG.md` is only the index and overview. When we tidy up and groom the backlog, or
+reprioritize items, you update the Priority field in each item's metadata table (section
+2.2.1).
+
+An item marked DONE is never reopened. When bugs, updates or refactoring touch code that
+an item delivered, we open new items in the backlog, and add references to the relevant
+older items in their metadata tables.
+
+### 2.2.1 Backlog item template
+
+Start each item from `docs/templates/backlog-item.md`.
+
+## 2.3 Our work process
+
+### 2.3.1 When ROADMAP.md is empty or all its items are DONE
+
+1. We brainstorm ideas.
+2. We agree which of the ideas go into `ROADMAP.md`, as the project's strategy, vision
+   and goals.
+
+### 2.3.2 When BACKLOG.md is empty or all its items are DONE
+
+1. We agree which of the open ideas in the roadmap to build.
+2. We create backlog items and index them in `BACKLOG.md`. Each item is created from the
+   template in section 2.2.1, with its first tasks.
+3. Later, when an iteration starts, each item's task list is revisited, verified and
+   updated.
+
+### 2.3.3 When BACKLOG.md has open items
+
+1. Suggest a group of backlog items that are not DONE, BLOCKED or PARKED for the next
+   iteration. This starts a new iteration.
+2. Design a solution. Analyse the source code, and identify the significant
+   requirements, and the possible solutions and their trade-offs when there is more than
+   one. Consider an external library or framework only when the language's standard
+   library can't provide what the implementation needs.
+3. Save the design at `docs/architecture/design/iteration-NNN/{title}.md`, from the
+   template in section 2.4.1.
+4. A design document can reference other design documents. Keep it concise and brief,
+   without long paragraphs or unnecessary detail. It may contain Mermaid diagrams,
+   including Mermaid C4 models, but only where they are needed.
+5. Check the design document against the writing rules in section 2.5, then ask
+   `application-architect` for a design review.
+6. Wait for the review, verify what it found, and make the necessary updates to the
+   design document.
+7. Add your questions to me about the design, if you have any, to the design document.
+8. Present the design and your questions to me, and wait for my input. From my feedback,
+   update the design's solution, decisions and log, and record each decision that will
+   outlive the iteration as an ADR (section 2.4.2). Make sure the task lists match the
+   updated design, the review and my input. Then wait for my signal to continue.
+9. Implement, test and build all the tasks in the iteration's items. Work directly on the
+   main branch (`{{MAIN_BRANCH}}`) unless we agree otherwise.
+10. When all the items of the iteration are done, ask `application-architect` and
+    `security-architect` for a code review.<!-- if FRONTEND --> Only if the frontend
+    changed, also ask `lead-frontend-developer` to review the frontend code (the changes
+    in `{{FRONTEND_DIR}}/`), and `product-ux-designer` to review the design.<!-- end FRONTEND -->
+11. Wait for all the reviews to finish, then read all the feedback. Fix everything you can
+    right away, and make new backlog items for issues that need more analysis or a new
+    design review.
+12. When all the issues from the reviews are fixed, show me the items you created, if
+    any, and wait for my input. We decide on and prioritize the new items, and consider
+    whether to fix them now or plan them for another iteration. Fixes made at this point
+    are code reviewed too (steps 9 to 12).
+13. Finally, when everything is implemented, we tidy up, remove temporary files, and make
+    a new release.
+
+### 2.3.4 Backlog grooming
+
+1. After each iteration, we update the roadmap and the backlog. We update the statuses,
+   and reprioritize where what we have learned calls for it.
+
+## 2.4 Architecture and security documents
+
+### 2.4.1 Design documents
+
+Save each design document at `docs/architecture/design/iteration-NNN/{title}.md`, starting
+from `docs/templates/design-document.md`.
+
+### 2.4.2 Architecture decision records
+
+Save each decision at `docs/architecture/decisions/NNNN-{title}.md`, where NNNN counts up
+and never changes. Once a decision is accepted, its text is never edited. A new decision
+supersedes it, and only its status changes.
+
+Start each one from `docs/templates/decision-record.md`.
+
+### 2.4.3 Security documents
+
+`security-architect` keeps `docs/security/threat-model.md` and `docs/security/standards.md`
+current. The setup writes both with the sections to fill in.<!-- if PUBLIC --> They are public, so
+they describe threats and mitigations, never an unfixed vulnerability.<!-- end PUBLIC -->
+
+## 2.5 Writing
+
+These rules apply to documents, logs, commit messages and pull requests:
+
+- Say the thing directly. Don't set it up with a contrast ("not X but Y"), an announcement
+  that a point is coming, or a closing line that repeats it.
+- Make every sentence add something the reader doesn't have yet. Keep every fact, and never
+  invent one.
+- Use plain words, without inflated claims, filler or sales language.
+- Use commas, colons and periods, not em or en dashes.
+- Use sentence-case headings, and no bold labels at the start of list items.

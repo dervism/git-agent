@@ -1,0 +1,5 @@
+prefix_rule(pattern = ["git", "commit"], decision = "prompt", justification = "Commits need the owner's permission")
+prefix_rule(pattern = ["git", "push"], decision = "prompt", justification = "Pushes need the owner's permission")
+prefix_rule(pattern = ["scripts/release.sh"], decision = "prompt", justification = "Releases need the owner's permission")
+prefix_rule(pattern = ["scripts/publish.sh"], decision = "prompt", justification = "Publishing needs the owner's permission")
+prefix_rule(pattern = ["scripts/rollback.sh"], decision = "prompt", justification = "Rollbacks need the owner's permission")

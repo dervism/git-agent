@@ -1,0 +1,61 @@
+# Temporary files: only the folder is tracked
+/tmp/*
+!/tmp/.gitkeep
+<!-- if CLAUDE_CODE -->
+
+# Claude Code settings for this machine only
+.claude/settings.local.json
+<!-- end CLAUDE_CODE -->
+
+# Secrets and local environment
+.env
+.env.*
+*.pem
+*.key
+
+# Editors and operating systems
+.idea/
+*.iml
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db
+<!-- if RUST -->
+
+# Rust
+/target
+<!-- end RUST -->
+<!-- if JAVA -->
+
+# Java and Maven
+target/
+<!-- end JAVA -->
+<!-- if HASKELL -->
+
+# Haskell and cabal
+dist-newstyle/
+<!-- end HASKELL -->
+<!-- if FRONTEND -->
+
+# Frontend
+node_modules/
+dist/
+test-results/
+playwright-report/
+<!-- end FRONTEND -->
+<!-- if CLOUDFLARE -->
+.wrangler/
+.dev.vars
+<!-- end CLOUDFLARE -->
+<!-- if VINEXT -->
+.vinext/
+.cloudflare/
+<!-- end VINEXT -->
+<!-- if ASTRO -->
+.astro/
+<!-- end ASTRO -->
+<!-- if NEXTJS -->
+.next/
+out/
+next-env.d.ts
+<!-- end NEXTJS -->

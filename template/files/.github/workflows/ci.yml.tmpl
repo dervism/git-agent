@@ -1,0 +1,79 @@
+name: CI
+
+on:
+  push:
+    branches: [{{MAIN_BRANCH}}]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@{{CHECKOUT_PIN}}
+<!-- if RUST -->
+      - uses: taiki-e/install-action@{{INSTALL_ACTION_PIN}}
+        with:
+          tool: cargo-deny
+<!-- end RUST -->
+<!-- if JAVA -->
+      - uses: actions/setup-java@{{SETUP_JAVA_PIN}}
+        with:
+          distribution: temurin
+          java-version: "{{JDK_VERSION}}"
+          cache: maven
+<!-- end JAVA -->
+<!-- if HASKELL -->
+      - id: setup
+        uses: haskell-actions/setup@{{HASKELL_SETUP_PIN}}
+        with:
+          ghc-version: "{{GHC_VERSION}}"
+          cabal-version: "{{CABAL_VERSION}}"
+      - uses: actions/cache@{{CACHE_PIN}}
+        with:
+          path: ${{ steps.setup.outputs.cabal-store }}
+          key: ${{ runner.os }}-ghc-${{ steps.setup.outputs.ghc-version }}
+      - run: |
+          cabal update
+          cabal install ormolu --installdir="$HOME/.local/bin" --overwrite-policy=always
+          cabal install cabal-plan -fexe -flicense-report --installdir="$HOME/.local/bin" --overwrite-policy=always
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+<!-- end HASKELL -->
+<!-- if FRONTEND -->
+      - uses: actions/setup-node@{{SETUP_NODE_PIN}}
+        with:
+          node-version-file: {{FRONTEND_DIR}}/.nvmrc
+          cache: npm
+          cache-dependency-path: {{FRONTEND_DIR}}/package-lock.json
+      - run: |
+          npm ci
+          npx playwright install --with-deps chromium
+        working-directory: {{FRONTEND_DIR}}
+<!-- end FRONTEND -->
+      - run: scripts/check.sh
+<!-- if PAGES -->
+
+  deploy:
+    needs: check
+    if: github.ref == 'refs/heads/{{MAIN_BRANCH}}'
+    uses: ./.github/workflows/pages.yml
+    concurrency: deploy
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+<!-- end PAGES -->
+<!-- if CLOUDFLARE -->
+
+  deploy:
+    needs: check
+    if: github.ref == 'refs/heads/{{MAIN_BRANCH}}'
+    uses: ./.github/workflows/cloudflare.yml
+    concurrency: deploy
+    secrets:
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+<!-- end CLOUDFLARE -->

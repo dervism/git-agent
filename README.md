@@ -682,7 +682,9 @@ GIT_AGENT_BASE_URL=http://localhost:11434/v1 git agent -m llama3.2   # Ollama
 
 Contributions are welcome! Open an [issue](https://github.com/dervism/git-agent/issues)
 for bugs and feature ideas, or send a pull request. For larger changes, please open an
-issue first so we can discuss the approach.
+issue first so we can discuss the approach. Please report security vulnerabilities
+privately rather than in an issue, as the
+[security policy](https://github.com/dervism/git-agent/security/policy) describes.
 
 ### Before you send a pull request
 

@@ -1,0 +1,43 @@
+name: Documentation or website
+description: Something in the README, on the website, or in the --help text is wrong, unclear or missing.
+labels: ["documentation"]
+body:
+  - type: dropdown
+    id: where
+    attributes:
+      label: Where
+      options:
+        - The README, or the docs page on the website
+        - The website's home page
+        - The --help text of a command
+        - Somewhere else
+    validations:
+      required: true
+  - type: input
+    id: location
+    attributes:
+      label: Link or section
+      placeholder: https://dervism.github.io/git-agent/docs/, the section "Configuration"
+  - type: textarea
+    id: problem
+    attributes:
+      label: What's wrong or missing
+    validations:
+      required: true
+  - type: textarea
+    id: suggestion
+    attributes:
+      label: Suggested wording or fix
+  - type: input
+    id: browser
+    attributes:
+      label: Browser and device
+      description: For a problem with how the website looks or works.
+      placeholder: Safari 26 on an iPhone 16
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Before you submit
+      options:
+        - label: I searched the existing issues, and this isn't reported yet.
+          required: true

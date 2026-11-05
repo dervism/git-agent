@@ -5,9 +5,9 @@ Because git runs git-agent as `git agent`, new features fit in as subcommands su
 the small context windows of local models, and it lets the features reuse what
 git-agent already has: model servers, diff shortening and the review menu.
 
-## Features inspired by IntelliJ
+## 1. Features inspired by IntelliJ
 
-### `git agent split` (DONE)
+### `git agent split` DONE
 
 Splits one large change into several logical commits. The model groups the changed
 files or hunks by purpose and proposes a set of commits, and each commit message goes
@@ -17,13 +17,13 @@ fit: commit in smaller parts. The plan can be edited, regenerated or revised wit
 feedback before any commit is made, and each commit is built in a temporary index,
 so stopping halfway leaves the rest of the changes as they were.
 
-### `git agent review`
+### `git agent review` OPEN
 
 Reviews staged changes before they are committed, like IntelliJ's before-commit
 analysis. It looks for leftover debug output, commented-out code, new TODOs and likely
 bugs. It could also be a key in the existing review menu.
 
-### `git agent resolve`
+### `git agent resolve` OPEN
 
 Helps with conflicts. Changes in a conflicted file that don't overlap are merged
 without the model, as IntelliJ's merge tool does. For the real conflicts it shows both
@@ -31,20 +31,20 @@ sides and a proposed resolution, which can be accepted, edited or skipped. Today
 git-agent cancels the rebase when a push runs into a conflict, and this would give
 that case a next step.
 
-### `git agent why src/fit.rs:120` (DONE)
+### `git agent why src/fit.rs:120` DONE
 
 Explains why a line is the way it is, from blame and the commits and diffs that
 touched it. It is IntelliJ's Annotate, with the model reading the history. It also
 takes a range of lines or a function, follows the lines through renames, and answers
 follow-up questions.
 
-### `git agent explain <commit or range>` (DONE)
+### `git agent explain <commit or range>` DONE
 
 Summarizes a commit, a branch, or everything that arrived with the last pull. A merge
 is explained through the commits it merged, and after a pull with rebase, the
 branch's own rebased commits are left out, so only what arrived is described.
 
-### Checking untracked files (DONE)
+### Checking untracked files DONE
 
 IntelliJ asks before it adds new files to version control. With `--all`, git-agent
 now warns about build output, `.env` files, private keys and large binaries, and
@@ -52,9 +52,9 @@ offers to add them to `.gitignore`. This needs no model. Build directories with
 common names only count when the file that marks their project is next to them, and
 when git-agent can't ask, it leaves the files out of the commit.
 
-## Git workflows people do by hand
+## 2. Git workflows people do by hand
 
-### `git agent pr` (DONE)
+### `git agent pr` DONE
 
 Writes a pull request title and description from the branch's commits and its diff
 against the base branch, and runs `gh pr create` once they are reviewed. Opening a
@@ -62,14 +62,14 @@ pull request is usually the step after a push, which git-agent already does. If 
 lacks some of the branch's commits, they are pushed first, and the review can create
 the pull request as a draft.
 
-### `git agent branch "fix login timeout"` (DONE)
+### `git agent branch "fix login timeout"` DONE
 
 Creates a branch named after a description, here `fix/login-timeout`, or after an
 issue number looked up with `gh`. Without a description, it names the branch after the
 uncommitted changes, which come along to it. Names follow the pattern of the
 repository's existing branches.
 
-### `git agent tidy` (DONE)
+### `git agent tidy` DONE
 
 Cleans up commits before they are pushed. It rewords messages like "wip" and "fix
 typo", and folds fixups into the commits they fix. It only touches commits that aren't
@@ -77,23 +77,23 @@ on the remote yet, so git-agent still never force-pushes. The commits are rewrit
 a temporary worktree, and the branch only moves if the result ends with the same files
 as before.
 
-### `git agent undo` and `git agent rescue`
+### `git agent undo` and `git agent rescue` OPEN
 
 `undo` reverts the last commit but keeps the changes, like IntelliJ's Undo Commit, and
 refuses if the commit was pushed. `rescue` finds lost work in the reflog after a bad
 reset or rebase, describes each candidate in plain words, and restores the chosen one
 onto a new branch.
 
-### `git agent release`
+### `git agent release` OPEN
 
 Suggests the next version from the Conventional Commits since the last tag (feat means
 minor, fix means patch, a breaking change means major) and writes release notes. The
 version part needs no model. git-agent's own `scripts/release.sh` could use both: it
 takes the version as an argument and publishes GitHub's generated release notes.
 
-## Useful for every feature
+## 3. Useful for every feature
 
-### Checking for secrets before anything leaves the machine (DONE)
+### Checking for secrets before anything leaves the machine DONE
 
 Scans what git-agent sends to the model for API keys, tokens, private keys and
 passwords, and replaces each one with `[REDACTED]`. That covers the diff and, for pull
@@ -103,8 +103,21 @@ add a secret to the repository, and the `on_secrets` setting can make it only wa
 This matters more with each new feature that sends more data, such as pull request
 descriptions, reviews or a branch's history.
 
-### A `prepare-commit-msg` hook (PARKED)
+### A `prepare-commit-msg` hook PARKED
 
 `git agent hook install` installs a hook that fills in the message for commits made
 from any editor or git GUI. That covers the lightweight code editors git-agent is
 meant to work with, without opening a terminal. Not a priority for now.
+
+## 4. Setting up new projects
+
+### `git agent project init` OPEN
+
+Sets up a new repository for working with coding agents. It scaffolds the source for
+its stack: Rust, Java with Maven, Haskell with cabal, or a frontend with Astro or
+Next.js. It also adds an `AGENTS.md` with a team of review agents, the documents for
+the roadmap, the backlog and iterations, issue forms, a security policy, licensing,
+CI, and scripts for releasing and publishing. Most of the setup is scripted from
+templates, and a model is only needed for the parts that depend on what the project is
+about. `template/PROMPT_TEMPLATE.md` describes the setup, and lists the questions its
+design still has to answer. `template/files/` holds the files it writes.

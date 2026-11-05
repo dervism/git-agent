@@ -1,0 +1,24 @@
+// @ts-check
+// SPDX-License-Identifier: {{LICENSE}}
+import { defineConfig } from "astro/config";
+import react from "@astrojs/react";
+import tailwindcss from "@tailwindcss/vite";
+<!-- if CLOUDFLARE_SERVER -->
+import cloudflare from "@astrojs/cloudflare";
+<!-- end CLOUDFLARE_SERVER -->
+
+export default defineConfig({
+<!-- if PAGES -->
+  site: "https://{{REPOSITORY_OWNER}}.github.io",
+<!-- end PAGES -->
+<!-- if PAGES_BASE -->
+  base: "/{{REPOSITORY_NAME}}",
+<!-- end PAGES_BASE -->
+<!-- if CLOUDFLARE_SERVER -->
+  output: "server",
+  session: false,
+  adapter: cloudflare({ imageService: "compile" }),
+<!-- end CLOUDFLARE_SERVER -->
+  integrations: [react()],
+  vite: { plugins: [tailwindcss()] },
+});

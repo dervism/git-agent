@@ -1,0 +1,32 @@
+name: Improvement
+description: "Make something {{PROJECT_NAME}} already does work better."
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        For something {{PROJECT_NAME}} can't do at all yet, use the "Feature request" form.
+  - type: textarea
+    id: current
+    attributes:
+      label: What it does now
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: What it should do instead
+    validations:
+      required: true
+  - type: textarea
+    id: why
+    attributes:
+      label: Why it would be better
+      description: Who it helps, and when. A real case helps the most.
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Before you submit
+      options:
+        - label: I searched the existing issues, and this isn't suggested yet.
+          required: true

@@ -11,6 +11,11 @@
 /tmp/*
 !/tmp/.gitkeep
 
+# Private planning documents: kept on this machine, never pushed
+/docs/planning/
+/docs/iterations/
+/docs/architecture/design/
+
 # Local environment and secrets
 .env
 .env.*

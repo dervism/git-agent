@@ -379,7 +379,8 @@ export const quickStart: readonly Step[] = [
   },
   {
     name: 'Commit',
-    description: 'Stage your changes and let the model describe them. You review before anything is committed.',
+    description:
+      'Stage your changes and let the model describe them. It can be wrong, so read the message before you commit it.',
     command: 'git agent',
   },
 ]

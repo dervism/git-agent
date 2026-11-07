@@ -6,6 +6,8 @@ git-agent writes git commit messages for your changes with a language model, eit
 one running on your own machine (LM Studio, Ollama, llama.cpp, vLLM) or one from a
 cloud provider such as OpenAI, Anthropic or OpenRouter. You review each proposed
 message, then commit it, edit it, regenerate it, or tell the model what to change.
+Models make mistakes, so read each message before you commit it.
+[Mistakes and speed](#mistakes-and-speed) says what to expect.
 
 The same model also names new branches, splits a large change into several commits,
 tidies commits before you push them, and writes pull requests for GitHub. It can
@@ -222,11 +224,11 @@ whole files instead. Commits that only change documentation go last in a new pla
 
 7 parts in 2 commits
 ────────────────────────────────────────────────────────────────
-[a]ll commits  [c]ommit  [e]dit  [r]egenerate  [f]eedback  [q]uit  [?] ›
+[c]ommit  [a]ll commits  [e]dit  [r]egenerate  [f]eedback  [q]uit  [?] ›
 ```
 
-`a` makes all the commits without stopping at each message; you still see the messages
-as they are committed. `c` commits them one at a time, and you review each message.
+`c` commits them one at a time, and you review each message. `a` makes all the commits
+without stopping at each message; you still see the messages as they are committed.
 `e` opens the plan in your git editor, where each part has a numbered
 line under its commit; move a line to move the part to another commit. `r` asks for a
 new plan, and `f` tells the model what to change, such as
@@ -291,38 +293,9 @@ the flag, so a repository you clone can't choose one.
 
 ### Which model to use
 
-`--check` is what gets you commits that build, with any model. The model decides how good the
-messages are and how long you wait for them.
-
-We ran four local models in LM Studio on a 36 GB MacBook Pro, on two real changes of 34 and
-39 parts:
-
-| Model | Parameters | Size on disk | Median seconds per plan | Median seconds per message |
-| --- | --- | --- | --- | --- |
-| `gemma-4-e4b`, 5-bit | 4B | 7.4 GB | 49 | 3 |
-| `gemma-4-12b`, 8-bit | 12B | 12.7 GB | 279 | 80 |
-| `gpt-oss-20b`, 8-bit | 20B | 22.3 GB | 15 | 6 |
-| `qwen3.8-27b`, 6-bit | 27B | 22.8 GB | 666 | 460 |
-
-No model split reliably on its own. Without `--check`, 26 of the 76 commits from
-`gemma-4-e4b` and `gpt-oss-20b` built. With it, all 31 built, in all 12 runs. Larger models
-made fewer commits: `qwen3.8-27b` and two `gpt-oss-20b` runs put all of one change in a
-single commit.
-
-The messages differed more. `gemma-4-e4b` and `gpt-oss-20b` invented a change or a reason, or
-said the opposite of the diff, in 13 of 76 messages. `gemma-4-12b` and `qwen3.8-27b` did that
-in none of 13, a small sample: `gemma-4-12b` ran on only one of the two changes, and
-`qwen3.8-27b` wrote four messages.
-
-What we'd use, knowing these numbers only cover these models, changes and this machine:
-
-- Use `--check` with `split`, whatever the model.
-- If memory is what limits you, use `gemma-4-e4b`, at a third of the size of the two largest,
-  and review its messages.
-- With the memory for it, `gpt-oss-20b` is quicker overall: for three commits, the medians add
-  up to 33 seconds against 58.
-- If the messages matter and you can wait, use `gemma-4-12b`. Raise `timeout_secs`, because a
-  plan can take longer than the default 300 seconds: two of its six runs stopped there.
+No model we tried split a change reliably on its own, so use `--check`, whatever the model. The
+larger the change, the longer the plan takes and the more it can get wrong, so split a large
+change in pieces: stage part of it, run `git agent split` without `--all`, and then do the rest.
 
 ## Tidying commits before you push
 
@@ -535,6 +508,21 @@ which model is loaded and uses that one. If several models are loaded, or none i
 the server has more than one, git-agent asks you to pick one with `git agent config`
 or `--model`. `git agent models` lists the server's models and marks the one
 git-agent uses.
+
+### Mistakes and speed
+
+A model can write a message that describes a change that isn't in the diff, or gives a reason
+nobody stated, and such a message reads as well as a correct one. Read each message before you
+commit it. `--commit`, `a` at a split plan and `tidy --apply` skip that review.
+
+The models small enough to run on a laptop trade one problem for another. In our use, the fast
+ones make these mistakes often, and the ones that make fewer can take minutes to answer. Every
+model also gets slower as your changes grow, because it reads the whole prompt before it writes
+anything.
+
+- Commit small changes often. A small diff is quicker, and the model sees all of it.
+- With a slow model, raise `timeout_secs`. Its default of 300 seconds covers the whole reply.
+- With `git agent split`, use `--check`, so that each commit builds whatever the model planned.
 
 ### Cloud providers
 

@@ -61,7 +61,9 @@ pub struct Review<T: 'static> {
     pub what: &'static str,
     /// Help for editing, e.g. "edit the message in your editor".
     pub edit: &'static str,
-    /// Typed as their first letter or in full; "y" picks the first.
+    /// Typed as their first letter or in full. `y` and `yes` pick the first, so put the
+    /// plain acceptance first: it skips no later review and does nothing more, such as
+    /// pushing.
     pub accept: &'static [Choice<T>],
     /// Help for quitting, e.g. "quit without committing".
     pub quit: &'static str,
@@ -123,9 +125,9 @@ pub fn yellow(text: &str) -> String {
 /// `text` with everything unsafe escaped, so that text from a repository, a model or a
 /// server can't change the terminal. With `color`, the styles of [`paint`] stay: they
 /// can dim or color text, and can't hide it.
-fn for_terminal(text: &str, color: bool) -> String {
+fn for_terminal(text: &str, color: bool) -> Shown {
     if !color {
-        return safe_text::escaped(text);
+        return Shown(safe_text::escaped(text));
     }
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
@@ -135,7 +137,18 @@ fn for_terminal(text: &str, color: bool) -> String {
         rest = &rest[at + style.len()..];
     }
     out.push_str(&safe_text::escaped(rest));
-    out
+    Shown(out)
+}
+
+/// Text that [`for_terminal`] made safe, ready to be written. It isn't a `&str`, so it can't
+/// be passed on as text by mistake and made safe a second time, which would show the styles
+/// it kept as text.
+struct Shown(String);
+
+impl Display for Shown {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
 }
 
 /// Where the first of the [`STYLES`] in `text` starts, and which it is.
@@ -150,20 +163,30 @@ fn next_style(text: &str) -> Option<(usize, &'static str)> {
 
 /// The one way to stderr for everything the user reads there.
 fn to_stderr(line: &str) {
-    let _ = writeln!(io::stderr(), "{}", for_terminal(line, color_enabled()));
+    let _ = write_line(&mut io::stderr(), line, color_enabled());
 }
 
 /// Writes a line to stdout, after making it safe for the terminal.
 pub fn out(line: &str) {
-    raw_out(&for_terminal(line, color_enabled()));
+    to_stdout(line, color_enabled());
 }
 
 /// Writes text to stdout without styles, for what a pipeline reads: a model's cleaned
 /// reply, or the user's own settings. Those are safe already, so escaping changes nothing
 /// in them, and it keeps a new caller from printing what isn't.
-#[allow(clippy::print_stdout)]
 pub fn raw_out(text: &str) {
-    println!("{}", safe_text::escaped(text));
+    to_stdout(text, false);
+}
+
+/// The one way to stdout. Like `println!`, it panics when stdout has gone away.
+fn to_stdout(line: &str, color: bool) {
+    write_line(&mut io::stdout().lock(), line, color)
+        .unwrap_or_else(|err| panic!("failed printing to stdout: {err}"));
+}
+
+/// Writes `line` to `to` as [`for_terminal`] makes it, and ends the line.
+fn write_line(to: &mut impl Write, line: &str, color: bool) -> io::Result<()> {
+    writeln!(to, "{}", for_terminal(line, color))
 }
 
 /// Formats a number with thousands separators, e.g. 131,072.
@@ -333,8 +356,9 @@ pub fn ask_action<T: Copy>(review: &Review<T>) -> Result<Action<T>> {
     }
 }
 
-/// The value of the accept choice typed as `choice`.
-fn accepted<T: Copy>(review: &Review<T>, choice: &str) -> Option<T> {
+/// The value of the accept choice typed as `choice`, in lower case. `y` and `yes` pick the
+/// first (see [`Review::accept`]).
+pub fn accepted<T: Copy>(review: &Review<T>, choice: &str) -> Option<T> {
     if matches!(choice, "y" | "yes") {
         return review.accept.first().map(|first| first.value);
     }
@@ -481,21 +505,58 @@ fn strip_comments(text: &str) -> String {
     prompt::normalize(&kept.join("\n"))
 }
 
+/// What the tests of the reviews share.
+#[cfg(test)]
+pub mod test_support {
+    use super::Review;
+
+    /// The keys [`super::ask_action`] reads besides the accept choices: yes, no, edit,
+    /// regenerate, feedback, quit and help.
+    const TAKEN: [char; 7] = ['y', 'n', 'e', 'r', 'f', 'q', 'h'];
+
+    /// Checks that `review` has a choice for `y`, and that each accept choice can be typed
+    /// as its first letter: a lower-case ASCII letter that no other choice and no other key
+    /// uses.
+    pub fn assert_typable<T>(review: &Review<T>) {
+        assert!(!review.accept.is_empty(), "a review needs a choice for `y`");
+        let letters: Vec<char> = review
+            .accept
+            .iter()
+            .map(|choice| choice.word.chars().next().expect("a choice has a word"))
+            .collect();
+        for (choice, letter) in review.accept.iter().zip(&letters) {
+            let word = choice.word;
+            assert!(
+                letter.is_ascii_lowercase(),
+                "{word:?} starts with {letter:?}"
+            );
+            assert!(!TAKEN.contains(letter), "{word:?} takes the key {letter:?}");
+            let sharing = letters.iter().filter(|other| *other == letter).count();
+            assert_eq!(sharing, 1, "{word:?} shares the key {letter:?}");
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// What [`for_terminal`] makes of `text`.
+    fn shown(text: &str, color: bool) -> String {
+        for_terminal(text, color).to_string()
+    }
 
     #[test]
     fn keeps_only_the_styles_it_writes_itself() {
         for style in STYLES {
             let painted = format!("{style}text{RESET}");
-            assert_eq!(for_terminal(&painted, true), painted);
+            assert_eq!(shown(&painted, true), painted);
             assert_eq!(
-                for_terminal(&painted, false),
+                shown(&painted, false),
                 safe_text::escaped(&painted),
                 "without color, a style is only text"
             );
-            assert!(!for_terminal(&painted, false).contains('\x1b'));
+            assert!(!shown(&painted, false).contains('\x1b'));
         }
     }
 
@@ -512,7 +573,7 @@ mod tests {
                 ("over\rwrite", "over\\rwrite"),
                 ("rev\u{202e}x", "rev\\342\\200\\256x"),
             ] {
-                assert_eq!(for_terminal(text, color), wanted, "{text:?}");
+                assert_eq!(shown(text, color), wanted, "{text:?}");
             }
         }
     }
@@ -520,18 +581,51 @@ mod tests {
     #[test]
     fn handles_an_allowed_style_next_to_a_forbidden_sequence() {
         assert_eq!(
-            for_terminal("\x1b[1m\x1b[2Jbold\x1b[0m", true),
+            shown("\x1b[1m\x1b[2Jbold\x1b[0m", true),
             "\x1b[1m\\033[2Jbold\x1b[0m"
         );
         assert_eq!(
-            for_terminal("a\x1b[33mæøå\nb\x1b[0m\tc", true),
+            shown("a\x1b[33mæøå\nb\x1b[0m\tc", true),
             "a\x1b[33mæøå\nb\x1b[0m\tc"
         );
     }
 
     #[test]
-    fn keeps_line_breaks_tabs_and_letters() {
-        assert_eq!(for_terminal("æøå\nline\tfour", false), "æøå\nline\tfour");
+    fn keeps_text_that_is_safe_already_with_or_without_color() {
+        for color in [true, false] {
+            for text in [
+                "æøå\nline\tfour",
+                "feat: add a greeting\n\nSays hei 👋🏽, and \\033 as text.",
+                "",
+            ] {
+                assert_eq!(shown(text, color), text, "{text:?}");
+            }
+        }
+    }
+
+    /// What [`write_line`] writes for `line`.
+    fn written(line: &str, color: bool) -> String {
+        let mut to = Vec::new();
+        write_line(&mut to, line, color).expect("a Vec takes any write");
+        String::from_utf8(to).expect("for_terminal writes UTF-8")
+    }
+
+    #[test]
+    fn writes_its_own_styles_once_with_color() {
+        let rule = format!("{DIM}── Proposed commit message ──{RESET}");
+        assert_eq!(written(&rule, true), format!("{rule}\n"));
+        let row = format!("* fake  {DIM}loaded, 4,096 tokens of context{RESET}");
+        assert_eq!(written(&row, true), format!("{row}\n"));
+    }
+
+    #[test]
+    fn adds_one_line_end() {
+        for color in [true, false] {
+            assert_eq!(written("", color), "\n");
+            assert_eq!(written("one", color), "one\n");
+            assert_eq!(written("one\ntwo", color), "one\ntwo\n");
+            assert_eq!(written("one\n", color), "one\n\n");
+        }
     }
 
     #[test]
@@ -609,5 +703,70 @@ mod tests {
         let help = help(&REVIEW);
         assert!(help.starts_with("  c  create it\n  d  create a draft\n  e  edit the thing"));
         assert!(help.ends_with("  q  quit without creating it"));
+    }
+
+    /// [`REVIEW`] with `choices` to accept it.
+    fn review_of(choices: &'static [Choice<u8>]) -> Review<u8> {
+        Review {
+            accept: choices,
+            ..REVIEW
+        }
+    }
+
+    /// An accept choice that only has a word.
+    const fn choice(word: &'static str) -> Choice<u8> {
+        Choice {
+            word,
+            help: "",
+            value: 0,
+        }
+    }
+
+    #[test]
+    fn a_review_with_its_own_letters_is_typable() {
+        const SPLIT_PLAN: &[Choice<u8>] = &[choice("commit"), choice("all commits")];
+        test_support::assert_typable(&REVIEW);
+        test_support::assert_typable(&review_of(SPLIT_PLAN));
+    }
+
+    #[test]
+    #[should_panic(expected = "takes the key 'e'")]
+    fn a_choice_cant_take_the_key_of_edit() {
+        const CHOICES: &[Choice<u8>] = &[choice("export")];
+        test_support::assert_typable(&review_of(CHOICES));
+    }
+
+    #[test]
+    #[should_panic(expected = "takes the key 'y'")]
+    fn a_choice_cant_take_the_key_of_yes() {
+        const CHOICES: &[Choice<u8>] = &[choice("commit"), choice("yank")];
+        test_support::assert_typable(&review_of(CHOICES));
+    }
+
+    #[test]
+    #[should_panic(expected = "shares the key 'c'")]
+    fn two_choices_cant_share_a_key() {
+        const CHOICES: &[Choice<u8>] = &[choice("commit"), choice("create")];
+        test_support::assert_typable(&review_of(CHOICES));
+    }
+
+    #[test]
+    #[should_panic(expected = "starts with 'ä'")]
+    fn a_choice_starts_with_an_ascii_letter() {
+        const CHOICES: &[Choice<u8>] = &[choice("ändern")];
+        test_support::assert_typable(&review_of(CHOICES));
+    }
+
+    #[test]
+    #[should_panic(expected = "starts with 'C'")]
+    fn a_choice_starts_in_lower_case() {
+        const CHOICES: &[Choice<u8>] = &[choice("Commit")];
+        test_support::assert_typable(&review_of(CHOICES));
+    }
+
+    #[test]
+    #[should_panic(expected = "needs a choice for `y`")]
+    fn a_review_has_a_choice_for_yes() {
+        test_support::assert_typable(&review_of(&[]));
     }
 }

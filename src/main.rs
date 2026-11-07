@@ -1709,6 +1709,29 @@ mod tests {
     use models::ContextSource;
     use tempfile::TempDir;
 
+    #[test]
+    fn yes_picks_the_plain_acceptance() {
+        for typed in ["y", "yes"] {
+            let push = ui::accepted(&COMMIT_REVIEW, typed);
+            assert_eq!(push, Some(false), "{typed:?} commits without pushing");
+            let draft = ui::accepted(&PULL_REQUEST_REVIEW, typed);
+            assert_eq!(draft, Some(false), "{typed:?} creates no draft");
+            assert_eq!(ui::accepted(&TIDY_REVIEW, typed), Some(()), "{typed:?}");
+            let new_message = ui::accepted(&TIDY_MESSAGE_REVIEW, typed);
+            assert_eq!(new_message, Some(true), "{typed:?} uses the new message");
+            assert_eq!(ui::accepted(&BRANCH_REVIEW, typed), Some(()), "{typed:?}");
+        }
+    }
+
+    #[test]
+    fn every_review_can_be_typed() {
+        ui::test_support::assert_typable(&COMMIT_REVIEW);
+        ui::test_support::assert_typable(&PULL_REQUEST_REVIEW);
+        ui::test_support::assert_typable(&TIDY_REVIEW);
+        ui::test_support::assert_typable(&TIDY_MESSAGE_REVIEW);
+        ui::test_support::assert_typable(&BRANCH_REVIEW);
+    }
+
     fn model(context_length: usize) -> Model {
         Model {
             id: "fake".to_owned(),

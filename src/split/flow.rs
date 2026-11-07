@@ -23,7 +23,8 @@ use std::fs;
 use std::io::{self, IsTerminal};
 use std::time::Duration;
 
-/// Accepting the plan of a split: the value says whether to review each message.
+/// Accepting the plan of a split: the value says whether to review each message. Reviewing
+/// comes first, since `y` picks the first choice.
 const PLAN_REVIEW: Review<bool> = Review {
     heading: "Proposed commits",
     first_line: "first line",
@@ -32,14 +33,14 @@ const PLAN_REVIEW: Review<bool> = Review {
     edit: "edit the plan in your editor",
     accept: &[
         Choice {
-            word: "all commits",
-            help: "make all the commits, without stopping to review their messages",
-            value: false,
-        },
-        Choice {
             word: "commit",
             help: "make the commits one at a time, reviewing each message",
             value: true,
+        },
+        Choice {
+            word: "all commits",
+            help: "make all the commits, without stopping to review their messages",
+            value: false,
         },
     ],
     quit: "quit without committing anything",
@@ -805,6 +806,42 @@ mod tests {
     use std::cell::RefCell;
     use std::path::Path;
     use tempfile::TempDir;
+
+    #[test]
+    fn yes_at_the_plan_keeps_the_review_of_each_message() {
+        for (typed, reviews_messages) in [
+            ("y", true),
+            ("yes", true),
+            ("c", true),
+            ("commit", true),
+            ("a", false),
+            ("all", false),
+            ("all commits", false),
+        ] {
+            assert_eq!(
+                ui::accepted(&PLAN_REVIEW, typed),
+                Some(reviews_messages),
+                "{typed:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn both_reviews_of_a_split_can_be_typed() {
+        ui::test_support::assert_typable(&PLAN_REVIEW);
+        ui::test_support::assert_typable(&SPLIT_COMMIT_REVIEW);
+    }
+
+    #[test]
+    fn yes_at_a_split_message_makes_the_commit() {
+        for (typed, commits) in [("y", true), ("yes", true), ("c", true), ("s", false)] {
+            assert_eq!(
+                ui::accepted(&SPLIT_COMMIT_REVIEW, typed),
+                Some(commits),
+                "{typed:?}"
+            );
+        }
+    }
 
     fn model() -> Model {
         Model {

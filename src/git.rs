@@ -4,8 +4,10 @@ pub mod lossless;
 pub mod names;
 pub mod worktree;
 
+use crate::safe_text::one_line;
 use anyhow::{Context, Result, anyhow, bail};
 use std::collections::HashSet;
+use std::ffi::OsString;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -112,6 +114,11 @@ const READABLE_NAMES: [&str; 2] = ["-c", "core.quotePath=false"];
 /// that isn't valid UTF-8 only survives that in git's ASCII quoting.
 const QUOTED_NAMES: [&str; 2] = ["-c", "core.quotePath=true"];
 
+/// Makes `git diff` and `git log` cover the whole work tree, and name paths from its
+/// top, whatever `diff.relative` says. Like [`READABLE_NAMES`], it's passed to each read
+/// and not to `git commit`, because `-c` values reach the user's hooks.
+const WHOLE_TREE: [&str; 2] = ["-c", "diff.relative=false"];
+
 pub struct Repo {
     /// Directory git commands run in.
     workdir: PathBuf,
@@ -146,6 +153,17 @@ impl Repo {
         let repo = Self::open(dir)?;
         let workdir = repo.toplevel()?;
         Ok(Self { workdir, ..repo })
+    }
+
+    /// The same repository with git running at the top of the work tree, where the paths
+    /// git reads mean the same as the paths it lists, whatever folder the user is in.
+    pub fn at_top(&self) -> Result<Repo> {
+        Ok(Repo {
+            workdir: self.toplevel()?,
+            index: self.index.clone(),
+            attributes: self.attributes.clone(),
+            hooks_off: self.hooks_off,
+        })
     }
 
     /// The same repository with the index file at `index`, so commits can be
@@ -244,14 +262,121 @@ impl Repo {
         Ok(output.stdout)
     }
 
+    /// Runs git for a `-z` list, whose names are in the form [`lossless`] describes, so
+    /// that they can reach git again unchanged.
+    fn nul_list(&self, args: &[&str]) -> Result<Vec<String>> {
+        Ok(self
+            .git_bytes(args)?
+            .split(|byte| *byte == 0)
+            .filter(|name| !name.is_empty())
+            .map(lossless::to_text)
+            .collect())
+    }
+
+    /// Runs a `git diff` for a `-z` list of names, as [`Repo::nul_list`] reads it. The
+    /// names are from the top of the work tree, and include those outside the current
+    /// folder, whatever `diff.relative` says.
+    fn diff_names(&self, args: &[&str]) -> Result<Vec<String>> {
+        self.nul_list(&[&WHOLE_TREE[..], args].concat())
+    }
+
+    /// Runs git with `input` on its standard input, failing with its stderr.
+    fn git_with_input(&self, args: &[&str], input: &[u8]) -> Result<()> {
+        self.git_with_input_and_output(args, input, &[0]).map(drop)
+    }
+
+    /// Runs git with `input` on its standard input and returns its stdout. An exit code
+    /// outside `success` fails with its stderr.
+    fn git_with_input_and_output(
+        &self,
+        args: &[&str],
+        input: &[u8],
+        success: &[i32],
+    ) -> Result<Vec<u8>> {
+        let mut child = self
+            .command(args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .context("failed to run git; is it installed?")?;
+        // A thread writes the input, so git can't block on a full stdout meanwhile.
+        let mut stdin = child.stdin.take().context("git has no input")?;
+        let input = input.to_vec();
+        let writer = std::thread::spawn(move || stdin.write_all(&input));
+        let output = child.wait_with_output().context("failed to wait for git")?;
+        let written = writer
+            .join()
+            .map_err(|_| anyhow::anyhow!("writing to git panicked"))?;
+        if !output
+            .status
+            .code()
+            .is_some_and(|code| success.contains(&code))
+        {
+            bail!(
+                "`git {}` failed: {}",
+                args.join(" "),
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+        written.context("failed to send git its input")?;
+        Ok(output.stdout)
+    }
+
+    /// Those of `paths` that git ignores, by every `.gitignore` and exclude file there is.
+    pub fn ignored(&self, paths: &[String]) -> Result<Vec<String>> {
+        if paths.is_empty() {
+            return Ok(Vec::new());
+        }
+        // check-ignore reads paths from the current folder, and these are from the top.
+        let output = self.at_top()?.git_with_input_and_output(
+            &["check-ignore", "-z", "--stdin"],
+            &nul_joined(paths),
+            &[0, 1],
+        )?;
+        Ok(output
+            .split(|byte| *byte == 0)
+            .filter(|name| !name.is_empty())
+            .map(lossless::to_text)
+            .collect())
+    }
+
+    /// The paths that are staged, also before the first commit.
+    pub fn staged_paths(&self) -> Result<Vec<String>> {
+        self.diff_names(&["diff", "--cached", "--name-only", "-z", "--no-renames"])
+    }
+
+    /// Takes new files out of the index again, leaving them in the work tree. Only for
+    /// files HEAD doesn't have: on a committed file, this would stage its deletion.
+    pub fn unstage_new_files(&self, paths: &[String]) -> Result<()> {
+        if paths.is_empty() {
+            return Ok(());
+        }
+        // `git rm` refuses a pathspec file outside the top of the work tree.
+        self.at_top()?.git_with_input(
+            &[
+                "rm",
+                "--cached",
+                // Only the index changes, so this can't lose work. Without it, git keeps an
+                // entry whose content differs from both the file and HEAD.
+                "--force",
+                "--quiet",
+                "--ignore-unmatch",
+                "--pathspec-from-file=-",
+                "--pathspec-file-nul",
+            ],
+            &top_literal_pathspecs(paths),
+        )
+    }
+
     /// Runs git like [`Repo::git`], for output that names files to people or models.
     fn git_readable(&self, args: &[&str]) -> Result<String> {
-        self.git(&[&READABLE_NAMES[..], args].concat())
+        self.git(&[&READABLE_NAMES[..], &WHOLE_TREE, args].concat())
     }
 
     fn has_diff(&self, args: &[&str]) -> Result<bool> {
         let output = self
-            .command(&["diff", "--quiet", "--no-ext-diff"])
+            .command(&[&WHOLE_TREE[..], &["diff", "--quiet", "--no-ext-diff"]].concat())
             .args(args)
             .output()
             .context("failed to run git; is it installed?")?;
@@ -272,17 +397,27 @@ impl Repo {
     /// Stages all changes like [`Repo::stage_all`], except what the `exclude`
     /// pathspecs name.
     pub fn stage_all_except(&self, exclude: &[String]) -> Result<()> {
-        let mut args = vec!["add", "--all", "--", ":/"];
-        args.extend(exclude.iter().map(String::as_str));
-        self.git(&args).map(drop)
+        let pathspecs: Vec<Vec<u8>> = std::iter::once(":/")
+            .chain(exclude.iter().map(String::as_str))
+            .map(lossless::to_bytes)
+            .collect();
+        self.git_with_input(
+            &[
+                "add",
+                "--all",
+                "--pathspec-from-file=-",
+                "--pathspec-file-nul",
+            ],
+            &pathspecs.join(&0),
+        )
     }
 
     /// The untracked files that no ignore rule covers, each file listed on its
     /// own and relative to the top of the work tree.
     pub fn untracked_files(&self) -> Result<Vec<String>> {
-        let status = self.git(&["status", "--porcelain", "-z", "--untracked-files=all"])?;
+        let status = self.nul_list(&["status", "--porcelain", "-z", "--untracked-files=all"])?;
         let mut files = Vec::new();
-        let mut entries = status.split('\0');
+        let mut entries = status.iter();
         while let Some(entry) = entries.next() {
             if let Some(path) = entry.strip_prefix("?? ") {
                 files.push(path.to_owned());
@@ -322,7 +457,7 @@ impl Repo {
     /// diff settings are. Bytes that aren't valid UTF-8 stay in it, in the form
     /// [`lossless`] describes, which [`Repo::apply_to_index`] takes.
     pub fn patch(&self, scope: Scope) -> Result<String> {
-        let mut args = QUOTED_NAMES.to_vec();
+        let mut args = [&QUOTED_NAMES[..], &WHOLE_TREE].concat();
         args.extend([
             "diff",
             "--no-color",
@@ -346,7 +481,11 @@ impl Repo {
     /// form [`names::of_diff`] gives. A renamed file is named by its new path.
     pub fn included_paths(&self, scope: Scope, exclude: &[String]) -> Result<HashSet<String>> {
         let excludes = exclude_pathspecs(exclude);
-        let mut args = vec!["diff", "--name-only", "--find-renames", "-z"];
+        let mut args = [
+            &WHOLE_TREE[..],
+            &["diff", "--name-only", "--find-renames", "-z"],
+        ]
+        .concat();
         if scope == Scope::Staged {
             args.push("--cached");
         }
@@ -356,7 +495,7 @@ impl Repo {
         Ok(names
             .split('\0')
             .filter(|name| !name.is_empty())
-            .map(names::printable)
+            .map(names::shown)
             .collect())
     }
 
@@ -378,9 +517,92 @@ impl Repo {
         }
     }
 
-    /// Whether the index holds conflicts that aren't resolved yet.
-    pub fn has_unmerged_paths(&self) -> Result<bool> {
-        Ok(!self.git(&["ls-files", "--unmerged"])?.trim().is_empty())
+    /// The files in the index with conflicts that aren't resolved yet.
+    pub fn unmerged_paths(&self) -> Result<Vec<String>> {
+        self.diff_names(&["diff", "--name-only", "--diff-filter=U", "-z"])
+    }
+
+    /// The paths that differ between two commits or trees, with both paths of a rename,
+    /// and submodules whatever their `ignore` setting says.
+    pub fn changed_between(&self, from: &str, to: &str) -> Result<Vec<String>> {
+        self.nul_list(&[
+            "diff-tree",
+            "-r",
+            "-z",
+            "--name-only",
+            "--no-renames",
+            "--no-commit-id",
+            "--ignore-submodules=none",
+            from,
+            to,
+        ])
+    }
+
+    /// The paths at which the index differs from `commit`.
+    pub fn staged_against(&self, commit: &str) -> Result<Vec<String>> {
+        self.diff_names(&[
+            "diff",
+            "--cached",
+            "--name-only",
+            "-z",
+            "--no-renames",
+            "--ignore-submodules=none",
+            commit,
+        ])
+    }
+
+    /// Sets `paths` in the index to what `commit` holds, leaving the rest of the index and
+    /// the work tree alone. No paths means nothing happens: `git reset` with an empty
+    /// list of paths would reset everything.
+    pub fn reset_paths(&self, commit: &str, paths: &[String]) -> Result<()> {
+        if paths.is_empty() {
+            return Ok(());
+        }
+        self.git_with_input(
+            &[
+                "reset",
+                "--quiet",
+                "--pathspec-from-file=-",
+                "--pathspec-file-nul",
+                commit,
+            ],
+            &top_literal_pathspecs(paths),
+        )
+    }
+
+    /// Staged submodule pointers that `git diff --cached` doesn't show, because of an
+    /// `ignore` setting. A plain `git commit` commits them all the same.
+    pub fn hidden_staged_pointers(&self) -> Result<Vec<String>> {
+        let all = self.diff_names(&[
+            "diff",
+            "--cached",
+            "--name-only",
+            "-z",
+            "--ignore-submodules=none",
+        ])?;
+        let shown = self.diff_names(&["diff", "--cached", "--name-only", "-z"])?;
+        Ok(all
+            .into_iter()
+            .filter(|path| !shown.contains(path))
+            .collect())
+    }
+
+    /// Moved submodule pointers in the work tree that `git commit --all` commits though
+    /// `git diff` doesn't show them. That's so for `submodule.<name>.ignore=all`, and not
+    /// for `diff.ignoreSubmodules=all`, under which `git commit --all` leaves them out.
+    pub fn hidden_changed_pointers(&self) -> Result<Vec<String>> {
+        let moved = self.diff_names(&["diff", "--name-only", "-z", "--ignore-submodules=dirty"])?;
+        let shown = self.diff_names(&[
+            "-c",
+            "diff.ignoreSubmodules=none",
+            "diff",
+            "--name-only",
+            "-z",
+        ])?;
+        Ok(moved
+            .into_iter()
+            .filter(|path| !shown.contains(path))
+            .collect())
     }
 
     /// Replaces the index with the tree of `tree_ish`, e.g. `HEAD`.
@@ -390,34 +612,10 @@ impl Repo {
 
     /// Applies `patch` to the index, leaving the work tree alone.
     pub fn apply_to_index(&self, patch: &str) -> Result<()> {
-        let mut child = self
-            .command(&["apply", "--cached", "--whitespace=nowarn", "-"])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            .spawn()
-            .context("failed to run git apply")?;
-        // Dropping stdin closes it, so git sees the end of the patch.
-        let written = child
-            .stdin
-            .take()
-            .context("git apply has no input")?
-            .write_all(&lossless::to_bytes(patch));
-        let output = child
-            .wait_with_output()
-            .context("failed to wait for git apply")?;
-        if !output.status.success() {
-            bail!(
-                "`git apply --cached` failed: {}",
-                String::from_utf8_lossy(&output.stderr).trim()
-            );
-        }
-        written.context("failed to send the patch to git apply")
-    }
-
-    /// Resets the index to HEAD, leaving the work tree alone.
-    pub fn reset_index(&self) -> Result<()> {
-        self.git(&["reset", "--quiet"]).map(drop)
+        self.git_with_input(
+            &["apply", "--cached", "--whitespace=nowarn", "-"],
+            &lossless::to_bytes(patch),
+        )
     }
 
     pub fn has_staged_changes(&self) -> Result<bool> {
@@ -444,7 +642,7 @@ impl Repo {
     /// The last `count` commits as `<hash> <subject>` lines, newest first.
     pub fn recent_commits(&self, count: usize) -> Result<Vec<String>> {
         let log = self.git(&["log", "--format=%h %s", &format!("--max-count={count}")])?;
-        Ok(log.lines().map(str::to_owned).collect())
+        Ok(log.lines().map(one_line).collect())
     }
 
     /// The changes HEAD makes since it branched off `base`.
@@ -896,7 +1094,13 @@ impl Repo {
 
     /// Commits with `message`. If git fails (e.g. a hook rejects the commit),
     /// the message is left on disk so it isn't lost.
-    pub fn commit(&self, message: &str, scope: Scope, extra_args: &[String]) -> Result<()> {
+    pub fn commit(
+        &self,
+        message: &str,
+        scope: Scope,
+        extra_args: &[String],
+        leave_out: &[String],
+    ) -> Result<()> {
         let path = self.git_path("GIT_AGENT_MSG")?;
         fs::write(&path, format!("{message}\n"))
             .with_context(|| format!("failed to write {}", path.display()))?;
@@ -904,12 +1108,25 @@ impl Repo {
         let mut command = self.command(&["commit", "--file"]);
         command.arg(&path);
         if scope == Scope::Tracked {
-            command.arg("--all");
+            // What `--all` commits, apart from the work-tree changes in `leave_out`:
+            // `--include` adds the work-tree contents of the paths given to what's
+            // staged, so a version of a left-out path the user staged is committed.
+            command.arg(if leave_out.is_empty() {
+                "--all"
+            } else {
+                "--include"
+            });
         }
-        let status = command
-            .args(extra_args)
-            .status()
-            .context("failed to run git commit")?;
+        command.args(extra_args);
+        if scope == Scope::Tracked && !leave_out.is_empty() {
+            command.args(["--", ":/"]);
+            command.args(leave_out.iter().map(|path| {
+                let mut pathspec = OsString::from(":(top,exclude,literal)");
+                pathspec.push(lossless::to_path(path));
+                pathspec
+            }));
+        }
+        let status = command.status().context("failed to run git commit")?;
         if !status.success() {
             bail!(
                 "git commit failed; the message was saved, reuse it with:\n  git commit --file {}",
@@ -950,7 +1167,7 @@ impl Repo {
             bail!("`git fetch` failed ({status})");
         }
         let log = self.git(&["log", "--format=%h %s", "HEAD..@{upstream}"])?;
-        Ok(log.lines().map(str::to_owned).collect())
+        Ok(log.lines().map(one_line).collect())
     }
 
     /// Replays local commits on top of the upstream, setting uncommitted changes
@@ -1106,6 +1323,28 @@ pub fn edit_file(path: &Path) -> Result<()> {
 /// `patch` without what a commit can't hold: that a submodule has uncommitted work
 /// of its own, which git writes as `-dirty` after its commit. The patch stays as
 /// git wrote it otherwise, which respects the user's settings for submodules.
+/// `paths` for git's standard input, each ended by a NUL.
+fn nul_joined(paths: &[String]) -> Vec<u8> {
+    paths
+        .iter()
+        .flat_map(|path| {
+            let mut bytes = lossless::to_bytes(path);
+            bytes.push(0);
+            bytes
+        })
+        .collect()
+}
+
+/// `paths` as pathspecs that name exactly those paths from the top of the work tree,
+/// wherever git runs, for git's standard input.
+fn top_literal_pathspecs(paths: &[String]) -> Vec<u8> {
+    let pathspecs: Vec<String> = paths
+        .iter()
+        .map(|path| format!(":(top,literal){path}"))
+        .collect();
+    nul_joined(&pathspecs)
+}
+
 fn without_dirty_submodules(patch: &str) -> String {
     crate::fit::split_files(patch)
         .into_iter()
@@ -1158,6 +1397,16 @@ pub mod test_support {
             String::from_utf8_lossy(&output.stderr)
         );
         String::from_utf8_lossy(&output.stdout).into_owned()
+    }
+
+    /// Moves the pointer of the submodule at `library` in the work tree of `dir` to `moved`.
+    pub fn move_pointer(dir: &Path, moved: &str) {
+        let library = dir.join("library");
+        run(
+            &library,
+            &["-c", "protocol.file.allow=always", "fetch", "-q", "origin"],
+        );
+        run(&library, &["checkout", "-q", moved]);
     }
 
     /// A text of `count` numbered lines.
@@ -1322,7 +1571,7 @@ mod tests {
         assert!(changes.diff.contains("+fn b() {}"));
         assert_eq!(repo.untracked_count().unwrap(), 1);
 
-        repo.commit("fix: rename a to b", scope, &[]).unwrap();
+        repo.commit("fix: rename a to b", scope, &[], &[]).unwrap();
         assert_eq!(log(&repo).trim(), "fix: rename a to b");
         assert!(repo.changes(&[]).unwrap().is_none());
         assert!(!repo.git_path("GIT_AGENT_MSG").unwrap().exists());
@@ -1372,7 +1621,8 @@ mod tests {
         assert!(repo.has_upstream());
 
         fs::write(dir.path().join("lib.rs"), "fn b() {}\n").unwrap();
-        repo.commit("feat: second", Scope::Tracked, &[]).unwrap();
+        repo.commit("feat: second", Scope::Tracked, &[], &[])
+            .unwrap();
         assert!(repo.incoming_commits().unwrap().is_empty());
         repo.push().unwrap();
         let pushed = run(remote.path(), &["log", "--format=%s", "-1", "main"]);
@@ -1394,7 +1644,8 @@ mod tests {
         commit_elsewhere(&remote, "LICENSE", "MIT\n", "docs: add license");
 
         fs::write(dir.path().join("lib.rs"), "fn b() {}\n").unwrap();
-        repo.commit("feat: local", Scope::Tracked, &[]).unwrap();
+        repo.commit("feat: local", Scope::Tracked, &[], &[])
+            .unwrap();
         fs::write(dir.path().join("lib.rs"), "fn uncommitted() {}\n").unwrap();
 
         let incoming = repo.incoming_commits().unwrap();
@@ -1416,7 +1667,7 @@ mod tests {
         commit_elsewhere(&remote, "lib.rs", "fn remote() {}\n", "fix: remote");
 
         fs::write(dir.path().join("lib.rs"), "fn local() {}\n").unwrap();
-        repo.commit("fix: local", Scope::Tracked, &[]).unwrap();
+        repo.commit("fix: local", Scope::Tracked, &[], &[]).unwrap();
         let before = repo.git(&["rev-parse", "HEAD"]).unwrap();
 
         assert_eq!(repo.incoming_commits().unwrap().len(), 1);
@@ -1440,11 +1691,13 @@ mod tests {
             "feat: add b\n\nb replaces a.\n\nIt is faster.",
             Scope::Tracked,
             &[],
+            &[],
         )
         .unwrap();
         fs::write(dir.path().join("new.rs"), "fn c() {}\n").unwrap();
         repo.stage_all().unwrap();
-        repo.commit("test: cover c", Scope::Staged, &[]).unwrap();
+        repo.commit("test: cover c", Scope::Staged, &[], &[])
+            .unwrap();
         // The base moves on without the branch; its commit is not the branch's.
         commit_elsewhere(&remote, "LICENSE", "MIT\n", "docs: add license");
 
@@ -1504,13 +1757,14 @@ mod tests {
             "fn a() {}\nfn b() {}\nfn c() {}\n",
         )
         .unwrap();
-        repo.commit("feat: add b and c", Scope::Tracked, &[])
+        repo.commit("feat: add b and c", Scope::Tracked, &[], &[])
             .unwrap();
         run(dir.path(), &["mv", "lib.rs", "core.rs"]);
-        repo.commit("refactor: rename lib to core", Scope::Staged, &[])
+        repo.commit("refactor: rename lib to core", Scope::Staged, &[], &[])
             .unwrap();
         write("fn a() {}\nfn b2() {}\nfn c() {}\n");
-        repo.commit("fix: rename b", Scope::Tracked, &[]).unwrap();
+        repo.commit("fix: rename b", Scope::Tracked, &[], &[])
+            .unwrap();
         write("// new\nfn a() {}\nfn b2() {}\nfn c() {}\n");
         assert!(repo.in_head("core.rs") && !repo.in_head("lib.rs"));
 
@@ -1543,7 +1797,7 @@ mod tests {
         let code = "struct Repo;\n\nimpl Repo {\n    fn has_open(&self) {}\n\n    \
                     pub fn open() -> Self {\n        Repo\n    }\n}\n";
         fs::write(dir.path().join("lib.rs"), code).unwrap();
-        repo.commit("feat: open", Scope::Tracked, &[]).unwrap();
+        repo.commit("feat: open", Scope::Tracked, &[], &[]).unwrap();
         let word = crate::why::Target {
             path: "lib.rs".into(),
             lines: crate::why::Lines::Function("open".into()),
@@ -1568,7 +1822,7 @@ mod tests {
     fn resolves_commits_and_their_parents() {
         let (dir, repo) = setup();
         fs::write(dir.path().join("lib.rs"), "fn b() {}\n").unwrap();
-        repo.commit("feat: b\n\nWhy b.", Scope::Tracked, &[])
+        repo.commit("feat: b\n\nWhy b.", Scope::Tracked, &[], &[])
             .unwrap();
         let head = repo.resolve("HEAD").unwrap().unwrap();
         let first = repo.resolve("HEAD~1").unwrap().unwrap();
@@ -1612,7 +1866,7 @@ mod tests {
         assert!(repo.has_uncommitted_changes().unwrap());
         // It doesn't track origin/main, so its first push makes origin/feat/b.
         assert!(!repo.has_upstream());
-        repo.commit("feat: b", Scope::Tracked, &[]).unwrap();
+        repo.commit("feat: b", Scope::Tracked, &[], &[]).unwrap();
         repo.push().unwrap();
         let pushed = run(remote.path(), &["log", "--format=%s", "-1", "feat/b"]);
         assert_eq!(pushed.trim(), "feat: b");
@@ -1626,12 +1880,13 @@ mod tests {
         let _remote = add_remote(&repo);
         let write = |name: &str, content: &str| fs::write(dir.path().join(name), content).unwrap();
         write("lib.rs", "fn a() {}\nfn b() {}\n");
-        repo.commit("feat: add b", Scope::Tracked, &[]).unwrap();
+        repo.commit("feat: add b", Scope::Tracked, &[], &[])
+            .unwrap();
         write("notes.md", "notes\n");
         repo.stage_all().unwrap();
-        repo.commit("wip", Scope::Staged, &[]).unwrap();
+        repo.commit("wip", Scope::Staged, &[], &[]).unwrap();
         write("lib.rs", "fn a() {}\nfn b() { }\n");
-        repo.commit("fix typo", Scope::Tracked, &[]).unwrap();
+        repo.commit("fix typo", Scope::Tracked, &[], &[]).unwrap();
         // Uncommitted work that the rewrite must leave alone.
         write("lib.rs", "fn a() {}\nfn b() { }\nfn c() {}\n");
         write("draft.txt", "draft\n");
@@ -1674,9 +1929,9 @@ mod tests {
         // A plan that conflicts leaves everything as it was: renaming c
         // before adding it can't work.
         let head = repo.resolve("HEAD").unwrap().unwrap();
-        repo.commit("feat: c", Scope::Tracked, &[]).unwrap();
+        repo.commit("feat: c", Scope::Tracked, &[], &[]).unwrap();
         write("lib.rs", "fn a() {}\nfn b() { }\nfn c2() {}\n");
-        repo.commit("refactor: rename c", Scope::Tracked, &[])
+        repo.commit("refactor: rename c", Scope::Tracked, &[], &[])
             .unwrap();
         let commits = repo.commits_after(&head).unwrap();
         let tip = repo.resolve("HEAD").unwrap().unwrap();
@@ -1816,7 +2071,7 @@ mod tests {
         run(dir.path(), &["config", "core.hooksPath", "hooks"]);
         fs::write(dir.path().join("lib.rs"), "fn b() {}\n").unwrap();
         run(dir.path(), &["add", "lib.rs"]);
-        repo.commit("change", Scope::Staged, &[]).unwrap();
+        repo.commit("change", Scope::Staged, &[], &[]).unwrap();
         assert!(!fs::read_to_string(seen).unwrap().contains("quotePath"));
     }
 
@@ -1859,7 +2114,7 @@ mod tests {
     #[test]
     fn tells_when_a_conflict_is_unresolved() {
         let (dir, repo) = setup();
-        assert!(!repo.has_unmerged_paths().unwrap());
+        assert!(repo.unmerged_paths().unwrap().is_empty());
         let blob = run(dir.path(), &["rev-parse", "HEAD:lib.rs"]);
         let entry = format!("100644,{},lib.rs", blob.trim());
         run(dir.path(), &["update-index", "--force-remove", "lib.rs"]);
@@ -1867,7 +2122,7 @@ mod tests {
             dir.path(),
             &["update-index", "--add", "--cacheinfo", &entry],
         );
-        assert!(!repo.has_unmerged_paths().unwrap());
+        assert!(repo.unmerged_paths().unwrap().is_empty());
         let mut child = Command::new("git")
             .current_dir(dir.path())
             .args(["update-index", "--index-info"])
@@ -1886,7 +2141,7 @@ mod tests {
             .write_all(unmerged.as_bytes())
             .unwrap();
         assert!(child.wait().unwrap().success());
-        assert!(repo.has_unmerged_paths().unwrap());
+        assert_eq!(repo.unmerged_paths().unwrap(), ["lib.rs"]);
     }
 
     #[test]
@@ -1932,10 +2187,347 @@ mod tests {
         let (dir, repo) = setup();
         fs::write(dir.path().join("lib.rs"), "fn b() {}\n").unwrap();
         let err = repo
-            .commit("feat: x", Scope::Tracked, &["--no-such-flag".into()])
+            .commit("feat: x", Scope::Tracked, &["--no-such-flag".into()], &[])
             .unwrap_err();
         let saved = repo.git_path("GIT_AGENT_MSG").unwrap();
         assert!(err.to_string().contains("GIT_AGENT_MSG"));
         assert_eq!(fs::read_to_string(saved).unwrap(), "feat: x\n");
+    }
+
+    fn names(list: &[&str]) -> Vec<String> {
+        list.iter().map(|name| name.to_string()).collect()
+    }
+
+    #[test]
+    fn resets_only_the_paths_it_is_given() {
+        let (dir, repo) = setup();
+        for name in ["a*", "ab", "blå bær", ":colon"] {
+            fs::write(dir.path().join(name), "one\n").unwrap();
+        }
+        run(dir.path(), &["add", "--all"]);
+        run(dir.path(), &["commit", "-q", "-m", "add them"]);
+        for name in ["a*", "ab", "blå bær", ":colon"] {
+            fs::write(dir.path().join(name), "two\n").unwrap();
+        }
+        run(dir.path(), &["add", "--all"]);
+
+        repo.reset_paths("HEAD", &[]).unwrap();
+        assert_eq!(repo.staged_against("HEAD").unwrap().len(), 4);
+
+        repo.reset_paths("HEAD", &names(&["a*", "blå bær", ":colon"]))
+            .unwrap();
+        assert_eq!(repo.staged_against("HEAD").unwrap(), ["ab"]);
+        assert_eq!(fs::read_to_string(dir.path().join("a*")).unwrap(), "two\n");
+    }
+
+    #[test]
+    fn lists_both_paths_of_a_rename_as_changed() {
+        let (dir, repo) = setup();
+        fs::write(dir.path().join("old.txt"), "the same text\n").unwrap();
+        run(dir.path(), &["add", "--all"]);
+        run(dir.path(), &["commit", "-q", "-m", "add old"]);
+        run(dir.path(), &["mv", "old.txt", "new.txt"]);
+        run(dir.path(), &["commit", "-q", "-m", "rename"]);
+        assert_eq!(
+            repo.changed_between("HEAD~", "HEAD").unwrap(),
+            ["new.txt", "old.txt"]
+        );
+        assert!(repo.changed_between("HEAD", "HEAD").unwrap().is_empty());
+    }
+
+    #[test]
+    fn stages_all_but_what_it_is_told_to_leave_out_from_a_subfolder() {
+        let (dir, _repo) = setup();
+        fs::create_dir(dir.path().join("sub")).unwrap();
+        for name in [
+            "keep.txt",
+            "key*.pem",
+            "key1.pem",
+            "sub/deep.o",
+            "sub/keep.txt",
+        ] {
+            fs::write(dir.path().join(name), "x\n").unwrap();
+        }
+        let repo = Repo::open(dir.path().join("sub")).unwrap();
+        repo.stage_all_except(&names(&[
+            ":(top,exclude,literal)key*.pem",
+            ":(top,exclude,glob)**/*.o",
+        ]))
+        .unwrap();
+        let staged = run(dir.path(), &["diff", "--cached", "--name-only"]);
+        assert_eq!(staged, "keep.txt\nkey1.pem\nsub/keep.txt\n");
+    }
+
+    #[test]
+    fn stages_everything_with_nothing_to_leave_out() {
+        let (dir, repo) = setup();
+        fs::write(dir.path().join("a.txt"), "x\n").unwrap();
+        repo.stage_all_except(&[]).unwrap();
+        assert_eq!(repo.staged_against("HEAD").unwrap(), ["a.txt"]);
+    }
+
+    #[test]
+    fn lists_conflicts_outside_the_folder_whatever_diff_relative_says() {
+        let (dir, _repo) = setup();
+        fs::create_dir(dir.path().join("sub")).unwrap();
+        fs::write(dir.path().join("sub/s.txt"), "s\n").unwrap();
+        fs::write(dir.path().join("f.txt"), "base\n").unwrap();
+        run(dir.path(), &["add", "--all"]);
+        run(dir.path(), &["commit", "-q", "-m", "base"]);
+        fs::write(dir.path().join("f.txt"), "stashed\n").unwrap();
+        run(dir.path(), &["stash", "-q"]);
+        fs::write(dir.path().join("f.txt"), "theirs\n").unwrap();
+        run(dir.path(), &["commit", "-q", "-a", "-m", "theirs"]);
+        let popped = Command::new("git")
+            .current_dir(dir.path())
+            .args(["stash", "pop", "-q"])
+            .output()
+            .unwrap();
+        assert!(!popped.status.success());
+        run(dir.path(), &["config", "diff.relative", "true"]);
+        let repo = Repo::open(dir.path().join("sub")).unwrap();
+        assert_eq!(repo.unmerged_paths().unwrap(), ["f.txt"]);
+        fs::write(dir.path().join("sub/s.txt"), "s2\n").unwrap();
+        run(dir.path(), &["add", "sub/s.txt"]);
+        assert_eq!(repo.staged_paths().unwrap(), ["f.txt", "sub/s.txt"]);
+    }
+
+    #[test]
+    fn reads_all_the_changes_from_a_subfolder_whatever_diff_relative_says() {
+        let (dir, _repo) = setup();
+        fs::create_dir(dir.path().join("sub")).unwrap();
+        fs::write(dir.path().join("sub/s.txt"), "s\n").unwrap();
+        run(dir.path(), &["add", "--all"]);
+        run(dir.path(), &["commit", "-q", "-m", "add sub"]);
+        run(dir.path(), &["config", "diff.relative", "true"]);
+        let repo = Repo::open(dir.path().join("sub")).unwrap();
+
+        fs::write(dir.path().join("lib.rs"), "fn b() {}\n").unwrap();
+        let (scope, changes) = repo.changes(&[]).unwrap().expect("a change outside sub/");
+        assert_eq!(scope, Scope::Tracked);
+        assert!(changes.diff.contains("+++ b/lib.rs"), "{}", changes.diff);
+        assert!(changes.stat.contains("lib.rs"), "{}", changes.stat);
+
+        fs::write(dir.path().join("sub/s.txt"), "s2\n").unwrap();
+        run(dir.path(), &["add", "--all"]);
+        let (scope, changes) = repo.changes(&[]).unwrap().unwrap();
+        assert_eq!(scope, Scope::Staged);
+        for name in ["lib.rs", "sub/s.txt"] {
+            assert!(
+                changes.diff.contains(&format!("+++ b/{name}")),
+                "{}",
+                changes.diff
+            );
+        }
+        let patch = repo.patch(Scope::Staged).unwrap();
+        assert!(patch.contains("+++ b/lib.rs") && patch.contains("+++ b/sub/s.txt"));
+        assert_eq!(
+            repo.included_paths(Scope::Staged, &[]).unwrap(),
+            HashSet::from(["lib.rs".to_owned(), "sub/s.txt".to_owned()])
+        );
+    }
+
+    #[test]
+    fn commits_tracked_changes_without_a_pointer_it_leaves_out() {
+        let (dir, repo, _library, moved) = test_support::with_submodule();
+        run(dir.path(), &["config", "submodule.library.ignore", "all"]);
+        fs::write(dir.path().join("gone.txt"), "x\n").unwrap();
+        run(dir.path(), &["add", "gone.txt"]);
+        run(dir.path(), &["commit", "-q", "-m", "add gone"]);
+        test_support::move_pointer(dir.path(), &moved);
+        fs::write(dir.path().join("lib.rs"), "fn b() {}\n").unwrap();
+        fs::remove_file(dir.path().join("gone.txt")).unwrap();
+        fs::create_dir(dir.path().join("sub")).unwrap();
+        let from_sub = Repo::open(dir.path().join("sub")).unwrap();
+
+        from_sub
+            .commit("feat: b", Scope::Tracked, &[], &["library".to_owned()])
+            .unwrap();
+        assert_eq!(
+            repo.changed_between("HEAD~", "HEAD").unwrap(),
+            ["gone.txt", "lib.rs"]
+        );
+        assert_eq!(repo.hidden_changed_pointers().unwrap(), ["library"]);
+    }
+
+    /// A repository with a moved submodule pointer under `ignore=all` and an edited lib.rs.
+    fn with_a_hidden_pointer() -> (TempDir, Repo, TempDir) {
+        let (dir, repo, library, moved) = test_support::with_submodule();
+        run(dir.path(), &["config", "submodule.library.ignore", "all"]);
+        test_support::move_pointer(dir.path(), &moved);
+        fs::write(dir.path().join("lib.rs"), "fn b() {}\n").unwrap();
+        (dir, repo, library)
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn leaving_a_pointer_out_keeps_what_a_formatting_hook_did() {
+        let (dir, repo, _library) = with_a_hidden_pointer();
+        let hooks = dir.path().join("hooks");
+        fs::create_dir(&hooks).unwrap();
+        fs::write(
+            hooks.join("pre-commit"),
+            "#!/bin/sh\nprintf 'fn b() { }\\n' > lib.rs\ngit add lib.rs\n",
+        )
+        .unwrap();
+        let executable = std::os::unix::fs::PermissionsExt::from_mode(0o755);
+        fs::set_permissions(hooks.join("pre-commit"), executable).unwrap();
+        run(dir.path(), &["config", "core.hooksPath", "hooks"]);
+
+        repo.commit("feat: b", Scope::Tracked, &[], &["library".to_owned()])
+            .unwrap();
+        assert_eq!(run(dir.path(), &["show", "HEAD:lib.rs"]), "fn b() { }\n");
+        assert!(repo.staged_against("HEAD").unwrap().is_empty());
+    }
+
+    #[test]
+    fn leaving_a_pointer_out_doesnt_commit_an_assume_unchanged_file() {
+        let (dir, repo, _library) = with_a_hidden_pointer();
+        fs::write(dir.path().join("quiet.txt"), "one\n").unwrap();
+        run(dir.path(), &["add", "quiet.txt"]);
+        run(dir.path(), &["commit", "-q", "-m", "add quiet"]);
+        run(
+            dir.path(),
+            &["update-index", "--assume-unchanged", "quiet.txt"],
+        );
+        fs::write(dir.path().join("quiet.txt"), "two\n").unwrap();
+        fs::write(dir.path().join("lib.rs"), "fn c() {}\n").unwrap();
+
+        repo.commit("feat: c", Scope::Tracked, &[], &["library".to_owned()])
+            .unwrap();
+        assert_eq!(run(dir.path(), &["show", "HEAD:quiet.txt"]), "one\n");
+        assert_eq!(run(dir.path(), &["show", "HEAD:lib.rs"]), "fn c() {}\n");
+    }
+
+    #[test]
+    fn commits_the_version_of_a_pointer_the_user_staged_and_not_a_later_one() {
+        let (dir, repo, library, moved) = test_support::with_submodule();
+        run(dir.path(), &["config", "submodule.library.ignore", "all"]);
+        test_support::move_pointer(dir.path(), &moved);
+        run(dir.path(), &["add", "library"]);
+        run(
+            library.path(),
+            &["commit", "-q", "--allow-empty", "-m", "three"],
+        );
+        let later = run(library.path(), &["rev-parse", "HEAD"])
+            .trim()
+            .to_owned();
+        test_support::move_pointer(dir.path(), &later);
+        fs::write(dir.path().join("lib.rs"), "fn b() {}\n").unwrap();
+        assert_eq!(repo.hidden_changed_pointers().unwrap(), ["library"]);
+
+        repo.commit("feat: b", Scope::Tracked, &[], &["library".to_owned()])
+            .unwrap();
+        assert_eq!(
+            run(dir.path(), &["rev-parse", "HEAD:library"]).trim(),
+            moved
+        );
+        assert_eq!(run(dir.path(), &["show", "HEAD:lib.rs"]), "fn b() {}\n");
+        assert_eq!(repo.hidden_changed_pointers().unwrap(), ["library"]);
+    }
+
+    #[test]
+    fn lists_a_conflicted_submodule_under_any_ignore_setting() {
+        let (dir, repo, _library, moved) = test_support::with_submodule();
+        let base = run(dir.path(), &["rev-parse", "HEAD:library"]);
+        let info = format!(
+            "0 {zero} 0\tlibrary\n160000 {base} 1\tlibrary\n160000 {moved} 2\tlibrary\n\
+             160000 {base} 3\tlibrary\n",
+            zero = "0".repeat(40),
+            base = base.trim()
+        );
+        let mut child = Command::new("git")
+            .current_dir(dir.path())
+            .args(["update-index", "--index-info"])
+            .stdin(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .as_mut()
+            .unwrap()
+            .write_all(info.as_bytes())
+            .unwrap();
+        assert!(child.wait().unwrap().success());
+        for (key, value) in [
+            ("submodule.library.ignore", "all"),
+            ("diff.ignoreSubmodules", "all"),
+        ] {
+            run(dir.path(), &["config", key, value]);
+            assert_eq!(repo.unmerged_paths().unwrap(), ["library"], "{key}");
+        }
+    }
+
+    #[test]
+    fn lists_unmerged_files_once_each_with_their_real_names() {
+        let (dir, repo) = setup();
+        fs::write(dir.path().join("Kjøre.txt"), "base\n").unwrap();
+        run(dir.path(), &["add", "--all"]);
+        run(dir.path(), &["commit", "-q", "-m", "base"]);
+        fs::write(dir.path().join("Kjøre.txt"), "stashed\n").unwrap();
+        run(dir.path(), &["stash", "-q"]);
+        fs::write(dir.path().join("Kjøre.txt"), "theirs\n").unwrap();
+        run(dir.path(), &["commit", "-q", "-a", "-m", "theirs"]);
+        let popped = Command::new("git")
+            .current_dir(dir.path())
+            .args(["stash", "pop", "-q"])
+            .output()
+            .unwrap();
+        assert!(!popped.status.success());
+        assert_eq!(repo.unmerged_paths().unwrap(), ["Kjøre.txt"]);
+    }
+
+    #[test]
+    fn finds_pointers_the_diff_hides_under_a_submodule_setting() {
+        let (dir, repo, _library, moved) = test_support::with_submodule();
+        run(dir.path(), &["config", "submodule.library.ignore", "all"]);
+        test_support::move_pointer(dir.path(), &moved);
+        assert!(!repo.has_diff(&[]).unwrap());
+        assert_eq!(repo.hidden_changed_pointers().unwrap(), ["library"]);
+        assert!(repo.hidden_staged_pointers().unwrap().is_empty());
+
+        run(dir.path(), &["add", "--all"]);
+        assert!(!repo.has_diff(&["--cached"]).unwrap());
+        assert_eq!(repo.hidden_staged_pointers().unwrap(), ["library"]);
+    }
+
+    #[test]
+    fn finds_only_staged_pointers_under_the_diff_setting() {
+        let (dir, repo, _library, moved) = test_support::with_submodule();
+        run(dir.path(), &["config", "diff.ignoreSubmodules", "all"]);
+        test_support::move_pointer(dir.path(), &moved);
+        assert!(repo.hidden_changed_pointers().unwrap().is_empty());
+        assert!(repo.hidden_staged_pointers().unwrap().is_empty());
+
+        run(dir.path(), &["add", "--all"]);
+        assert_eq!(repo.hidden_staged_pointers().unwrap(), ["library"]);
+    }
+
+    #[test]
+    fn finds_no_hidden_pointers_when_the_diff_shows_them_or_nothing_moved() {
+        let (dir, repo, _library, moved) = test_support::with_submodule();
+        assert!(repo.hidden_changed_pointers().unwrap().is_empty());
+        fs::write(dir.path().join("library/loose.txt"), "dirty\n").unwrap();
+        run(dir.path(), &["config", "submodule.library.ignore", "all"]);
+        assert!(repo.hidden_changed_pointers().unwrap().is_empty());
+        run(
+            dir.path(),
+            &["config", "--unset", "submodule.library.ignore"],
+        );
+        fs::remove_file(dir.path().join("library/loose.txt")).unwrap();
+        test_support::move_pointer(dir.path(), &moved);
+        assert!(repo.hidden_changed_pointers().unwrap().is_empty());
+        run(dir.path(), &["add", "--all"]);
+        assert!(repo.hidden_staged_pointers().unwrap().is_empty());
+    }
+
+    #[test]
+    fn lists_a_hidden_pointer_a_commit_changed() {
+        let (dir, repo, _library, moved) = test_support::with_submodule();
+        run(dir.path(), &["config", "submodule.library.ignore", "all"]);
+        test_support::move_pointer(dir.path(), &moved);
+        run(dir.path(), &["add", "--all"]);
+        run(dir.path(), &["commit", "-q", "-m", "move the library"]);
+        assert_eq!(repo.changed_between("HEAD~", "HEAD").unwrap(), ["library"]);
     }
 }

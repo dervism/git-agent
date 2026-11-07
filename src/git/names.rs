@@ -5,6 +5,9 @@
 //! letters as they are and control characters still escaped, so a file name
 //! can't change the terminal or add lines to a prompt.
 
+use super::lossless;
+use crate::safe_text::{NAMED_ESCAPES, one_line};
+
 /// The readable name of the file a part of a diff is about: its new name if it
 /// was renamed or copied. `file` starts with the "diff --git" line, which is
 /// all it needs to hold.
@@ -18,61 +21,12 @@ pub fn of_diff(file: &str) -> String {
                 .or_else(|| line.strip_prefix("copy to "))
         });
     let name = new_name.map_or_else(|| from_header(header), unquoted);
-    printable(&name)
+    one_line(&name)
 }
 
-/// `name` with control characters and text direction overrides escaped the way
-/// git writes them, and all other characters as they are.
-pub fn printable(name: &str) -> String {
-    let mut out = String::with_capacity(name.len());
-    for character in name.chars() {
-        if is_unsafe_to_show(character) {
-            escape(character, &mut out);
-        } else {
-            out.push(character);
-        }
-    }
-    out
-}
-
-/// Control characters, and those that can hide text, reverse it or start a line
-/// without showing that they do: separators, direction marks and overrides,
-/// characters of no width, invisible fillers and tags. Variation selectors stay,
-/// because file names with emoji need them.
-fn is_unsafe_to_show(character: char) -> bool {
-    character.is_control()
-        || matches!(
-            character,
-            '\u{00ad}'
-                | '\u{034f}'
-                | '\u{061c}'
-                | '\u{115f}'..='\u{1160}'
-                | '\u{17b4}'..='\u{17b5}'
-                | '\u{180b}'..='\u{180f}'
-                | '\u{200b}'..='\u{200f}'
-                | '\u{2028}'..='\u{202e}'
-                | '\u{2060}'..='\u{206f}'
-                | '\u{3164}'
-                | '\u{feff}'
-                | '\u{ffa0}'
-                | '\u{fff9}'..='\u{fffb}'
-                | '\u{1bca0}'..='\u{1bca3}'
-                | '\u{1d173}'..='\u{1d17a}'
-                | '\u{e0000}'..='\u{e007f}'
-                | '\u{e0100}'..='\u{e01ef}'
-        )
-}
-
-fn escape(character: char, out: &mut String) {
-    for &byte in character.encode_utf8(&mut [0; 4]).as_bytes() {
-        match NAMED_ESCAPES.iter().find(|(_, value)| *value == byte) {
-            Some((code, _)) => {
-                out.push('\\');
-                out.push(char::from(*code));
-            }
-            None => out.push_str(&format!("\\{byte:03o}")),
-        }
-    }
+/// `name`, as git-agent reads it from git, in the form to show people.
+pub fn shown(name: &str) -> String {
+    one_line(&lossless::readable(name))
 }
 
 /// The name in a "diff --git" line, whose two names may each be quoted.
@@ -155,17 +109,6 @@ fn unquoted(name: &str) -> String {
         None => name.to_owned(),
     }
 }
-
-/// The escape letters git uses, with the bytes they stand for.
-const NAMED_ESCAPES: [(u8, u8); 7] = [
-    (b'a', 0x07),
-    (b'b', 0x08),
-    (b't', b'\t'),
-    (b'n', b'\n'),
-    (b'v', 0x0b),
-    (b'f', 0x0c),
-    (b'r', b'\r'),
-];
 
 fn decode_escapes(text: &str) -> Vec<u8> {
     let mut bytes = text.bytes();
@@ -254,39 +197,10 @@ mod tests {
     }
 
     #[test]
-    fn escapes_what_can_hide_text_and_leaves_letters_and_emoji() {
-        for unsafe_character in [
-            '\u{00ad}',
-            '\u{061c}',
-            '\u{180e}',
-            '\u{200b}',
-            '\u{200f}',
-            '\u{2028}',
-            '\u{202e}',
-            '\u{2060}',
-            '\u{2066}',
-            '\u{206f}',
-            '\u{feff}',
-            '\u{fff9}',
-            '\u{fffb}',
-            '\u{e0001}',
-        ] {
-            assert!(is_unsafe_to_show(unsafe_character), "{unsafe_character:?}");
-        }
-        for safe in [
-            'æ',
-            'ø',
-            'å',
-            'ß',
-            '日',
-            'ع',
-            '\u{1f600}',
-            '\u{fe0f}',
-            '\u{2027}',
-            '\u{202f}',
-        ] {
-            assert!(!is_unsafe_to_show(safe), "{safe:?}");
-        }
+    fn shows_a_name_that_isnt_utf8_on_one_line() {
+        assert_eq!(shown("Kj\u{10efe8}re.txt"), "Kj\u{fffd}re.txt");
+        assert_eq!(shown("a\nb\u{1b}c"), "a\\nb\\033c");
+        assert_eq!(shown("Kjøre.txt"), "Kjøre.txt");
     }
 
     #[test]
@@ -309,7 +223,7 @@ mod tests {
             ("c\u{9b}", "c\\302\\233"),
         ] {
             assert_eq!(
-                printable(raw),
+                one_line(raw),
                 header(&format!("\"a/{quoted}\" \"b/{quoted}\""))
             );
         }

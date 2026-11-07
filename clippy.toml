@@ -1,0 +1,6 @@
+# Everything git-agent writes to the terminal goes through `ui`, which escapes what could
+# change the terminal or hide text. Only `ui` may take these handles.
+disallowed-methods = [
+    { path = "std::io::stdout", reason = "write through `ui`, which makes text safe for the terminal" },
+    { path = "std::io::stderr", reason = "write through `ui`, which makes text safe for the terminal" },
+]

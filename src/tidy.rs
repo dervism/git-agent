@@ -8,6 +8,7 @@
 //! --autosquash` would do.
 
 use crate::fit;
+use crate::safe_text::{escaped, one_line};
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
 use std::fmt::Write;
@@ -92,7 +93,12 @@ impl Plan {
         let mut out = String::new();
         let line = |out: &mut String, verb: &str, index: usize| {
             let commit = &commits[index];
-            let _ = writeln!(out, "{verb:<7}{} {}", commit.short, commit.subject());
+            let _ = writeln!(
+                out,
+                "{verb:<7}{} {}",
+                commit.short,
+                one_line(commit.subject())
+            );
         };
         for group in &self.groups {
             line(
@@ -134,7 +140,7 @@ pub fn show(plan: &Plan, commits: &[Commit]) -> String {
 
 /// The plan as text to edit.
 pub fn to_text(plan: &Plan, commits: &[Commit]) -> String {
-    format!("{EDIT_HELP}\n{}", plan.lines(commits))
+    format!("{EDIT_HELP}\n{}", escaped(&plan.lines(commits)))
 }
 
 /// Reads an edited plan. Every commit must appear once; a fold line folds

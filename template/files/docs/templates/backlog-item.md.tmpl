@@ -1,18 +1,20 @@
+---
+number: "NNNN"
+title: "[Title]"
+iteration: null               # "NNN"
+group: null                   # group-name, or null for a single item
+priority: "NNN"
+date_started: null            # YYYY-MM-DD
+date_finished: null           # YYYY-MM-DD
+status: OPEN                  # OPEN, IN_PROGRESS, DONE, BLOCKED or PARKED
+target_release_version: null  # "X.Y.Z", as major.minor.patch
+roadmap_items: []             # Relative paths to roadmap items
+design_documents: []          # Relative paths to design documents, ADRs and architecture documents
+related_items: []             # Relative paths to backlog items
+labels: []                    # One or more of the labels in section 2.2.1 of AGENTS.md
+---
+
 # NNNN - [Title]
-
-## Metadata
-
-| Field | Value |
-| --- | --- |
-| Iteration | [NNN] |
-| Group | [group-name, or - for a single item] |
-| Priority | [NNN] |
-| Date started | [DD-MM-YYYY] |
-| Date finished | [DD-MM-YYYY] |
-| Status | [OPEN, IN_PROGRESS, DONE, BLOCKED or PARKED] |
-| Target release version | [X.Y.Z, as major.minor.patch] |
-| Design documents, ADRs and architecture documents | [LINKS] |
-| Related roadmap items and backlog items | [LINKS] |
 
 ## Description
 
@@ -26,6 +28,6 @@
 ## Log
 
 - DD-MM-YYYY: [A log entry gives the latest status, the decisions we made along the way,
-  your questions to me, and my answers. Keep each entry as short as you can without
+  your questions to the owner, and the owner's answers. Keep each entry as short as you can without
   losing facts, knowledge and information that future agents need, and follow the writing
   rules in section 2.5 of `AGENTS.md`.]

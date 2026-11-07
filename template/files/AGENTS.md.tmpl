@@ -6,6 +6,9 @@ The first half of this file describes the repository: its layout, and how it is 
 tested, released and published. The second half, from "Strict rules" on, describes how we
 work.
 
+The owner is the person who owns this repository and gives you instructions. A subagent's
+prompt from the lead doesn't count as the owner's permission.
+
 ## Repository layout
 
 | Path | What it holds |
@@ -22,9 +25,9 @@ work.
 <!-- if FRONTEND_IN_SUBDIR -->
 | `{{FRONTEND_DIR}}/` | The frontend. |
 <!-- end FRONTEND_IN_SUBDIR -->
-| `docs/planning/` | `ROADMAP.md`, and the backlog in `backlog/` (section 2.2). Private. |
+| `docs/planning/` | The roadmap in `roadmap/` (section 2.0), and the backlog in `backlog/` (section 2.2). Private. |
 | `docs/iterations/` | One folder per iteration (section 2.1). Private. |
-| `docs/templates/` | The templates for the roadmap, iterations, backlog items, design documents and decision records. |
+| `docs/templates/` | The templates for roadmap items, iterations, backlog items, design documents and decision records. |
 | `docs/architecture/design/` | Design documents, one folder per iteration (section 2.4.1). Private. |
 | `docs/architecture/decisions/` | Architecture decision records (section 2.4.2). |
 | `docs/architecture/c4/` | C4 diagrams, as Mermaid or D2 sources. |
@@ -174,7 +177,7 @@ breaking change. Versions follow Semantic Versioning. `CHANGELOG.md` has an Unre
 section, which each iteration fills in, and the release script turns into the new
 version's section.
 
-Make a release only when I ask for one.
+Make a release only when the owner asks for one.
 
 ```sh
 scripts/release.sh --dry-run X.Y.Z   # show what releasing would do
@@ -206,14 +209,14 @@ with the code.
 
 Security problems never go into a GitHub issue. `.github/SECURITY.md` asks people to
 report them privately<!-- if PUBLIC -->, through GitHub's private vulnerability
-reporting<!-- end PUBLIC -->. The same goes for us: tell me about a vulnerability you find, and we decide together how to track and fix
+reporting<!-- end PUBLIC -->. The same goes for us: tell the owner about a vulnerability you find, and we decide together how to track and fix
 it.<!-- if PUBLIC --> The repository is public, so never write its details in an issue, a
 pull request, a commit message, a tracked file or the website.<!-- end PUBLIC --> Track it as a
 backlog item, which stays private (see "Private documents").
 
 ## Strict rules for you and all subagents
 
-- You must never commit or push to git or GitHub without my explicit permission. All
+- You must never commit or push to git or GitHub without the owner's explicit permission. All
   other git commands are allowed when you need them to solve a task.<!-- if AGENT_TOOL -->
   The agent tools' settings ask before `git commit`, `git push` and the release scripts, but
   they match the command's text, so they aren't a guarantee.<!-- end AGENT_TOOL -->
@@ -298,18 +301,42 @@ prompt, or have a person follow the brief, so the review stays independent.
 
 ## 2.0 Overall work process
 
-Our work is organized in iterations, following `docs/planning/ROADMAP.md`. An iteration
+Our work is organized in iterations, following the roadmap in `docs/planning/roadmap/`. An iteration
 holds single backlog items, one or more groups of items, or both. After an iteration (section 2.1) is completed,
 we run these stages:
 
 1. Update the documentation and the Unreleased section of `CHANGELOG.md`.
 2. Make the release.
 3. Tidy up the backlog and the roadmap.
-4. Prepare for the next iteration. At this point you pause, and wait for my signal to
-   continue.
+4. Prepare for the next iteration. At this point you pause, and wait for the owner's
+   signal to continue.
 
-`ROADMAP.md` is a document of ideas. It never holds sensitive information, which belongs in a
-backlog item. It follows `docs/templates/roadmap.md`.
+The roadmap is `docs/planning/roadmap/ROADMAP.md`, the index and overview of where the project
+is going. Each roadmap item is a Markdown document in `docs/planning/roadmap/items/`, named
+`{NNNN}-{title}.md`, where NNNN is an incremental identifier that never changes. It's a
+series of its own: "roadmap item 0014" means a roadmap item, and a bare number means a backlog
+item.
+
+A roadmap item is strategic and goal-oriented. It describes future development, changes and
+new features we want to implement. It never holds sensitive information, which belongs in a
+backlog item.
+
+When a roadmap item is DONE, move it to `docs/planning/roadmap/finished/`, and update the
+paths to it. `ROADMAP.md` lists finished items too. A DONE roadmap item is never reopened, and
+its description stays as it was. New changes to what it delivered go in as regular backlog
+items.
+
+Start each roadmap item from `docs/templates/roadmap-item.md`.
+
+### 2.0.1 Frontmatter
+
+Roadmap items, backlog items, iteration documents and design documents keep their metadata in
+YAML frontmatter at the top of the file, so that tools can read it:
+
+- Text that could be read as something else is in double quotes, such as `"0047"` and `"0.11.0"`.
+- Dates are `YYYY-MM-DD`, without quotes. Log entries and prose keep `DD-MM-YYYY`.
+- A link is a string holding the relative path, from the file's own folder.
+- An empty value is `null`, or `[]` for a list.
 
 ## 2.1 Iterations
 
@@ -332,38 +359,54 @@ IN_PROGRESS, DONE, BLOCKED or PARKED. The roadmap's items use the same statuses.
 
 Each item is a Markdown document in `docs/planning/backlog/items/`, named
 `{NNNN}-{title}.md`, where NNNN is an incremental identifier that never changes. When an
-item is DONE, move it to `docs/planning/backlog/finished/`, and update the links to it.
-`BACKLOG.md` is only the index and overview, and it lists finished items too. When we tidy
-up and groom the backlog, or reprioritize items, you update the Priority field in each
-item's metadata table (section 2.2.1).
+item is DONE, move it to `docs/planning/backlog/finished/`, and update the paths and links to
+it. `BACKLOG.md` is only the index and overview, and it lists finished items too. When we tidy
+up and groom the backlog, or reprioritize items, you update the `priority` field in each
+item's frontmatter (section 2.2.1).
 
-An item can belong to one group, a named batch of work, through the Group field in its
-metadata. Group names are lower-case words joined by hyphens, such as `search-rewrite`. An
-item outside any group has `-` there, and is a single item. An iteration can include single
+An item can belong to one group, a named batch of work, through the `group` field in its
+frontmatter. Group names are lower-case words joined by hyphens, such as `search-rewrite`. An
+item outside any group has `null` there, shown as `-` in `BACKLOG.md`, and is a single item. An iteration can include single
 items, one or more groups, or both. Including a group includes all its items that aren't
 DONE, BLOCKED or PARKED.
 
 An item marked DONE is never reopened. When bugs, updates or refactoring touch code that
 an item delivered, we open new items in the backlog, and add references to the relevant
-older items in their metadata tables.
+older items in their `related_items`.
 
 ### 2.2.1 Backlog item template
 
 Start each item from `docs/templates/backlog-item.md`.
 
+An item has one or more of these labels, which GitHub issues use too:
+
+| Label | Use it for |
+| --- | --- |
+| `accessibility` | A barrier for people with disabilities |
+| `bug` | Something that doesn't work |
+| `documentation` | Documentation and planning documents |
+| `duplicate` | What another item already covers |
+| `enhancement` | An improvement or a new feature |
+| `wontfix` | What we decided not to do |
+| `security` | A risk to users' data, keys or trust. Details stay in the private item |
+| `refactor` | Changing the code's shape and not what it does |
+| `testing` | Tests and proofs, including trying generated projects for real |
+| `tooling` | Build, CI, release and packaging |
+
 ## 2.3 Our work process
 
-### 2.3.1 When ROADMAP.md is empty or all its items are DONE
+### 2.3.1 When the roadmap is empty or all its items are DONE
 
 1. We brainstorm ideas.
-2. We agree which of the ideas go into `ROADMAP.md`, as the project's strategy, vision
-   and goals.
+2. We agree which of the ideas become roadmap items, as the project's strategy, vision and
+   goals.
 
 ### 2.3.2 When BACKLOG.md is empty or all its items are DONE
 
-1. We agree which of the open ideas in the roadmap to build.
+1. We agree which of the open roadmap items to build.
 2. We create backlog items and index them in `BACKLOG.md`. Each item is created from the
-   template in section 2.2.1, with its first tasks.
+   template in section 2.2.1, with its first tasks, and its `roadmap_items` point to the
+   roadmap items it builds.
 3. Later, when an iteration starts, each item's task list is revisited, verified and
    updated.
 
@@ -384,11 +427,12 @@ Start each item from `docs/templates/backlog-item.md`.
    `application-architect` for a design review.
 6. Wait for the review, verify what it found, and make the necessary updates to the
    design document.
-7. Add your questions to me about the design, if you have any, to the design document.
-8. Present the design and your questions to me, and wait for my input. From my feedback,
-   update the design's solution, decisions and log, and record each decision that will
-   outlive the iteration as an ADR (section 2.4.2). Make sure the task lists match the
-   updated design, the review and my input. Then wait for my signal to continue.
+7. Add your questions to the owner about the design, if you have any, to the design document.
+8. Present the design and your questions to the owner, and wait for the owner's input. From
+   that feedback, update the design's solution, decisions and log, and record each decision
+   that will outlive the iteration as an ADR (section 2.4.2). Make sure the task lists match
+   the updated design, the review and the owner's input. Then wait for the owner's signal to
+   continue.
 9. Implement, test and build all the tasks in the iteration's items. Work directly on the
    main branch (`{{MAIN_BRANCH}}`) unless we agree otherwise.
 10. When all the items of the iteration are done, ask `application-architect` and
@@ -398,17 +442,26 @@ Start each item from `docs/templates/backlog-item.md`.
 11. Wait for all the reviews to finish, then read all the feedback. Fix everything you can
     right away, and make new backlog items for issues that need more analysis or a new
     design review.
-12. When all the issues from the reviews are fixed, show me the items you created, if
-    any, and wait for my input. We decide on and prioritize the new items, and consider
+12. When all the issues from the reviews are fixed, show the owner the items you created, if
+    any, and wait for the owner's input. We decide on and prioritize the new items, and consider
     whether to fix them now or plan them for another iteration. Fixes made at this point
     are code reviewed too (steps 9 to 12).
 13. Finally, when everything is implemented, we tidy up, remove temporary files, and make
     a new release.
 
-### 2.3.4 Backlog grooming
+### 2.3.4 Backlog and roadmap grooming
 
 1. After each iteration, we update the roadmap and the backlog. We update the statuses and
-   the groups, and reprioritize where what we have learned calls for it.
+   the groups, and reprioritize where what we have learned calls for it. Finished roadmap
+   items move to `finished/`.
+2. Look at the direction the project is going, from facts and data, including the backlog
+   items that aren't implemented yet, and consider whether new roadmap items are necessary.
+   This isn't about the items the iteration just finished. New roadmap items are added only
+   in agreement with the owner. If those open backlog items would make larger changes to what
+   a finished roadmap item delivered, the new roadmap item references the original through
+   `roadmap_items`.
+3. Check that every path in the frontmatter of these documents still points to a file, since
+   moving an item to `finished/` changes its path.
 
 ## 2.4 Architecture and security documents
 

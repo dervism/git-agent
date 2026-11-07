@@ -1,9 +1,13 @@
 //! Terminal output and the interactive review prompt.
 //!
 //! The commit message goes to stdout; status, warnings and prompts go to stderr.
+//! This module is the only one that may write to them (`clippy.toml`), so that all of it
+//! goes through [`for_terminal`].
+#![allow(clippy::disallowed_methods)]
 
 use crate::git::{self, Repo};
 use crate::prompt;
+use crate::safe_text;
 use anyhow::{Context, Result};
 use std::fmt::Display;
 use std::fs;
@@ -15,10 +19,19 @@ use std::time::{Duration, Instant};
 /// Writes a line to stderr, for the user. Unlike `eprintln!`, it doesn't panic
 /// when the terminal has gone away, so that a hangup can end the program properly.
 macro_rules! say {
-    ($($line:tt)*) => {{
-        let _ = writeln!(io::stderr(), $($line)*);
-    }};
+    ($($line:tt)*) => {
+        to_stderr(&format!($($line)*))
+    };
 }
+
+const RESET: &str = "\x1b[0m";
+const BOLD: &str = "\x1b[1m";
+const DIM: &str = "\x1b[2m";
+const RED: &str = "\x1b[31m";
+const GREEN: &str = "\x1b[32m";
+const YELLOW: &str = "\x1b[33m";
+/// All that [`paint`] writes, and the only escape sequences allowed through to the terminal.
+const STYLES: [&str; 6] = [RESET, BOLD, DIM, RED, GREEN, YELLOW];
 
 const SUBJECT_LIMIT: usize = 72;
 
@@ -60,6 +73,16 @@ pub struct Choice<T> {
     pub value: T,
 }
 
+/// Whether stdout is a terminal rather than a file or a pipe.
+pub fn stdout_is_terminal() -> bool {
+    io::stdout().is_terminal()
+}
+
+/// Whether stderr is a terminal rather than a file or a pipe.
+pub fn stderr_is_terminal() -> bool {
+    io::stderr().is_terminal()
+}
+
 fn color_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| {
@@ -69,32 +92,78 @@ fn color_enabled() -> bool {
     })
 }
 
-fn paint(code: &str, text: &str) -> String {
+fn paint(style: &str, text: &str) -> String {
     if color_enabled() {
-        format!("\x1b[{code}m{text}\x1b[0m")
+        format!("{style}{text}{RESET}")
     } else {
         text.to_owned()
     }
 }
 
 pub fn bold(text: &str) -> String {
-    paint("1", text)
+    paint(BOLD, text)
 }
 
 pub fn dim(text: &str) -> String {
-    paint("2", text)
+    paint(DIM, text)
 }
 
 pub fn red(text: &str) -> String {
-    paint("31", text)
+    paint(RED, text)
 }
 
 pub fn green(text: &str) -> String {
-    paint("32", text)
+    paint(GREEN, text)
 }
 
 pub fn yellow(text: &str) -> String {
-    paint("33", text)
+    paint(YELLOW, text)
+}
+
+/// `text` with everything unsafe escaped, so that text from a repository, a model or a
+/// server can't change the terminal. With `color`, the styles of [`paint`] stay: they
+/// can dim or color text, and can't hide it.
+fn for_terminal(text: &str, color: bool) -> String {
+    if !color {
+        return safe_text::escaped(text);
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some((at, style)) = next_style(rest) {
+        out.push_str(&safe_text::escaped(&rest[..at]));
+        out.push_str(style);
+        rest = &rest[at + style.len()..];
+    }
+    out.push_str(&safe_text::escaped(rest));
+    out
+}
+
+/// Where the first of the [`STYLES`] in `text` starts, and which it is.
+fn next_style(text: &str) -> Option<(usize, &'static str)> {
+    text.match_indices('\x1b').find_map(|(at, _)| {
+        STYLES
+            .iter()
+            .find(|style| text[at..].starts_with(**style))
+            .map(|style| (at, *style))
+    })
+}
+
+/// The one way to stderr for everything the user reads there.
+fn to_stderr(line: &str) {
+    let _ = writeln!(io::stderr(), "{}", for_terminal(line, color_enabled()));
+}
+
+/// Writes a line to stdout, after making it safe for the terminal.
+pub fn out(line: &str) {
+    raw_out(&for_terminal(line, color_enabled()));
+}
+
+/// Writes text to stdout without styles, for what a pipeline reads: a model's cleaned
+/// reply, or the user's own settings. Those are safe already, so escaping changes nothing
+/// in them, and it keeps a new caller from printing what isn't.
+#[allow(clippy::print_stdout)]
+pub fn raw_out(text: &str) {
+    println!("{}", safe_text::escaped(text));
 }
 
 /// Formats a number with thousands separators, e.g. 131,072.
@@ -154,9 +223,9 @@ pub fn show_framed(heading: &str, text: &str) {
     const WIDTH: usize = 64;
     let title = format!("── {heading} ");
     let title_rule = "─".repeat(WIDTH.saturating_sub(title.chars().count()));
-    println!("\n{}", dim(&format!("{title}{title_rule}")));
-    println!("{text}");
-    println!("{}", dim(&"─".repeat(WIDTH)));
+    out(&format!("\n{}", dim(&format!("{title}{title_rule}"))));
+    out(text);
+    out(&dim(&"─".repeat(WIDTH)));
 }
 
 /// Prints the model's answer: framed under `heading` in a terminal, and as it
@@ -165,7 +234,7 @@ pub fn show_answer(heading: &str, text: &str) {
     if io::stdout().is_terminal() {
         show_framed(heading, text);
     } else {
-        println!("{text}");
+        raw_out(text);
     }
 }
 
@@ -189,6 +258,7 @@ impl Spinner {
             info(&label);
             return Self(None);
         }
+        let label = for_terminal(&label, color_enabled());
         let task = tokio::spawn(async move {
             const FRAMES: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
             let started = Instant::now();
@@ -295,7 +365,7 @@ fn help<T>(review: &Review<T>) -> String {
 
 /// Prompts on stderr and reads a trimmed line, or `None` at end of input.
 fn read_line(prompt: &str) -> Result<Option<String>> {
-    let _ = write!(io::stderr(), "{prompt} ");
+    let _ = write!(io::stderr(), "{} ", for_terminal(prompt, color_enabled()));
     io::stderr().flush()?;
     let mut line = String::new();
     let read = io::stdin()
@@ -303,7 +373,7 @@ fn read_line(prompt: &str) -> Result<Option<String>> {
         .read_line(&mut line)
         .context("failed to read input")?;
     if read == 0 {
-        say!();
+        say!("");
         return Ok(None);
     }
     Ok(Some(line.trim().to_owned()))
@@ -414,6 +484,55 @@ fn strip_comments(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn keeps_only_the_styles_it_writes_itself() {
+        for style in STYLES {
+            let painted = format!("{style}text{RESET}");
+            assert_eq!(for_terminal(&painted, true), painted);
+            assert_eq!(
+                for_terminal(&painted, false),
+                safe_text::escaped(&painted),
+                "without color, a style is only text"
+            );
+            assert!(!for_terminal(&painted, false).contains('\x1b'));
+        }
+    }
+
+    #[test]
+    fn escapes_every_other_sequence_with_or_without_color() {
+        for color in [true, false] {
+            for (text, wanted) in [
+                ("\x1b[2Jx", "\\033[2Jx"),
+                ("\x1b[8mhidden", "\\033[8mhidden"),
+                ("\x1b[1;31mx", "\\033[1;31mx"),
+                ("\x1b]0;title\x07", "\\033]0;title\\a"),
+                ("\u{9b}2J", "\\302\\2332J"),
+                ("end\x1b", "end\\033"),
+                ("over\rwrite", "over\\rwrite"),
+                ("rev\u{202e}x", "rev\\342\\200\\256x"),
+            ] {
+                assert_eq!(for_terminal(text, color), wanted, "{text:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn handles_an_allowed_style_next_to_a_forbidden_sequence() {
+        assert_eq!(
+            for_terminal("\x1b[1m\x1b[2Jbold\x1b[0m", true),
+            "\x1b[1m\\033[2Jbold\x1b[0m"
+        );
+        assert_eq!(
+            for_terminal("a\x1b[33mæøå\nb\x1b[0m\tc", true),
+            "a\x1b[33mæøå\nb\x1b[0m\tc"
+        );
+    }
+
+    #[test]
+    fn keeps_line_breaks_tabs_and_letters() {
+        assert_eq!(for_terminal("æøå\nline\tfour", false), "æøå\nline\tfour");
+    }
 
     #[test]
     fn separates_thousands() {

@@ -10,6 +10,7 @@ use crate::config::{
 };
 use crate::models::FALLBACK_CONTEXT_LENGTH;
 use crate::providers::{self, PROVIDERS};
+use crate::safe_text::one_line;
 use crate::server::{ModelInfo, ModelServer, Server};
 use crate::temp::PrivateDir;
 use crate::ui::{self, thousands};
@@ -93,7 +94,7 @@ struct Menu<'a> {
 }
 
 pub async fn run(settings: &SettingArgs) -> Result<()> {
-    if !io::stdin().is_terminal() || !io::stderr().is_terminal() {
+    if !io::stdin().is_terminal() || !ui::stderr_is_terminal() {
         bail!(
             "the settings menu needs a terminal; edit the config file instead \
              (`git agent config init` creates one)"
@@ -559,10 +560,11 @@ impl fmt::Display for ModelOption {
                 if let Some(tokens) = model.context_length {
                     details.push(format!("{} tokens", thousands(tokens)));
                 }
+                let id = one_line(&model.id);
                 if details.is_empty() {
-                    f.write_str(&model.id)
+                    f.write_str(&id)
                 } else {
-                    write!(f, "{}  ({})", model.id, details.join(", "))
+                    write!(f, "{id}  ({})", details.join(", "))
                 }
             }
             ModelOption::Typed => f.write_str("Type a model ID…"),

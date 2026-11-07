@@ -1,3 +1,5 @@
+#![warn(clippy::print_stdout, clippy::print_stderr, clippy::dbg_macro)]
+
 mod branch;
 mod cli;
 mod config;
@@ -10,9 +12,11 @@ mod models;
 mod prompt;
 mod providers;
 mod redact;
+mod safe_text;
 mod secrets;
 mod server;
 mod split;
+mod staging;
 mod temp;
 mod tidy;
 mod ui;
@@ -175,20 +179,12 @@ async fn generate(args: &GenerateArgs, settings: &SettingArgs) -> Result<()> {
     let config = Config::load(settings)?.config;
     let repo = Repo::open(".")?;
     let ask = !args.commit && !args.raw && io::stdin().is_terminal();
-    if args.all && !stage_all(&repo, ask)? {
-        ui::info("Nothing staged or committed.");
-        return Ok(());
-    }
-
-    let Some((scope, mut changes)) = repo.changes(&config.exclude)? else {
-        match repo.untracked_count()? {
-            0 => ui::info("✨ No changes to commit."),
-            // --all already said which untracked files it left out.
-            _ if args.all => ui::info("✨ No changes to commit besides the files left out above."),
-            n => ui::info(format!(
-                "No changes to tracked files, but {n} untracked path(s). Use --all to include them."
-            )),
-        }
+    let Some(ToCommit {
+        scope,
+        mut changes,
+        leave_out,
+    }) = changes_to_commit(&repo, args, &config, ask)?
+    else {
         return Ok(());
     };
 
@@ -239,12 +235,12 @@ async fn generate(args: &GenerateArgs, settings: &SettingArgs) -> Result<()> {
     let message = commit_message(&server, &model, &conversation).await?;
 
     if args.raw {
-        println!("{message}");
+        ui::raw_out(&message);
         return Ok(());
     }
     ui::show_proposal(&COMMIT_REVIEW, &message);
     if args.commit {
-        commit(&repo, &message, scope, &args.git_args)?;
+        commit(&repo, &message, scope, &args.git_args, &leave_out)?;
         if args.push {
             check_outgoing(&repo, &config).context(NOT_PUSHED)?;
             push(&repo, false).context(NOT_PUSHED)?;
@@ -274,12 +270,55 @@ async fn generate(args: &GenerateArgs, settings: &SettingArgs) -> Result<()> {
         ui::info("Nothing committed.");
         return Ok(());
     };
-    commit(&repo, &message, scope, &args.git_args)?;
+    commit(&repo, &message, scope, &args.git_args, &leave_out)?;
     if and_push || args.push {
         check_outgoing(&repo, &config).context(NOT_PUSHED)?;
         push(&repo, true).context(NOT_PUSHED)?;
     }
     Ok(())
+}
+
+/// What `git agent` commits: the changes, how, and the submodule pointers it leaves out
+/// because the diff hides them.
+struct ToCommit {
+    scope: Scope,
+    changes: Changes,
+    leave_out: Vec<String>,
+}
+
+/// The changes to commit and how, or `None` if there are none, after everything that
+/// doesn't need the model. Unresolved conflicts come first, because `--all` would mark
+/// them as resolved.
+fn changes_to_commit(
+    repo: &Repo,
+    args: &GenerateArgs,
+    config: &Config,
+    ask: bool,
+) -> Result<Option<ToCommit>> {
+    staging::refuse_unresolved_conflicts(repo, "committing")?;
+    if args.all && !staging::stage_all(repo, ask)? {
+        ui::info("Nothing staged or committed.");
+        return Ok(None);
+    }
+    let found = repo.changes(&config.exclude)?;
+    let commits_all = matches!(found, Some((Scope::Tracked, _)));
+    let hidden = staging::hidden_pointers(repo, commits_all)?;
+    staging::report_hidden_pointers(&hidden, false);
+    if found.is_none() {
+        match repo.untracked_count()? {
+            0 => ui::info("✨ No changes to commit."),
+            // --all already said which untracked files it left out.
+            _ if args.all => ui::info("✨ No changes to commit besides the files left out above."),
+            n => ui::info(format!(
+                "No changes to tracked files, but {n} untracked path(s). Use --all to include them."
+            )),
+        }
+    }
+    Ok(found.map(|(scope, changes)| ToCommit {
+        scope,
+        changes,
+        leave_out: hidden.changed,
+    }))
 }
 
 async fn pull_request(args: &PrArgs, settings: &SettingArgs) -> Result<()> {
@@ -366,7 +405,7 @@ async fn pull_request(args: &PrArgs, settings: &SettingArgs) -> Result<()> {
     let text = generate_message(&server, &model, &conversation).await?;
 
     if args.raw {
-        println!("{text}");
+        ui::raw_out(&text);
         return Ok(());
     }
     ui::show_proposal(&PULL_REQUEST_REVIEW, &text);
@@ -443,7 +482,7 @@ async fn new_branch(args: &BranchArgs, settings: &SettingArgs) -> Result<()> {
         Work::Changes(&changes)
     } else if let Some(reference) = branch::issue_reference(description) {
         let mut found = github::issue(repo.workdir(), &reference)?;
-        ui::info(format!("🔍 Issue #{}: {}", found.number, found.title));
+        ui::info(format!("🔍 {}", found.summary()));
         let redacted = redact::text(&found.body, &format!("issue #{}", found.number));
         found.body = redacted.text;
         report_secrets(
@@ -477,7 +516,7 @@ async fn new_branch(args: &BranchArgs, settings: &SettingArgs) -> Result<()> {
     };
     let mut name = clean(generate_message(&server, &model, &conversation).await?)?;
     if args.raw {
-        println!("{name}");
+        ui::raw_out(&name);
         return Ok(());
     }
 
@@ -612,9 +651,9 @@ async fn tidy_commits(args: &TidyArgs, settings: &SettingArgs) -> Result<()> {
         "🔍 {} commit(s) to tidy, from {} {} to {} {}",
         commits.len(),
         commits[0].short,
-        commits[0].subject(),
+        safe_text::one_line(commits[0].subject()),
         commits[commits.len() - 1].short,
-        commits[commits.len() - 1].subject()
+        safe_text::one_line(commits[commits.len() - 1].subject())
     ));
     let findings: Vec<Finding> = commits
         .iter()
@@ -796,7 +835,7 @@ impl Tidier<'_> {
             ui::info(format!(
                 "\n✏️  A new message for {} {}",
                 commit.short,
-                commit.subject()
+                safe_text::one_line(commit.subject())
             ));
             let mut changes = self.changes(group, &config.exclude)?;
             changes.diff = redact::diff(&changes.diff).text;
@@ -923,7 +962,9 @@ async fn explain_lines(args: &WhyArgs, settings: &SettingArgs) -> Result<()> {
     if let Some(latest) = history.first() {
         status.push_str(&format!(
             ", last changed in {} ({}, {})",
-            latest.short, latest.author, latest.date
+            latest.short,
+            safe_text::one_line(&latest.author),
+            latest.date
         ));
     }
     let count = history.len();
@@ -1070,7 +1111,7 @@ async fn explain_commits(args: &ExplainArgs, settings: &SettingArgs) -> Result<(
     let summary = changes.stat.lines().last().unwrap_or_default().trim();
     if subject.single {
         let message = commits[0].message.trim_start_matches("- ");
-        let title = message.lines().next().unwrap_or_default();
+        let title = safe_text::one_line(message.lines().next().unwrap_or_default());
         ui::info(format!("🔍 {} ({title}): {summary}", subject.heading));
     } else {
         ui::info(format!(
@@ -1129,7 +1170,7 @@ async fn discuss(
 ) -> Result<()> {
     let mut answer = generate_message(server, model, &conversation).await?;
     ui::show_answer(heading, &answer);
-    if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
+    if !io::stdin().is_terminal() || !ui::stdout_is_terminal() {
         return Ok(());
     }
     while let Some(question) = ui::ask_follow_up()? {
@@ -1159,47 +1200,6 @@ fn conversation_tokens(conversation: &[Message]) -> usize {
         .iter()
         .map(|message| prompt::estimate_tokens(&message.content))
         .sum()
-}
-
-/// Stages everything for `--all`, after checking the untracked files for
-/// build output, dependencies, secrets and large files that a `.gitignore`
-/// should keep out. With `ask`, the user decides what happens to them;
-/// otherwise they are left out. Returns `false` if the user quit.
-fn stage_all(repo: &Repo, ask: bool) -> Result<bool> {
-    let top = repo.toplevel()?;
-    let findings = untracked::check(&top, &repo.untracked_files()?);
-    if findings.is_empty() {
-        repo.stage_all()?;
-        return Ok(true);
-    }
-    ui::warn("some untracked files look like they should be ignored rather than committed:");
-    ui::info(untracked::list(&findings));
-    if !ask {
-        repo.stage_all_except(&untracked::exclude(&findings))?;
-        ui::info(ui::dim(
-            "   git-agent left them out. Add them to .gitignore, or stage them yourself with git add.",
-        ));
-        return Ok(true);
-    }
-    match ui::ask_untracked()? {
-        ui::UntrackedChoice::Ignore => ignore_and_stage_the_rest(repo, &top, &findings)?,
-        ui::UntrackedChoice::Commit => repo.stage_all()?,
-        ui::UntrackedChoice::Quit => return Ok(false),
-    }
-    Ok(true)
-}
-
-/// Adds `findings` to `.gitignore`, and stages everything else.
-fn ignore_and_stage_the_rest(
-    repo: &Repo,
-    top: &Path,
-    findings: &[untracked::Finding],
-) -> Result<()> {
-    let added = untracked::add_to_gitignore(top, findings)?;
-    if !added.is_empty() {
-        ui::info(format!("📝 Added to .gitignore: {}", added.join(", ")));
-    }
-    repo.stage_all_except(&untracked::exclude_what_gitignore_cant_hold(findings))
 }
 
 /// Connects to the configured server and picks the model to use.
@@ -1409,7 +1409,7 @@ fn report_model(model: &Model, prompt_tokens: usize) {
     };
     ui::info(format!(
         "🤖 {}{chosen} {}",
-        model.id,
+        safe_text::one_line(&model.id),
         ui::dim(&format!(
             "· prompt about {} of {} context tokens",
             thousands(prompt_tokens),
@@ -1504,20 +1504,43 @@ fn first_few(items: &[String]) -> String {
     text
 }
 
+/// Asks the model, with control and invisible characters escaped on the way out and
+/// taken out of its reply, so that what the user reviews is what gets committed.
 async fn generate_message(
     server: &impl ModelServer,
     model: &Model,
     conversation: &[Message],
 ) -> Result<String> {
+    let outgoing = prompt::for_model(conversation);
+    if prompt::outgrew_context(
+        conversation,
+        &outgoing,
+        model.context_length,
+        model.max_output_tokens,
+    ) {
+        bail!(
+            "the changes hold so many control or invisible characters that, escaped, they no \
+             longer fit in the model's context"
+        );
+    }
     let reply = {
-        let _spinner = ui::Spinner::start(format!("Generating with {}", model.id));
-        server.complete(&model.id, conversation).await?
+        let _spinner = ui::Spinner::start(format!(
+            "Generating with {}",
+            safe_text::one_line(&model.id)
+        ));
+        server.complete(&model.id, &outgoing).await?
     };
-    let message = prompt::clean_response(&reply);
-    if message.is_empty() {
+    let cleaned = prompt::clean_reply(&reply);
+    if cleaned.removed > 0 {
+        ui::warn(format!(
+            "the model's reply held {} control or invisible character(s); git-agent removed them",
+            cleaned.removed
+        ));
+    }
+    if cleaned.text.is_empty() {
         bail!("the model returned an empty message");
     }
-    Ok(message)
+    Ok(cleaned.text)
 }
 
 /// A commit message from the model, with its subject apart from its body.
@@ -1536,8 +1559,14 @@ fn separated(message: String) -> Result<String> {
     Ok(prompt::separate_subject(&message))
 }
 
-fn commit(repo: &Repo, message: &str, scope: Scope, git_args: &[String]) -> Result<()> {
-    repo.commit(message, scope, git_args)?;
+fn commit(
+    repo: &Repo,
+    message: &str,
+    scope: Scope,
+    git_args: &[String],
+    leave_out: &[String],
+) -> Result<()> {
+    repo.commit(message, scope, git_args, leave_out)?;
     ui::info(ui::green("✅ Committed."));
     Ok(())
 }
@@ -1579,7 +1608,12 @@ async fn list_models(settings: &SettingArgs) -> Result<()> {
         Some(model) => Some(model.clone()),
         None => models::choose(models.clone()).ok().map(|model| model.id),
     };
-    let width = models.iter().map(|model| model.id.len()).max().unwrap_or(0);
+    let shown_id = |model: &server::ModelInfo| safe_text::one_line(&model.id);
+    let width = models
+        .iter()
+        .map(|model| shown_id(model).chars().count())
+        .max()
+        .unwrap_or(0);
     for model in &models {
         let marker = if chosen.as_ref() == Some(&model.id) {
             "*"
@@ -1594,10 +1628,10 @@ async fn list_models(settings: &SettingArgs) -> Result<()> {
             details.push(format!("{} tokens of context", thousands(tokens)));
         }
         if details.is_empty() {
-            println!("{marker} {}", model.id);
+            ui::out(&format!("{marker} {}", shown_id(model)));
         } else {
             let details = ui::dim(&details.join(", "));
-            println!("{marker} {:width$}  {details}", model.id);
+            ui::out(&format!("{marker} {:width$}  {details}", shown_id(model)));
         }
     }
 
@@ -1641,26 +1675,29 @@ fn show_config(settings: &SettingArgs) -> Result<()> {
         (Some(path), false) => format!("# No file at {}; using defaults", path.display()),
         (None, _) => "# No config location found; using defaults".to_owned(),
     };
-    println!("{source}\n# Flags and GIT_AGENT_* environment variables are applied.");
+    ui::raw_out(&format!(
+        "{source}\n# Flags and GIT_AGENT_* environment variables are applied."
+    ));
     if loaded.config.model.is_none() {
-        println!("# `model` is not set: git-agent uses the model loaded on the server.");
+        ui::raw_out("# `model` is not set: git-agent uses the model loaded on the server.");
     }
     if loaded.config.context_length.is_none() {
-        println!(
+        ui::raw_out(&format!(
             "# `context_length` is not set: git-agent asks the server, or assumes {} tokens.",
             models::FALLBACK_CONTEXT_LENGTH
-        );
+        ));
     }
     let flag_key = settings
         .api_key
         .as_deref()
         .is_some_and(|key| !key.trim().is_empty());
-    match (flag_key, loaded.config.api_key.is_some()) {
-        (true, _) => println!("# API key: from --api-key or GIT_AGENT_API_KEY."),
-        (false, true) => println!("# API key: saved in the macOS keychain."),
-        (false, false) => println!("# API key: none."),
-    }
-    print!("\n{}", toml::to_string_pretty(&loaded.config)?);
+    ui::raw_out(match (flag_key, loaded.config.api_key.is_some()) {
+        (true, _) => "# API key: from --api-key or GIT_AGENT_API_KEY.",
+        (false, true) => "# API key: saved in the macOS keychain.",
+        (false, false) => "# API key: none.",
+    });
+    let settings_text = toml::to_string_pretty(&loaded.config)?;
+    ui::raw_out(&format!("\n{}", settings_text.trim_end()));
     Ok(())
 }
 
@@ -1668,24 +1705,175 @@ fn show_config(settings: &SettingArgs) -> Result<()> {
 mod tests {
     use super::*;
     use crate::git::test_support::{isolated_repo, run};
+    use crate::server::test_support::FakeServer;
+    use models::ContextSource;
+    use tempfile::TempDir;
+
+    fn model(context_length: usize) -> Model {
+        Model {
+            id: "fake".to_owned(),
+            picked: None,
+            context_length,
+            context_source: ContextSource::Config,
+            max_output_tokens: config::DEFAULT_MAX_OUTPUT_TOKENS,
+        }
+    }
+
+    fn generate_args(arguments: &[&str]) -> GenerateArgs {
+        let command = std::iter::once("git-agent").chain(arguments.iter().copied());
+        Cli::parse_from(command).generate
+    }
+
+    /// A repository where `git stash pop` left `f.txt` and `Kjøre plan.txt` in conflict.
+    fn conflicted() -> (TempDir, Repo) {
+        let (dir, repo) = isolated_repo();
+        let write = |name: &str, text: &str| fs::write(dir.path().join(name), text).unwrap();
+        write("f.txt", "base\n");
+        write("Kjøre plan.txt", "base\n");
+        write("other.txt", "base\n");
+        run(dir.path(), &["add", "--all"]);
+        run(dir.path(), &["commit", "-q", "-m", "base"]);
+        write("f.txt", "stashed\n");
+        write("Kjøre plan.txt", "stashed\n");
+        run(dir.path(), &["stash", "-q"]);
+        write("f.txt", "theirs\n");
+        write("Kjøre plan.txt", "theirs\n");
+        run(dir.path(), &["commit", "-q", "-a", "-m", "theirs"]);
+        let popped = std::process::Command::new("git")
+            .current_dir(dir.path())
+            .args(["stash", "pop", "-q"])
+            .output()
+            .unwrap();
+        assert!(!popped.status.success(), "the stash should conflict");
+        (dir, repo)
+    }
 
     #[test]
-    fn keeps_a_file_that_gitignore_cant_name_out_of_what_it_stages() {
-        let (dir, repo) = isolated_repo();
-        fs::write(dir.path().join("x\ny.pem"), "key\n").unwrap();
-        fs::write(dir.path().join("plain.pem"), "key\n").unwrap();
-        fs::write(dir.path().join("other.txt"), "text\n").unwrap();
-        let untracked = repo.untracked_files().unwrap();
-        let findings = untracked::check(dir.path(), &untracked);
-        assert_eq!(findings.len(), 2, "{findings:?}");
+    fn refuses_conflicts_in_every_mode_and_keeps_them_unresolved() {
+        for arguments in [
+            &[][..],
+            &["--all"],
+            &["--commit"],
+            &["--all", "--commit"],
+            &["--raw"],
+            &["--all", "--raw"],
+        ] {
+            let (dir, repo) = conflicted();
+            let head = repo.resolve("HEAD").unwrap();
+            let error =
+                changes_to_commit(&repo, &generate_args(arguments), &Config::default(), false)
+                    .map(|_| ())
+                    .unwrap_err();
+            let message = format!("{error:#}");
+            assert!(
+                message.starts_with("2 files have unresolved conflicts"),
+                "{arguments:?}: {message}"
+            );
+            assert!(message.contains("   Kjøre plan.txt\n   f.txt"), "{message}");
+            assert_eq!(repo.resolve("HEAD").unwrap(), head, "{arguments:?}");
+            assert_eq!(
+                repo.unmerged_paths().unwrap(),
+                ["Kjøre plan.txt", "f.txt"],
+                "{arguments:?}"
+            );
+            drop(dir);
+        }
+    }
 
-        ignore_and_stage_the_rest(&repo, dir.path(), &findings).unwrap();
-        let staged = run(dir.path(), &["diff", "--cached", "--name-only", "-z"]);
-        let staged: Vec<&str> = staged.split('\0').filter(|name| !name.is_empty()).collect();
-        assert_eq!(staged, [".gitignore", "other.txt"]);
+    #[test]
+    fn commits_a_merge_whose_conflicts_are_resolved() {
+        let (dir, repo) = conflicted();
+        fs::write(dir.path().join("f.txt"), "resolved\n").unwrap();
+        fs::write(dir.path().join("Kjøre plan.txt"), "resolved\n").unwrap();
+        run(dir.path(), &["add", "--all"]);
+        let found = changes_to_commit(&repo, &generate_args(&[]), &Config::default(), false)
+            .unwrap()
+            .expect("the resolved changes");
+        assert_eq!(found.scope, Scope::Staged);
+    }
+
+    #[test]
+    fn finds_nothing_to_commit_in_a_clean_repository() {
+        let (_dir, repo) = isolated_repo();
+        let found =
+            changes_to_commit(&repo, &generate_args(&[]), &Config::default(), false).unwrap();
+        assert!(found.is_none());
+    }
+
+    #[test]
+    fn leaves_a_hidden_pointer_out_of_a_commit_of_tracked_changes_only() {
+        let (dir, repo, _library, moved) = crate::git::test_support::with_submodule();
+        run(dir.path(), &["config", "submodule.library.ignore", "all"]);
+        crate::git::test_support::move_pointer(dir.path(), &moved);
+        fs::write(dir.path().join("lib.rs"), "fn b() {}\n").unwrap();
+        let args = generate_args(&[]);
+        let tracked = changes_to_commit(&repo, &args, &Config::default(), false)
+            .unwrap()
+            .unwrap();
+        assert_eq!(tracked.scope, Scope::Tracked);
+        assert_eq!(tracked.leave_out, ["library"]);
+
+        run(dir.path(), &["add", "lib.rs"]);
+        let staged = changes_to_commit(&repo, &args, &Config::default(), false)
+            .unwrap()
+            .unwrap();
+        assert_eq!(staged.scope, Scope::Staged);
+        assert!(staged.leave_out.is_empty());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn commits_exactly_the_text_the_user_was_shown() {
+        let (dir, repo) = isolated_repo();
+        fs::write(dir.path().join("a.txt"), "a\n").unwrap();
+        run(dir.path(), &["add", "--all"]);
+        let server = FakeServer::new("{}", "feat: add\u{1b}[2J a\u{202e}\n\nbody\rtext\u{9b}");
+        let conversation = [Message::user("write a message")];
+
+        let message = commit_message(&server, &model(100_000), &conversation)
+            .await
+            .unwrap();
+
+        assert_eq!(message, "feat: add[2J a\n\nbodytext");
+        commit(&repo, &message, Scope::Staged, &[], &[]).unwrap();
         assert_eq!(
-            fs::read_to_string(dir.path().join(".gitignore")).unwrap(),
-            "/plain.pem\n"
+            run(dir.path(), &["log", "-1", "--format=%B"]).trim_end(),
+            message
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn sends_the_model_escaped_text_with_letters_and_line_endings_intact() {
+        let server = FakeServer::new("{}", "feat: x");
+        let conversation = [Message::user("+ blåbær\r\n+ \u{e0041}\u{1b}[2J")];
+
+        generate_message(&server, &model(100_000), &conversation)
+            .await
+            .unwrap();
+
+        let sent = server.received.borrow();
+        assert_eq!(
+            sent[0][0].content,
+            "+ blåbær\r\n+ \\363\\240\\201\\201\\033[2J"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn refuses_a_reply_of_only_hidden_characters() {
+        let server = FakeServer::new("{}", "\u{1b}\u{202e}");
+        let error = generate_message(&server, &model(100_000), &[Message::user("x")])
+            .await
+            .unwrap_err();
+        assert_eq!(error.to_string(), "the model returned an empty message");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn says_why_when_escaping_overfills_the_context() {
+        let server = FakeServer::new("{}", "feat: x");
+        let conversation = [Message::user("\u{1b}".repeat(4000))];
+        let error = generate_message(&server, &model(3000), &conversation)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("no longer fit"), "{error}");
+        assert!(server.received.borrow().is_empty());
     }
 }

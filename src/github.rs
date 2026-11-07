@@ -1,5 +1,6 @@
 //! Pull requests and issues through the GitHub CLI (`gh`), which brings its own login.
 
+use crate::safe_text::one_line;
 use anyhow::{Context, Result, anyhow, bail};
 use std::io::{self, ErrorKind, Write};
 use std::path::Path;
@@ -12,6 +13,13 @@ pub struct Issue {
     pub title: String,
     pub body: String,
     pub labels: Vec<String>,
+}
+
+impl Issue {
+    /// The issue on one line, whatever its title holds.
+    pub fn summary(&self) -> String {
+        format!("Issue #{}: {}", self.number, one_line(&self.title))
+    }
 }
 
 /// A pull request to create.
@@ -171,6 +179,20 @@ pub fn create_pull_request(dir: &Path, pull_request: &PullRequest) -> Result<()>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn keeps_an_issue_on_one_line() {
+        let issue = Issue {
+            number: 7,
+            title: "Fiks å lagre\n✅ Pushed.\u{1b}[2J".to_owned(),
+            body: String::new(),
+            labels: Vec::new(),
+        };
+        assert_eq!(
+            issue.summary(),
+            "Issue #7: Fiks å lagre\\n✅ Pushed.\\033[2J"
+        );
+    }
 
     #[test]
     fn reads_an_issue() {

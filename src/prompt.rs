@@ -3,6 +3,7 @@
 use crate::fit::{self, FileFit};
 use crate::git::Changes;
 use crate::github::Issue;
+use crate::safe_text::{self, Cleaned, without_hidden};
 use crate::server::Message;
 use std::fmt::Write;
 
@@ -566,15 +567,54 @@ fn describe_changes(intro: String, changes: &Changes, room: usize) -> (String, F
     (out, fit)
 }
 
-/// Strips reasoning blocks and code fences that models sometimes wrap around the message.
-pub fn clean_response(raw: &str) -> String {
+/// A model's reply, without the reasoning and code fences that models sometimes wrap
+/// around it, and without hidden characters, so that what's shown is what gets committed.
+/// Those go before the fence, because a BOM ahead of a fence would otherwise keep it.
+pub fn clean_reply(raw: &str) -> Cleaned {
     let mut text = raw;
     for close in ["</think>", "</thinking>"] {
         if let Some(end) = text.rfind(close) {
             text = &text[end + close.len()..];
         }
     }
-    normalize(strip_code_fence(text.trim()))
+    let cleaned = without_hidden(text);
+    Cleaned {
+        text: normalize(strip_code_fence(cleaned.text.trim())),
+        removed: cleaned.removed,
+    }
+}
+
+/// The conversation as it goes to the model, with control and invisible characters
+/// escaped, so that a file can't hide instructions from the person reviewing its diff.
+/// Patches aren't made from this text, so commits are unchanged.
+pub fn for_model(conversation: &[Message]) -> Vec<Message> {
+    conversation
+        .iter()
+        .map(|message| Message {
+            role: message.role,
+            content: safe_text::escaped(&message.content),
+        })
+        .collect()
+}
+
+/// Whether escaping made `conversation` too large for the model's context, with room left
+/// for its reply. What's sent is sized before it's escaped, so only text full of such
+/// characters can get here.
+pub fn outgrew_context(
+    conversation: &[Message],
+    outgoing: &[Message],
+    context_length: usize,
+    max_output_tokens: usize,
+) -> bool {
+    let tokens = |messages: &[Message]| -> usize {
+        messages
+            .iter()
+            .map(|message| estimate_tokens(&message.content))
+            .sum()
+    };
+    let (before, after) = (tokens(conversation), tokens(outgoing));
+    let room = context_length.saturating_sub(reply_reserve(context_length, max_output_tokens));
+    before <= room && after > room
 }
 
 fn strip_code_fence(text: &str) -> &str {
@@ -621,12 +661,77 @@ mod tests {
     fn removes_reasoning_and_fences() {
         let raw =
             "<think>\nThe diff renames...\n</think>\n\n```text\nfix: rename a  \n\nbody\n```\n";
-        assert_eq!(clean_response(raw), "fix: rename a\n\nbody");
-        assert_eq!(clean_response("feat: x"), "feat: x");
+        assert_eq!(clean_reply(raw).text, "fix: rename a\n\nbody");
+        assert_eq!(clean_reply("feat: x").text, "feat: x");
         assert_eq!(
-            clean_response("hidden opening tag</think>\nfeat: x"),
+            clean_reply("hidden opening tag</think>\nfeat: x").text,
             "feat: x"
         );
+    }
+
+    #[test]
+    fn removes_hidden_characters_from_a_reply_and_counts_them() {
+        let cleaned = clean_reply("fix: a\u{1b}[2Jb\n\nbody\u{202e} text\r more");
+        assert_eq!(cleaned.text, "fix: a[2Jb\n\nbody text more");
+        assert_eq!(cleaned.removed, 3);
+    }
+
+    #[test]
+    fn doesnt_count_hidden_characters_in_the_reasoning() {
+        let cleaned = clean_reply("<think>\u{1b}[2J\u{202e}</think>\nfeat: x");
+        assert_eq!(cleaned.text, "feat: x");
+        assert_eq!(cleaned.removed, 0);
+    }
+
+    #[test]
+    fn a_reply_of_only_hidden_characters_is_empty() {
+        let cleaned = clean_reply("\u{1b}\u{202e}\u{200b}\n\u{feff}");
+        assert_eq!(cleaned.text, "");
+        assert_eq!(cleaned.removed, 4);
+    }
+
+    #[test]
+    fn strips_a_fence_behind_a_bom() {
+        let cleaned = clean_reply("\u{feff}```text\nfeat: x\n```\n");
+        assert_eq!(cleaned.text, "feat: x");
+        assert_eq!(cleaned.removed, 1);
+    }
+
+    #[test]
+    fn keeps_trailing_whitespace_from_hiding_behind_a_hidden_character() {
+        assert_eq!(clean_reply("feat: x  \u{200b}\nbody").text, "feat: x\nbody");
+    }
+
+    #[test]
+    fn escapes_what_goes_to_the_model_and_keeps_the_rest() {
+        let conversation = [
+            Message::system("rules"),
+            Message::user("+ blåbær\u{e0041}\r\n+ \u{1b}[2J Kjøre.txt\u{202e}"),
+        ];
+        let outgoing = for_model(&conversation);
+        assert_eq!(outgoing[0].role, conversation[0].role);
+        assert_eq!(outgoing[1].role, conversation[1].role);
+        assert_eq!(outgoing[0].content, "rules");
+        assert_eq!(
+            outgoing[1].content,
+            "+ blåbær\\363\\240\\201\\201\r\n+ \\033[2J Kjøre.txt\\342\\200\\256"
+        );
+    }
+
+    #[test]
+    fn notices_only_escaping_that_outgrows_the_context() {
+        let plain = [Message::user("x".repeat(4000))];
+        assert!(!outgrew_context(&plain, &for_model(&plain), 10, REPLY));
+
+        let hidden = [Message::user("\u{1b}".repeat(4000))];
+        let outgoing = for_model(&hidden);
+        assert!(outgrew_context(&hidden, &outgoing, 3000, REPLY));
+        assert!(!outgrew_context(&hidden, &outgoing, 100_000, REPLY));
+        // 4,000 tokens fit in 5,000, but not with 1,250 kept for the reply.
+        assert!(outgrew_context(&hidden, &outgoing, 5000, REPLY));
+        // A conversation over the room already is the server's to judge.
+        let long = [Message::user(format!("{}\u{1b}", "x".repeat(40_000)))];
+        assert!(!outgrew_context(&long, &for_model(&long), 5000, REPLY));
     }
 
     fn diff(lines: usize) -> String {

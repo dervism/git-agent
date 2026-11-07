@@ -148,7 +148,10 @@ The script works these out itself:
 │   ├── agents/                      the agent team's briefs, as plain Markdown
 │   ├── templates/                   the templates for the documents the process creates
 │   ├── planning/                    private: git-ignored
-│   │   ├── ROADMAP.md
+│   │   ├── roadmap/
+│   │   │   ├── ROADMAP.md
+│   │   │   ├── items/
+│   │   │   └── finished/
 │   │   └── backlog/
 │   │       ├── BACKLOG.md
 │   │       ├── items/
@@ -452,10 +455,17 @@ themselves, and the agent exports it for other commands.
 ### 8. Configure GitHub (script, asks first for each)
 
 ```sh
-# The labels the issue forms use
+# The labels that issues and backlog items use
+gh label create accessibility --description "A barrier for people with disabilities" --force
 gh label create bug --description "Something doesn't work" --force
-gh label create enhancement --description "An improvement or a new feature" --force
 gh label create documentation --description "Documentation and the website" --force
+gh label create duplicate --description "What another issue already covers" --force
+gh label create enhancement --description "An improvement or a new feature" --force
+gh label create wontfix --description "What we decided not to do" --force
+gh label create security --description "A risk to users' data, keys or trust" --force
+gh label create refactor --description "Changing the code's shape and not what it does" --force
+gh label create testing --description "Tests and proofs" --force
+gh label create tooling --description "Build, CI, release and packaging" --force
 
 # Dependabot alerts and security updates
 gh api -X PUT repos/{{REPOSITORY}}/vulnerability-alerts
@@ -552,6 +562,8 @@ writes. Then check these:
 
 - `scripts/check.sh` passes on the new scaffold.
 - `git check-ignore docs/planning docs/iterations docs/architecture/design` lists all three.
+- The empty folders under "What gets created" exist, including `items/` and `finished/` in both
+  `docs/planning/roadmap/` and `docs/planning/backlog/`.
 - No file holds a leftover parameter, or a condition marker.
 - After `scripts/check.sh` has run, `git ls-files --others --exclude-standard tmp` lists only
   `tmp/.gitkeep`.
@@ -561,6 +573,7 @@ git-agent's own unit tests render the templates for every combination of conditi
 check the rest, so the binary needs no YAML parser:
 
 - Each agent file parses: the frontmatter as YAML, and Codex's files as TOML.
+- The frontmatter of each document template in `docs/templates/` parses as YAML.
 - With `none` in `{{AGENT_TOOLS}}`, no file names a specific agent tool.
 - Each issue form passes GitHub's form schema: the required keys, `id`s of letters,
   digits, `-` and `_` that are unique in the form, and distinct dropdown options.
@@ -649,7 +662,7 @@ write permissions. To deploy again by hand, run `ci.yml` on `{{MAIN_BRANCH}}`.
 - `docs/planning/`, `docs/iterations/` and `docs/architecture/design/` are git-ignored in every
   project, public or private, so they can hold information that shouldn't be public. The
   generated `AGENTS.md` explains what follows from that.
-- A backlog item can belong to one group, through the Group field in its metadata, and an
+- A backlog item can belong to one group, through the `group` field in its frontmatter, and an
   iteration can include single items, one or more groups, or both.
 - The setup doesn't need a coding agent. The first version has add-ons for Claude Code,
   Codex, Cursor and OpenCode.
@@ -690,11 +703,11 @@ for each role in "The agent roles". `template/snippets/pom-plugins.xml.tmpl` goe
 | `docs/agents/security-architect.md` | Always | 4 | The root |
 | `docs/agents/lead-frontend-developer.md` | `FRONTEND` | 4 | The root |
 | `docs/agents/product-ux-designer.md` | `FRONTEND` | 4 | The root |
-| `docs/planning/ROADMAP.md` | Always | 4 | The root |
+| `docs/planning/roadmap/ROADMAP.md` | Always | 4 | The root |
 | `docs/planning/backlog/BACKLOG.md` | Always | 4 | The root |
 | `docs/security/threat-model.md` | Always | 4 | The root |
 | `docs/security/standards.md` | Always | 4 | The root |
-| `docs/templates/roadmap.md` | Always | 4 | The root |
+| `docs/templates/roadmap-item.md` | Always | 4 | The root |
 | `docs/templates/iteration.md` | Always | 4 | The root |
 | `docs/templates/backlog-item.md` | Always | 4 | The root |
 | `docs/templates/design-document.md` | Always | 4 | The root |
@@ -768,7 +781,7 @@ their own default model.
 
 ### Notes on the files
 
-- `docs/planning/ROADMAP.md` and `docs/planning/backlog/BACKLOG.md`: the setup writes these
+- `docs/planning/roadmap/ROADMAP.md` and `docs/planning/backlog/BACKLOG.md`: the setup writes these
   even though they are git-ignored, so they exist only on the owner's machine.
 - `docs/templates/NOTICE`: a new project has no code or assets from others, so there is no
   `NOTICE` at the root until it includes some. It starts from this file.

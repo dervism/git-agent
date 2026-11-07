@@ -10,8 +10,6 @@ use reqwest::Url;
 /// Whether this system has a keychain git-agent can save keys in.
 pub const SUPPORTED: bool = cfg!(target_os = "macos");
 
-const SERVICE: &str = "git-agent";
-
 /// The keychain account of the server at `base_url`, e.g. "api.openai.com".
 pub fn account(base_url: &str) -> Option<String> {
     let url = Url::parse(base_url).ok()?;
@@ -48,11 +46,12 @@ pub fn delete(base_url: &str) -> Result<()> {
 
 #[cfg(target_os = "macos")]
 mod platform {
-    use super::SERVICE;
     use anyhow::Result;
     use security_framework::passwords::{
         PasswordOptions, delete_generic_password, generic_password, set_generic_password,
     };
+
+    const SERVICE: &str = "git-agent";
 
     /// `errSecItemNotFound`
     const NOT_FOUND: i32 = -25300;

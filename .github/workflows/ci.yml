@@ -1,0 +1,36 @@
+# The same checks as AGENTS.md describes, on Linux, on every push to master and pull request.
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            target
+          key: ${{ runner.os }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets --locked -- -D warnings
+      - run: cargo test --locked
+      # Not part of the crate, so cargo doesn't see it.
+      - name: Check scripts/check-planning.rs
+        run: |
+          rustfmt --check --edition 2024 scripts/check-planning.rs
+          mkdir -p target
+          clippy-driver --edition 2024 --test -D warnings -o target/check-planning-lint scripts/check-planning.rs
+          rustc --edition 2024 --test -o target/check-planning-tests scripts/check-planning.rs
+          target/check-planning-tests

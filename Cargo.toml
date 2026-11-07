@@ -8,8 +8,8 @@ license = "MIT"
 repository = "https://github.com/dervism/git-agent"
 keywords = ["git", "commit", "llm", "cli", "ai"]
 categories = ["command-line-utilities", "development-tools"]
-# The website lives in the repository but not in the crate.
-exclude = ["/site/", "/.claude/"]
+# Only what the crate needs, so a new folder in the repository stays out by default.
+include = ["/src/**", "/LICENSE", "/README.md"]
 
 [dependencies]
 anyhow = "1"

@@ -8,6 +8,7 @@
 //! secrets in formats none of the rules know.
 
 use crate::git::names;
+use crate::safe_text::without_hidden;
 use regex_lite::Regex;
 use std::sync::LazyLock;
 
@@ -316,7 +317,23 @@ impl Scanner {
     /// The line with its secrets replaced, adding what they look like to
     /// `kinds`. A private key's lines become one [`REDACTED`] line, so `None`
     /// means the line is left out.
+    /// `line` with its secrets replaced, or `None` if it's part of a key already replaced.
+    /// The patterns see the line without hidden characters, since a secret with an
+    /// invisible character inside matches none. A line that held a secret goes on as
+    /// that visible text; any other line goes on as it was, so the model sees its hidden
+    /// characters escaped.
     fn scan(&mut self, line: &str, kinds: &mut Vec<String>) -> Option<String> {
+        let visible = without_hidden(line);
+        let found = kinds.len();
+        let scanned = self.scan_visible(&visible.text, kinds)?;
+        Some(if kinds.len() > found {
+            scanned
+        } else {
+            line.to_owned()
+        })
+    }
+
+    fn scan_visible(&mut self, line: &str, kinds: &mut Vec<String>) -> Option<String> {
         if self.in_key {
             if is_key_data(line) {
                 if self.key_replaced {
@@ -474,6 +491,27 @@ fn plausible(secret: &str, whole: &str, check: Check) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn finds_a_secret_split_by_an_invisible_character() {
+        let key = format!("AKIA{}", "Q".repeat(16));
+        let hidden = format!("key = \"{}\u{200b}{}\"\n", &key[..8], &key[8..]);
+        let redacted = text(&hidden, "message");
+        assert_eq!(redacted.findings.len(), 1, "{:?}", redacted.findings);
+        assert!(!redacted.text.contains("AKIA"), "{}", redacted.text);
+        let patch = format!("diff --git a/x b/x\n--- a/x\n+++ b/x\n@@ -0,0 +1 @@\n+{hidden}");
+        assert_eq!(diff(&patch).findings.len(), 1);
+    }
+
+    #[test]
+    fn leaves_hidden_characters_in_a_line_without_a_secret_for_the_model_to_see() {
+        let line = "+let ok = \"admin\u{202e} \u{2066}// check\u{2069}\u{2066}\";\u{1b}[2J\r\n";
+        let patch = format!("diff --git a/x b/x\n--- a/x\n+++ b/x\n@@ -0,0 +1 @@\n{line}");
+        let redacted = diff(&patch);
+        assert!(redacted.findings.is_empty());
+        assert_eq!(redacted.text, patch);
+        assert_eq!(text(&line[1..], "message").text, &line[1..]);
+    }
 
     /// A random-looking string of `len` letters and digits, so no real-looking
     /// secret is written out in this file.

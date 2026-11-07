@@ -19,7 +19,8 @@ running local language models. git-agent has since evolved into more than just g
 
 ## Install
 
-Because the binary is called `git-agent`, git also runs it as `git agent`.
+Because the binary is called `git-agent`, git also runs it as `git agent`. It needs git
+2.26 or newer.
 
 ### With Homebrew
 
@@ -89,6 +90,13 @@ If you have staged changes, git-agent describes and commits only those. If nothi
 staged, it describes all changes to tracked files and commits them with
 `git commit --all`. Untracked files are left out unless you use `--all`.
 
+If files have unresolved conflicts, git-agent lists them and stops, before `--all` could
+mark them as resolved. A merge whose conflicts you've resolved commits as usual.
+
+If a submodule's `ignore` setting hides its change from `git diff`, neither you nor the
+model would see it, so git-agent leaves it out of the commit and says so. `--all` doesn't
+stage it either. If you stage it yourself, it's committed, with a note.
+
 ### Untracked files
 
 Before `--all` stages anything, git-agent checks the untracked files for ones that are
@@ -130,6 +138,9 @@ git-agent shows the proposed message and waits for one of these keys:
 | `r` | Generate a new message |
 | `f` | Tell the model what to change, e.g. `f shorter, and mention the CLI flags` |
 | `q` | Quit without committing |
+
+git-agent takes control and invisible characters out of the model's reply, and says so, so
+that what you review is what gets committed.
 
 ### If the commit fails
 
@@ -230,9 +241,11 @@ its changes as they were. `q` stops; the commits made so far stay. Changes that 
 where they were, staged or not.
 
 git-agent keeps to the changes as they were when you started: what you save or stage while
-it waits for the model stays uncommitted. If another commit lands on the branch before
-the split is done, it stops, and the commits it made so far stay. A commit hook that
-changes a commit is fine, but the check doesn't cover what the hook did.
+it waits for the model stays uncommitted, and what you stage stays staged. If a commit
+touches a file you staged something else in, git-agent unstages that file and says so, and
+the file itself keeps its content. If another commit lands on the branch before the split is
+done, it stops, and the commits it made so far stay. A commit hook that changes a commit is
+fine, but the check doesn't cover what the hook did.
 
 Before the first commit, git-agent works out what each commit will hold. A commit that
 can't be made on its own, such as one that adds a file to a folder that a later commit
@@ -241,7 +254,8 @@ git-agent stops and commits nothing. A commit with only documentation or only te
 the type `docs` or `test`, if its message has a Conventional Commits type.
 
 Secrets are checked as for any commit, and git-agent won't split changes while a merge
-or rebase is in progress. You can run `git agent split` from any folder of the repository.
+or rebase is in progress, or while files have unresolved conflicts. You can run
+`git agent split` from any folder of the repository.
 
 ### Checking that each commit builds
 
@@ -277,11 +291,38 @@ the flag, so a repository you clone can't choose one.
 
 ### Which model to use
 
-A check makes up for a plan's weak boundaries with any model, but not for its messages.
-In our tests, `gemma-4-12b` and `qwen3.8-27b` wrote more accurate messages than the small
-`gemma-4-e4b`, which sometimes described changes that weren't in the diff, but they took
-minutes per message instead of seconds. `gpt-oss-20b` was fast, and its accuracy varied
-with the change. Use a larger model for `split` when the messages matter and you can wait.
+`--check` is what gets you commits that build, with any model. The model decides how good the
+messages are and how long you wait for them.
+
+We ran four local models in LM Studio on a 36 GB MacBook Pro, on two real changes of 34 and
+39 parts:
+
+| Model | Parameters | Size on disk | Median seconds per plan | Median seconds per message |
+| --- | --- | --- | --- | --- |
+| `gemma-4-e4b`, 5-bit | 4B | 7.4 GB | 49 | 3 |
+| `gemma-4-12b`, 8-bit | 12B | 12.7 GB | 279 | 80 |
+| `gpt-oss-20b`, 8-bit | 20B | 22.3 GB | 15 | 6 |
+| `qwen3.8-27b`, 6-bit | 27B | 22.8 GB | 666 | 460 |
+
+No model split reliably on its own. Without `--check`, 26 of the 76 commits from
+`gemma-4-e4b` and `gpt-oss-20b` built. With it, all 31 built, in all 12 runs. Larger models
+made fewer commits: `qwen3.8-27b` and two `gpt-oss-20b` runs put all of one change in a
+single commit.
+
+The messages differed more. `gemma-4-e4b` and `gpt-oss-20b` invented a change or a reason, or
+said the opposite of the diff, in 13 of 76 messages. `gemma-4-12b` and `qwen3.8-27b` did that
+in none of 13, a small sample: `gemma-4-12b` ran on only one of the two changes, and
+`qwen3.8-27b` wrote four messages.
+
+What we'd use, knowing these numbers only cover these models, changes and this machine:
+
+- Use `--check` with `split`, whatever the model.
+- If memory is what limits you, use `gemma-4-e4b`, at a third of the size of the two largest,
+  and review its messages.
+- With the memory for it, `gpt-oss-20b` is quicker overall: for three commits, the medians add
+  up to 33 seconds against 58.
+- If the messages matter and you can wait, use `gemma-4-12b`. Raise `timeout_secs`, because a
+  plan can take longer than the default 300 seconds: two of its six runs stopped there.
 
 ## Tidying commits before you push
 

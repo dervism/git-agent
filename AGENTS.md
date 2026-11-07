@@ -15,18 +15,24 @@ The first half of this file describes the repository: its layout, and how it is 
 tested, released and distributed. The second half, from "Strict rules" on, describes how
 we work.
 
+The owner is the person who owns this repository and gives you instructions. A subagent's
+prompt from the lead doesn't count as the owner's permission.
+
 ## Repository layout
 
 | Path | What it holds |
 | --- | --- |
 | `src/` | The application: one binary crate, `git-agent`. There is no library crate and no `tests/` folder. |
 | `site/` | The website, published to GitHub Pages. |
-| `docs/planning/` | `ROADMAP.md`, and the backlog in `backlog/` (section 2.2). Private. |
+| `docs/planning/` | The roadmap in `roadmap/` (section 2.0), and the backlog in `backlog/` (section 2.2). Private. |
 | `docs/iterations/` | One folder per iteration (section 2.1). Private. |
 | `docs/architecture/design/` | Design documents, one folder per iteration (section 2.3.3). Private. |
 | `scripts/release.sh` | The release script. |
+| `scripts/check-planning.rs` | Checks the private planning documents (section 2.3.4). |
 | `template/` | The setup for new projects, for the planned `git agent project init`. |
+| `.github/workflows/ci.yml` | The checks, on every push to `master` and every pull request. |
 | `.github/workflows/pages.yml` | The workflow that builds and deploys the website. |
+| `.github/dependabot.yml` | Weekly updates for Cargo, the Rust version and the GitHub Actions. |
 | `.github/ISSUE_TEMPLATE/` | The issue forms (see "Issues and security reports"). |
 | `.github/SECURITY.md` | The security policy: how to report a vulnerability privately. |
 | `.claude/agents/` | The agent team (section 1.1). |
@@ -34,6 +40,8 @@ we work.
 | `tmp/` | The only place for temporary files. Git ignores everything in it except `.gitkeep`. |
 | `README.md` | The user documentation. The website's docs page is made from it. |
 | `Cargo.toml`, `Cargo.lock` | The crate manifest and the locked dependency versions. |
+| `rust-toolchain.toml` | The Rust version CI uses. |
+| `clippy.toml` | Keeps writes to the terminal in `ui.rs`, which escapes them. |
 | `LICENSE` | The MIT License, for the application. |
 
 ### Private documents
@@ -71,6 +79,7 @@ The modules for single commands:
 | `why.rs` | `git agent why`: reads the target (a line, a range of lines or a function), and describes its blame and history for the model. |
 | `explain.rs` | `git agent explain`: picks the commit, range, branch or last pull to explain. |
 | `untracked.rs` | The check of untracked files before `--all` stages them. |
+| `staging.rs` | What happens before the changes are read: refusing unresolved conflicts, staging for `--all`, and warning about submodule changes the diff hides. |
 | `menu.rs` | `git agent config`: the interactive settings menu. |
 
 The modules the commands share:
@@ -82,7 +91,7 @@ The modules the commands share:
 | `git/names.rs` | How git writes file names, and the readable form git-agent shows them in. |
 | `git/lossless.rs` | Text that holds any bytes, so a patch of a file that isn't UTF-8 reaches `git apply` unchanged. |
 | `git/worktree.rs` | `TempWorktree`: a temporary checkout that leaves the user's work tree, index and branches alone. |
-| `temp.rs` | `PrivateDir`: a temporary folder only the owner can enter. |
+| `temp.rs` | `PrivateDir`: a temporary folder that only your user account can enter. |
 | `github.rs` | Pull requests and issues through the GitHub CLI, `gh`. |
 | `prompt.rs` | Builds the conversation sent to the model for every command, and cleans up its replies. |
 | `server/` | Model servers: the `ModelServer` interface (`mod.rs`), `openai.rs`, `anthropic.rs` and `http.rs`. |
@@ -92,7 +101,8 @@ The modules the commands share:
 | `redact.rs` | Finds secrets in text before it goes to a model, and replaces them with `[REDACTED]`. |
 | `secrets.rs` | API keys in the macOS Keychain, so they are never written to a file. |
 | `config.rs` | The settings, and the order of the places they come from. |
-| `ui.rs` | Terminal output and the review prompt. |
+| `ui.rs` | Terminal output and the review prompt. Everything it prints goes through one gate that escapes control characters. |
+| `safe_text.rs` | Escapes or removes the characters that could change the terminal or hide text. |
 
 ## Building and running
 
@@ -103,7 +113,7 @@ cargo install --path . --locked   # install this checkout as git-agent
 ```
 
 The crate needs Rust 1.88 or newer (`rust-version` in `Cargo.toml`) and uses the 2024
-edition.
+edition. git-agent needs git 2.26 or newer to run, for `--pathspec-from-file`.
 
 Set these two variables for every command that builds, tests or runs git-agent, so that
 temporary files stay in `tmp/`:
@@ -130,6 +140,20 @@ ones:
 cargo fmt --check
 cargo clippy --all-targets -- -D warnings
 cargo test
+```
+
+The `CI` workflow (`.github/workflows/ci.yml`) runs these on Linux, with `--locked` on the
+last two, on every push to `master` and every pull request. It has a read-only token and no
+secrets, and each action is pinned to a full commit, which Dependabot updates. It uses the
+Rust version in `rust-toolchain.toml`. Tools without `rustup`, such as Homebrew's Rust, ignore
+that file, so a check can pass here and fail there until the versions match.
+
+`scripts/check-planning.rs` isn't part of the crate, so these checks don't see it. To test it:
+
+```sh
+rustfmt --check --edition 2024 scripts/check-planning.rs
+clippy-driver --edition 2024 --test -D warnings -o tmp/check-planning-lint scripts/check-planning.rs
+rustc --edition 2024 --test -o tmp/check-planning-tests scripts/check-planning.rs && tmp/check-planning-tests
 ```
 
 To measure complexity:
@@ -182,7 +206,7 @@ into `site/src/design/`. The logo is all rights reserved. Every file starts with
 
 ## Releasing
 
-Make a release only when you are asked to. `scripts/release.sh` releases a version from
+Make a release only when the owner asks for one. `scripts/release.sh` releases a version from
 `master`:
 
 ```sh
@@ -215,8 +239,9 @@ macOS. The script deletes the clone when it is done.
 
 The crate is `git-agent` on https://crates.io/crates/git-agent, and users install it with
 `cargo install git-agent --locked`. Publishing uses the token Cargo keeps from
-`cargo login`. The `exclude` list in `Cargo.toml` keeps `site/` and `.claude/` out of the
-package; check what the package holds with `cargo package --list` before a release.
+`cargo login`. The `include` list in `Cargo.toml` names what goes in the package, and the
+rest of the repository stays out; check what the package holds with `cargo package --list`
+before a release.
 
 ### GitHub releases
 
@@ -269,12 +294,12 @@ Security problems never go into a GitHub issue. `.github/SECURITY.md` asks peopl
 report them privately, through GitHub's private vulnerability reporting, which is turned
 on for the repository. The same goes for us. The repository is public, so never write the
 details of a vulnerability in an issue, a pull request, a commit message, a tracked file or
-the website. Tell me, and track it as a backlog item, which stays private (see "Private
+the website. Tell the owner, and track it as a backlog item, which stays private (see "Private
 documents").
 
 ## Strict rules for you and all subagents
 
-- You must never commit or push to git or GitHub without my explicit permission. All
+- You must never commit or push to git or GitHub without the owner's explicit permission. All
   other git commands are allowed when you need them to solve a task.
 - The source code is always the truth: never make a claim without verifying it in the
   code. For every claim, say whether you ran it (the program and its output), read it in
@@ -354,35 +379,71 @@ it what it needs in the prompt.
 
 ## 2.0 Overall work process
 
-Our work is organized in iterations, following `docs/planning/ROADMAP.md`. An iteration
+Our work is organized in iterations, following the roadmap in `docs/planning/roadmap/`. An iteration
 holds single backlog items, one or more groups of items, or both. After an iteration (section 2.1) is completed,
 we run these stages:
 
 1. Update the documentation and the website.
 2. Make the release.
 3. Tidy up the backlog and the roadmap.
-4. Prepare for the next iteration. At this point you pause, and wait for my signal to
-   continue.
+4. Prepare for the next iteration. At this point you pause, and wait for the owner's
+   signal to continue.
 
-`ROADMAP.md` is a document of ideas. It never holds sensitive information, which belongs in a backlog item. It has this format:
+The roadmap is `docs/planning/roadmap/ROADMAP.md`, the index and overview of where the project
+is going. Each roadmap item is a Markdown document in `docs/planning/roadmap/items/`, named
+`{NNNN}-{title}.md`, where NNNN is an incremental identifier that never changes. It's a
+series of its own: "roadmap item 0014" means a roadmap item, and a bare number means a backlog
+item.
+
+A roadmap item is strategic and goal-oriented. It describes future development, changes and
+new features we want to implement. It never holds sensitive information, which belongs in a
+backlog item.
+
+When a roadmap item is DONE, move it to `docs/planning/roadmap/finished/`, and update the
+paths to it. `ROADMAP.md` lists finished items too. A DONE roadmap item is never reopened, and
+its description stays as it was. New changes to what it delivered go in as regular backlog
+items.
+
+`ROADMAP.md` has this layout:
 
 ```markdown
 # Roadmap
 
 {description of the project}
 
-## 1. {a category of related items in the roadmap}
+## Items
 
-### {roadmap item title} {status: OPEN | IN_PROGRESS | DONE | BLOCKED | PARKED}
-
-{description of the item}
-
-## 2. {a category of related items in the roadmap}
-
-### {roadmap item title} {status: OPEN | IN_PROGRESS | DONE | BLOCKED | PARKED}
-
-{description of the item}
+| Item number | Item title | Item category | Item status |
+| --- | --- | --- | --- |
 ```
+
+Document each roadmap item with this template:
+
+```markdown
+---
+number: "NNNN"
+title: "[Title, as plain text]"
+category: "[A category of related items]"
+status: OPEN                  # OPEN, IN_PROGRESS, DONE, BLOCKED or PARKED
+roadmap_items: []             # Relative paths to earlier roadmap items this one changes
+---
+
+# NNNN - [Title]
+
+## Description
+
+[The description of the item.]
+```
+
+### 2.0.1 Frontmatter
+
+Roadmap items, backlog items, iteration documents and design documents keep their metadata in
+YAML frontmatter at the top of the file, so that tools can read it:
+
+- Text that could be read as something else is in double quotes, such as `"0047"` and `"0.11.0"`.
+- Dates are `YYYY-MM-DD`, without quotes. Log entries and prose keep `DD-MM-YYYY`.
+- A link is a string holding the relative path, from the file's own folder.
+- An empty value is `null`, or `[]` for a list.
 
 ## 2.1 Iterations
 
@@ -395,18 +456,17 @@ with a list of what it includes.
 Use this format for iteration documents:
 
 ```markdown
+---
+iteration: "NNN"
+date_started: null            # YYYY-MM-DD
+date_finished: null           # YYYY-MM-DD
+target_release_version: null  # "X.Y.Z", as major.minor.patch
+roadmap_items: []             # Relative paths to roadmap items
+design_documents: []          # Relative paths to design documents, ADRs and architecture documents
+related_items: []             # Relative paths to backlog items
+---
+
 # Iteration NNN
-
-## Metadata
-
-| Field | Value |
-| --- | --- |
-| Roadmap items | [LINKS] |
-| Date started | [DD-MM-YYYY] |
-| Date finished | [DD-MM-YYYY] |
-| Target release version | [X.Y.Z, as major.minor.patch] |
-| Design documents, ADRs and architecture documents | [LINKS] |
-| Related roadmap items and backlog items | [LINKS] |
 
 ## Goal
 
@@ -434,7 +494,7 @@ concise, without clutter, and run the humanizer on the list.]
 ## Log
 
 - DD-MM-YYYY: [A log entry gives the latest status, the decisions we made along the way,
-  your questions to me, and my answers. Keep each entry as short as you can without
+  your questions to the owner, and the owner's answers. Keep each entry as short as you can without
   losing facts, knowledge and information that future agents need. Run the humanizer on
   the log after you add an entry.]
 ```
@@ -450,14 +510,14 @@ IN_PROGRESS, DONE, BLOCKED or PARKED. The roadmap's items use the same statuses.
 
 Each item is a Markdown document in `docs/planning/backlog/items/`, named
 `{NNNN}-{title}.md`, where NNNN is an incremental identifier that never changes. When an
-item is DONE, move it to `docs/planning/backlog/finished/`, and update the links to it.
-`BACKLOG.md` is only the index and overview, and it lists finished items too. When we tidy
-up and groom the backlog, or reprioritize items, you update the Priority field in each
-item's metadata table (section 2.2.1).
+item is DONE, move it to `docs/planning/backlog/finished/`, and update the paths and links to
+it. `BACKLOG.md` is only the index and overview, and it lists finished items too. When we tidy
+up and groom the backlog, or reprioritize items, you update the `priority` field in each
+item's frontmatter (section 2.2.1).
 
-An item can belong to one group, a named batch of work, through the Group field in its
-metadata. Group names are lower-case words joined by hyphens, such as `search-rewrite`. An
-item outside any group has `-` there, and is a single item. An iteration can include single
+An item can belong to one group, a named batch of work, through the `group` field in its
+frontmatter. Group names are lower-case words joined by hyphens, such as `search-rewrite`. An
+item outside any group has `null` there, shown as `-` in `BACKLOG.md`, and is a single item. An iteration can include single
 items, one or more groups, or both. Including a group includes all its items that aren't
 DONE, BLOCKED or PARKED.
 
@@ -468,34 +528,36 @@ DONE, BLOCKED or PARKED.
 
 ## Items
 
-| Item priority | Item number | Item title | Item group | Item status |
-| --- | --- | --- | --- | --- |
+| Item priority | Item number | Item title | Item group | Item labels | Item status |
+| --- | --- | --- | --- | --- | --- |
 ```
 
 An item marked DONE is never reopened. When bugs, updates or refactoring touch code that
 an item delivered, we open new items in the backlog, and add references to the relevant
-older items in their metadata tables.
+older items in their `related_items`.
 
 ### 2.2.1 Backlog item template
 
 Document each item with this template:
 
 ```markdown
+---
+number: "NNNN"
+title: "[Title]"
+iteration: null               # "NNN"
+group: null                   # group-name, or null for a single item
+priority: "NNN"
+date_started: null            # YYYY-MM-DD
+date_finished: null           # YYYY-MM-DD
+status: OPEN                  # OPEN, IN_PROGRESS, DONE, BLOCKED or PARKED
+target_release_version: null  # "X.Y.Z", as major.minor.patch
+roadmap_items: []             # Relative paths to roadmap items
+design_documents: []          # Relative paths to design documents, ADRs and architecture documents
+related_items: []             # Relative paths to backlog items
+labels: []                    # One or more of the labels below
+---
+
 # NNNN - [Title]
-
-## Metadata
-
-| Field | Value |
-| --- | --- |
-| Iteration | [NNN] |
-| Group | [group-name, or - for a single item] |
-| Priority | [NNN] |
-| Date started | [DD-MM-YYYY] |
-| Date finished | [DD-MM-YYYY] |
-| Status | [OPEN, IN_PROGRESS, DONE, BLOCKED or PARKED] |
-| Target release version | [X.Y.Z, as major.minor.patch] |
-| Design documents, ADRs and architecture documents | [LINKS] |
-| Related roadmap items and backlog items | [LINKS] |
 
 ## Description
 
@@ -509,26 +571,42 @@ Document each item with this template:
 ## Log
 
 - DD-MM-YYYY: [A log entry gives the latest status, the decisions we made along the way,
-  your questions to me, and my answers. Keep each entry as short as you can without
+  your questions to the owner, and the owner's answers. Keep each entry as short as you can without
   losing facts, knowledge and information that future agents need. Run the humanizer on
   the log after you add an entry.]
 ```
+
+An item has one or more of these labels, which GitHub issues use too:
+
+| Label | Use it for |
+| --- | --- |
+| `accessibility` | A barrier for people with disabilities |
+| `bug` | Something that doesn't work |
+| `documentation` | Documentation and planning documents |
+| `duplicate` | What another item already covers |
+| `enhancement` | An improvement or a new feature |
+| `wontfix` | What we decided not to do |
+| `security` | A risk to users' data, keys or trust. Details stay in the private item |
+| `refactor` | Changing the code's shape and not what it does |
+| `testing` | Tests and proofs, including trying generated projects for real |
+| `tooling` | Build, CI, release and packaging |
 
 ## 2.3 Our work process
 
 The humanizer is the `humanizer:humanizer` skill.
 
-### 2.3.1 When ROADMAP.md is empty or all its items are DONE
+### 2.3.1 When the roadmap is empty or all its items are DONE
 
 1. We brainstorm ideas.
-2. We agree which of the ideas go into `ROADMAP.md`, as the project's strategy, vision
-   and goals.
+2. We agree which of the ideas become roadmap items, as the project's strategy, vision and
+   goals.
 
 ### 2.3.2 When BACKLOG.md is empty or all its items are DONE
 
-1. We agree which of the open ideas in the roadmap to build.
+1. We agree which of the open roadmap items to build.
 2. We create backlog items and index them in `BACKLOG.md`. Each item is created from the
-   template in section 2.2.1, with its first tasks.
+   template in section 2.2.1, with its first tasks, and its `roadmap_items` point to the
+   roadmap items it builds.
 3. Later, when an iteration starts, each item's task list is revisited, verified and
    updated.
 
@@ -541,7 +619,19 @@ The humanizer is the `humanizer:humanizer` skill.
    an external library or framework only when the Rust standard library can't provide what
    the implementation needs.
 3. Save the design as a Markdown document at
-   `docs/architecture/design/iteration-NNN/{title}.md`.
+   `docs/architecture/design/iteration-NNN/{title}.md`, starting with this frontmatter:
+
+   ```yaml
+   ---
+   title: "[Title]"
+   iteration: "NNN"
+   backlog_items: []        # Relative paths
+   status: DRAFT            # DRAFT, IN_REVIEW, APPROVED or SUPERSEDED
+   date: null               # YYYY-MM-DD, when the status last changed
+   related_documents: []    # Relative paths
+   ---
+   ```
+
 4. A design document can reference other design documents. Keep it concise and brief,
    without long paragraphs or unnecessary detail. It may contain Mermaid diagrams,
    including Mermaid C4 models, but only where they are needed.
@@ -549,10 +639,11 @@ The humanizer is the `humanizer:humanizer` skill.
    design review.
 6. Wait for the review, verify what it found, and make the necessary updates to the
    design document.
-7. Add your questions to me about the design, if you have any, to the design document.
-8. Present the design and your questions to me, and wait for my input. From my feedback,
-   update the design's solution, decisions and log. Make sure the task lists match the
-   updated design, the review and my input. Then wait for my signal to continue.
+7. Add your questions to the owner about the design, if you have any, to the design document.
+8. Present the design and your questions to the owner, and wait for the owner's input. From
+   that feedback, update the design's solution, decisions and log. Make sure the task lists
+   match the updated design, the review and the owner's input. Then wait for the owner's
+   signal to continue.
 9. Implement, test and build all the tasks in the iteration's items. Work directly on the
    main branch (`master`) unless we agree otherwise.
 10. When all the items of the iteration are done, ask `application-architect` and
@@ -562,14 +653,24 @@ The humanizer is the `humanizer:humanizer` skill.
 11. Wait for all the reviews to finish, then read all the feedback. Fix everything you can
     right away, and make new backlog items for issues that need more analysis or a new
     design review.
-12. When all the issues from the reviews are fixed, show me the items you created, if
-    any, and wait for my input. We decide on and prioritize the new items, and consider
+12. When all the issues from the reviews are fixed, show the owner the items you created, if
+    any, and wait for the owner's input. We decide on and prioritize the new items, and consider
     whether to fix them now or plan them for another iteration. Fixes made at this point
     are code reviewed too (steps 9 to 12).
 13. Finally, when everything is implemented, we tidy up, remove temporary files, and make
     a new release.
 
-### 2.3.4 Backlog grooming
+### 2.3.4 Backlog and roadmap grooming
 
 1. After each iteration, we update the roadmap and the backlog. We update the statuses and
-   the groups, and reprioritize where what we have learned calls for it.
+   the groups, and reprioritize where what we have learned calls for it. Finished roadmap
+   items move to `finished/`.
+2. Look at the direction the project is going, from facts and data, including the backlog
+   items that aren't implemented yet, and consider whether new roadmap items are necessary.
+   This isn't about the items the iteration just finished. New roadmap items are added only
+   in agreement with the owner. If those open backlog items would make larger changes to what
+   a finished roadmap item delivered, the new roadmap item references the original through
+   `roadmap_items`.
+3. Run `scripts/check-planning.rs`, as its first lines describe, and fix what it finds. It
+   checks the frontmatter, the paths, the labels and the indexes, and it's how a path that a
+   moved item left behind gets found.

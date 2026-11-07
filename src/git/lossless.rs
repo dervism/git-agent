@@ -5,6 +5,8 @@
 //! instead, and turned back at the end. What people and models read gets
 //! U+FFFD in their place, through [`readable`].
 
+use std::path::PathBuf;
+
 /// The private character for byte 0x80; those for higher bytes follow it.
 const FIRST_PRIVATE: u32 = 0x10ef80;
 const FIRST_BYTE: u32 = 0x80;
@@ -60,6 +62,20 @@ pub fn readable(text: &str) -> String {
             None => character,
         })
         .collect()
+}
+
+/// The real path that `text` from [`to_text`] holds. Only Unix allows a path that isn't
+/// text, so elsewhere bytes that aren't valid UTF-8 become U+FFFD.
+pub fn to_path(text: &str) -> PathBuf {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        PathBuf::from(std::ffi::OsStr::from_bytes(&to_bytes(text)))
+    }
+    #[cfg(not(unix))]
+    {
+        PathBuf::from(readable(text))
+    }
 }
 
 #[cfg(test)]
@@ -119,5 +135,17 @@ mod tests {
     fn handles_no_bytes() {
         round_trip(&[]);
         assert_eq!(to_text(&[]), "");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn gives_back_the_real_path() {
+        use std::os::unix::ffi::OsStrExt;
+        let name = to_text(b"caf\xe9/bl\xc3\xa5.txt");
+        assert_eq!(
+            to_path(&name).as_os_str().as_bytes(),
+            b"caf\xe9/bl\xc3\xa5.txt"
+        );
+        assert_eq!(to_path("plain/name.txt"), PathBuf::from("plain/name.txt"));
     }
 }

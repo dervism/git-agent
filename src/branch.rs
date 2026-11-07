@@ -1,6 +1,7 @@
 //! Naming a new branch (`git agent branch`) after a description, a GitHub
 //! issue, or the uncommitted changes.
 
+use crate::safe_text::without_hidden;
 use std::collections::HashSet;
 
 /// Longest name to keep; a longer one is cut at a hyphen.
@@ -28,6 +29,7 @@ pub fn issue_reference(text: &str) -> Option<String> {
 /// as "Branch name:", quotes or characters git doesn't allow, and at most
 /// [`MOST_CHARS`] long. `None` if nothing is left.
 pub fn clean_name(reply: &str) -> Option<String> {
+    let reply = without_hidden(reply).text;
     let line = reply.lines().map(str::trim).find(|line| !line.is_empty())?;
     let line = match line.rsplit_once(": ") {
         Some((label, name))
@@ -135,6 +137,23 @@ pub fn style_examples(branches: &[String]) -> Vec<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn keeps_control_and_invisible_characters_out_of_a_name() {
+        for (reply, wanted) in [
+            ("fix/lo\u{1b}gin", "fix/login"),
+            ("fix/lo\u{9b}gin", "fix/login"),
+            ("fix/lo\u{202e}gin", "fix/login"),
+            ("fix/lo\u{200b}gin", "fix/login"),
+            ("fix/lo\u{115f}gin", "fix/login"),
+            ("fix/lo\u{1160}gin", "fix/login"),
+            ("fix/lo\u{3164}gin", "fix/login"),
+            ("fix/lo\u{ffa0}gin", "fix/login"),
+            ("fix/blåbær", "fix/blåbær"),
+        ] {
+            assert_eq!(clean_name(reply).as_deref(), Some(wanted), "{reply:?}");
+        }
+    }
 
     #[test]
     fn recognizes_issue_numbers_and_urls() {

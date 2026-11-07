@@ -2,8 +2,8 @@
 //! if it takes too long or the user asks.
 
 use super::signals::Stopped;
-use crate::git::names;
 use crate::git::worktree::TempWorktree;
+use crate::safe_text::one_line;
 use anyhow::{Context, Result, bail};
 use regex_lite::Regex;
 use std::fs::{self, File, OpenOptions};
@@ -160,7 +160,7 @@ fn end_of_output(file: &mut File) -> Result<String> {
     let shown = &lines[lines.len().saturating_sub(OUTPUT_LINES)..];
     Ok(shown
         .iter()
-        .map(|line| names::printable(&COLOR_CODE.replace_all(line, "")))
+        .map(|line| one_line(&COLOR_CODE.replace_all(line, "")))
         .collect::<Vec<_>>()
         .join("\n"))
 }

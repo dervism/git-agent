@@ -119,3 +119,72 @@ impl ModelServer for Server {
         }
     }
 }
+
+#[cfg(test)]
+pub mod test_support {
+    use super::{Message, ModelInfo, ModelServer};
+    use crate::prompt;
+    use anyhow::Result;
+    use std::cell::{Cell, RefCell};
+
+    /// A model that replies with fixed text, keeps what it was sent, and can do something
+    /// while the user waits for its reply.
+    pub struct FakeServer<'a> {
+        pub plans: RefCell<Vec<&'a str>>,
+        pub message: &'a str,
+        pub message_requests: Cell<usize>,
+        pub received: RefCell<Vec<Vec<Message>>>,
+        during_plan: RefCell<Option<Box<dyn FnOnce() + 'a>>>,
+        during_message: RefCell<Option<Box<dyn FnOnce() + 'a>>>,
+    }
+
+    impl<'a> FakeServer<'a> {
+        pub fn new(plan: &'a str, message: &'a str) -> Self {
+            Self {
+                plans: RefCell::new(vec![plan]),
+                message,
+                message_requests: Cell::new(0),
+                received: RefCell::new(Vec::new()),
+                during_plan: RefCell::new(None),
+                during_message: RefCell::new(None),
+            }
+        }
+
+        pub fn during_plan(self, action: impl FnOnce() + 'a) -> Self {
+            *self.during_plan.borrow_mut() = Some(Box::new(action));
+            self
+        }
+
+        pub fn during_message(self, action: impl FnOnce() + 'a) -> Self {
+            *self.during_message.borrow_mut() = Some(Box::new(action));
+            self
+        }
+    }
+
+    impl ModelServer for FakeServer<'_> {
+        async fn models(&self) -> Result<Vec<ModelInfo>> {
+            Ok(Vec::new())
+        }
+
+        async fn complete(&self, _model: &str, messages: &[Message]) -> Result<String> {
+            self.received.borrow_mut().push(messages.to_vec());
+            if messages[0].content == prompt::SPLIT_PROMPT {
+                if let Some(action) = self.during_plan.borrow_mut().take() {
+                    action();
+                }
+                let mut plans = self.plans.borrow_mut();
+                let plan = if plans.len() > 1 {
+                    plans.remove(0)
+                } else {
+                    plans[0]
+                };
+                return Ok(plan.to_owned());
+            }
+            self.message_requests.set(self.message_requests.get() + 1);
+            if let Some(action) = self.during_message.borrow_mut().take() {
+                action();
+            }
+            Ok(self.message.to_owned())
+        }
+    }
+}

@@ -16,6 +16,8 @@ pub struct Model {
     pub picked: Option<Pick>,
     pub context_length: usize,
     pub context_source: ContextSource,
+    /// The most tokens a reply may take, which the prompt leaves room for.
+    pub max_output_tokens: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -68,6 +70,7 @@ pub async fn resolve(server: &impl ModelServer, config: &Config) -> Result<Model
         picked,
         context_length,
         context_source,
+        max_output_tokens: config.max_output_tokens,
     })
 }
 

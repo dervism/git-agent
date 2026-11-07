@@ -129,6 +129,8 @@ mod tests {
 
     #[test]
     fn gives_an_absolute_path_for_a_relative_temp_folder() {
+        // The crate on crates.io has no tmp/ folder.
+        fs::create_dir_all("tmp").unwrap();
         let dir = PrivateDir::create_under(Path::new("tmp"), "test").unwrap();
         assert!(dir.path().is_absolute(), "{}", dir.path().display());
         assert!(dir.path().is_dir());

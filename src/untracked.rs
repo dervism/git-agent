@@ -6,9 +6,9 @@
 //! them out, and `git add --all` would commit them. No model is involved:
 //! the rules below decide.
 
-use crate::git::names;
+use crate::git::{lossless, names};
 use crate::ui::{bytes, thousands};
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use std::collections::HashMap;
 use std::fmt::Write;
 use std::fs;
@@ -218,7 +218,8 @@ pub struct Finding {
     pub pattern: String,
     /// Pathspecs that leave these files out when staging.
     pub exclude: Vec<String>,
-    pub files: usize,
+    /// The untracked files it covers, as git lists them.
+    pub paths: Vec<String>,
     pub bytes: u64,
 }
 
@@ -233,14 +234,15 @@ pub fn check(top: &Path, untracked: &[String]) -> Vec<Finding> {
         else {
             continue;
         };
-        let size = fs::symlink_metadata(top.join(path)).map_or(0, |meta| meta.len());
+        let size =
+            fs::symlink_metadata(top.join(lossless::to_path(path))).map_or(0, |meta| meta.len());
         let index = *by_key.entry(key).or_insert_with(|| {
             findings.push(Finding {
                 label,
                 reason,
                 pattern,
                 exclude: Vec::new(),
-                files: 0,
+                paths: Vec::new(),
                 bytes: 0,
             });
             findings.len() - 1
@@ -249,7 +251,7 @@ pub fn check(top: &Path, untracked: &[String]) -> Vec<Finding> {
         if !finding.exclude.contains(&leave_out) {
             finding.exclude.push(leave_out);
         }
-        finding.files += 1;
+        finding.paths.push(path.clone());
         finding.bytes += size;
     }
     findings
@@ -261,7 +263,7 @@ pub fn check(top: &Path, untracked: &[String]) -> Vec<Finding> {
 type Classified = (String, String, String, String, String);
 
 /// A pathspec that leaves out exactly `path`, a file or a directory.
-fn literal(path: &str) -> String {
+pub fn literal(path: &str) -> String {
     format!(":(top,exclude,literal){path}")
 }
 
@@ -315,9 +317,8 @@ fn classify(top: &Path, path: &str, markers: &mut Markers) -> Option<Classified>
     }
 
     let name = *parts.last()?;
-    let extension = name
-        .rsplit_once('.')
-        .map(|(_, extension)| extension.to_lowercase());
+    let extension = name.rsplit_once('.').map(|(_, extension)| extension);
+    let lowercase = extension.map(str::to_lowercase);
     let single = |reason: &str, pattern: String| {
         Some((
             path.to_owned(),
@@ -340,10 +341,13 @@ fn classify(top: &Path, path: &str, markers: &mut Markers) -> Option<Classified>
     if SYSTEM_FILES.contains(&name) {
         return kind("operating system file", name.to_owned());
     }
-    if let Some(extension) = extension
-        .as_deref()
-        .filter(|extension| COMPILED.contains(extension))
-    {
+    // The pattern keeps the file's own case: `*.exe` doesn't match SETUP.EXE where
+    // core.ignorecase is false, and a `.gitignore` line can't say otherwise.
+    if let Some(extension) = extension.filter(|_| {
+        lowercase
+            .as_deref()
+            .is_some_and(|lowercase| COMPILED.contains(&lowercase))
+    }) {
         return kind("compiled files", format!("*.{extension}"));
     }
     if is_env_file(name) {
@@ -353,16 +357,16 @@ fn classify(top: &Path, path: &str, markers: &mut Markers) -> Option<Classified>
         );
     }
     if SSH_KEYS.contains(&name)
-        || extension
+        || lowercase
             .as_deref()
-            .is_some_and(|extension| KEY_FILES.contains(&extension))
+            .is_some_and(|lowercase| KEY_FILES.contains(&lowercase))
     {
         return single(
             "private key or key store",
             format!("/{}", ignore_pattern_for(path)),
         );
     }
-    let size = fs::symlink_metadata(top.join(path)).map_or(0, |meta| meta.len());
+    let size = fs::symlink_metadata(top.join(lossless::to_path(path))).map_or(0, |meta| meta.len());
     if size >= LARGE_FILE_BYTES {
         return single("large file", format!("/{}", ignore_pattern_for(path)));
     }
@@ -393,7 +397,7 @@ impl Markers {
             return true;
         }
         let names = self.listings.entry(parent.to_owned()).or_insert_with(|| {
-            fs::read_dir(top.join(parent))
+            fs::read_dir(top.join(lossless::to_path(parent)))
                 .map(|entries| {
                     entries
                         .filter_map(|entry| entry.ok()?.file_name().into_string().ok())
@@ -416,19 +420,20 @@ pub fn list(findings: &[Finding]) -> String {
     let width = findings
         .iter()
         .take(MOST_LISTED)
-        .map(|finding| names::printable(&finding.label).chars().count())
+        .map(|finding| names::shown(&finding.label).chars().count())
         .max()
         .unwrap_or(0);
     let mut out = String::new();
     for finding in findings.iter().take(MOST_LISTED) {
         let mut details = vec![finding.reason.clone()];
-        if finding.files > 1 {
-            details.push(format!("{} files", thousands(finding.files)));
+        let files = finding.paths.len();
+        if files > 1 {
+            details.push(format!("{} files", thousands(files)));
         }
-        if finding.files > 1 || finding.bytes >= 1024 * 1024 {
+        if files > 1 || finding.bytes >= 1024 * 1024 {
             details.push(bytes(finding.bytes));
         }
-        let label = names::printable(&finding.label);
+        let label = names::shown(&finding.label);
         let _ = writeln!(out, "   {label:width$}  {}", details.join(", "));
     }
     if findings.len() > MOST_LISTED {
@@ -461,12 +466,30 @@ pub fn exclude_what_gitignore_cant_hold(findings: &[Finding]) -> Vec<String> {
         .collect()
 }
 
+/// The paths of the findings that [`add_to_gitignore`] adds, which git should now ignore.
+/// A `.gitignore` deeper down can still include them again, such as one that says `!*.pem`.
+pub fn added_paths(findings: &[Finding]) -> Vec<String> {
+    findings
+        .iter()
+        .filter(|finding| fits_gitignore(finding))
+        .flat_map(|finding| finding.paths.iter().cloned())
+        .collect()
+}
+
 /// Adds the findings' patterns to the `.gitignore` at `top`, creating it if
 /// needed, and returns the patterns it added.
 pub fn add_to_gitignore(top: &Path, findings: &[Finding]) -> Result<Vec<String>> {
     let path = top.join(".gitignore");
-    let mut text = match fs::read_to_string(&path) {
-        Ok(text) => text,
+    // git doesn't read a .gitignore that is a symbolic link, and writing through one would
+    // change a file outside the repository.
+    if fs::symlink_metadata(&path).is_ok_and(|meta| meta.file_type().is_symlink()) {
+        bail!(
+            "{} is a symbolic link, so git-agent won't add to it",
+            path.display()
+        );
+    }
+    let mut text = match fs::read(&path) {
+        Ok(bytes) => lossless::to_text(&bytes),
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => String::new(),
         Err(err) => return Err(err).with_context(|| format!("failed to read {}", path.display())),
     };
@@ -486,7 +509,8 @@ pub fn add_to_gitignore(top: &Path, findings: &[Finding]) -> Result<Vec<String>>
     for pattern in &added {
         let _ = writeln!(text, "{pattern}");
     }
-    fs::write(&path, text).with_context(|| format!("failed to write {}", path.display()))?;
+    fs::write(&path, lossless::to_bytes(&text))
+        .with_context(|| format!("failed to write {}", path.display()))?;
     Ok(added)
 }
 
@@ -515,7 +539,7 @@ mod tests {
                     finding.label.as_str(),
                     finding.reason.as_str(),
                     finding.pattern.as_str(),
-                    finding.files,
+                    finding.paths.len(),
                 )
             })
             .collect()
@@ -554,7 +578,7 @@ mod tests {
             reason: "environment file".to_owned(),
             pattern: "/secret.env\n*".to_owned(),
             exclude: Vec::new(),
-            files: 1,
+            paths: vec!["secret.env\n*".to_owned()],
             bytes: 1,
         };
         let plain = Finding {
@@ -670,7 +694,9 @@ mod tests {
             reason: "Rust build output".to_owned(),
             pattern: String::new(),
             exclude: Vec::new(),
-            files,
+            paths: (0..files)
+                .map(|number| format!("{label}{number}"))
+                .collect(),
             bytes,
         };
         let findings = [
@@ -693,7 +719,7 @@ mod tests {
             reason: String::new(),
             pattern: pattern.to_owned(),
             exclude: Vec::new(),
-            files: 1,
+            paths: vec![pattern.to_owned()],
             bytes: 0,
         };
         let added = add_to_gitignore(dir.path(), &[finding("/target/"), finding(".env")]).unwrap();
@@ -718,5 +744,141 @@ mod tests {
             fs::read_to_string(dir.path().join(".gitignore")).unwrap(),
             "*.log\nnode_modules/\n"
         );
+    }
+
+    /// A repository where names differ by case, as on Linux.
+    fn case_sensitive_repo() -> (TempDir, crate::git::Repo) {
+        let (dir, repo) = crate::git::test_support::isolated_repo();
+        crate::git::test_support::run(dir.path(), &["config", "core.ignorecase", "false"]);
+        (dir, repo)
+    }
+
+    #[test]
+    fn keeps_the_case_of_an_extension_in_its_pattern() {
+        let (_dir, untracked) = tree(&["SETUP.EXE", "low.exe", "n/DEEP.Exe", "a.O", "keep.txt"]);
+        let findings = check(_dir.path(), &untracked);
+        let patterns: Vec<&str> = findings.iter().map(|f| f.pattern.as_str()).collect();
+        assert_eq!(patterns, ["*.EXE", "*.exe", "*.Exe", "*.O"]);
+    }
+
+    #[test]
+    fn leaves_out_files_with_an_uppercase_extension_when_case_matters() {
+        let (dir, repo) = case_sensitive_repo();
+        let run = |args: &[&str]| crate::git::test_support::run(dir.path(), args);
+        fs::create_dir(dir.path().join("n")).unwrap();
+        for name in ["SETUP.EXE", "low.exe", "n/DEEP.Exe", "keep.txt"] {
+            fs::write(dir.path().join(name), "x\n").unwrap();
+        }
+        let findings = check(dir.path(), &repo.untracked_files().unwrap());
+        repo.stage_all_except(&exclude(&findings)).unwrap();
+        assert_eq!(run(&["diff", "--cached", "--name-only"]), "keep.txt\n");
+
+        run(&["reset", "-q"]);
+        add_to_gitignore(dir.path(), &findings).unwrap();
+        repo.stage_all_except(&exclude_what_gitignore_cant_hold(&findings))
+            .unwrap();
+        assert_eq!(
+            run(&["diff", "--cached", "--name-only"]),
+            ".gitignore\nkeep.txt\n"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn wont_write_through_a_gitignore_that_is_a_symbolic_link() {
+        let (dir, _untracked) = tree(&["x.o"]);
+        let outside = TempDir::new().unwrap();
+        let target = outside.path().join("target.txt");
+        fs::write(&target, "mine\n").unwrap();
+        std::os::unix::fs::symlink(&target, dir.path().join(".gitignore")).unwrap();
+        let findings = check(dir.path(), &["x.o".to_owned()]);
+        let error = add_to_gitignore(dir.path(), &findings).unwrap_err();
+        assert!(error.to_string().contains("symbolic link"), "{error}");
+        assert_eq!(fs::read_to_string(&target).unwrap(), "mine\n");
+    }
+
+    #[test]
+    fn keeps_a_gitignore_that_isnt_utf8_as_it_is() {
+        let (dir, _untracked) = tree(&["x.o"]);
+        let path = dir.path().join(".gitignore");
+        fs::write(&path, b"caf\xe9.log\n").unwrap();
+        let findings = check(dir.path(), &["x.o".to_owned()]);
+        assert_eq!(add_to_gitignore(dir.path(), &findings).unwrap(), ["*.o"]);
+        assert_eq!(fs::read(&path).unwrap(), b"caf\xe9.log\n*.o\n");
+    }
+
+    /// Writes a file whose name isn't valid UTF-8, or returns `false` where the file
+    /// system refuses such a name, which only macOS's should.
+    #[cfg(unix)]
+    fn write_name_that_isnt_utf8(dir: &Path, name: &[u8], text: &str) -> bool {
+        use std::os::unix::ffi::OsStrExt;
+        let path = dir.join(std::ffi::OsStr::from_bytes(name));
+        if let Some(parent) = path.parent()
+            && fs::create_dir_all(parent).is_err()
+        {
+            assert_eq!(
+                std::env::consts::OS,
+                "macos",
+                "the file system refused {name:?}"
+            );
+            return false;
+        }
+        match fs::write(&path, text) {
+            Ok(()) => true,
+            Err(error) => {
+                assert_eq!(
+                    std::env::consts::OS,
+                    "macos",
+                    "couldn't write {name:?}: {error}"
+                );
+                false
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn leaves_out_a_private_key_whose_folder_name_isnt_utf8() {
+        let (dir, repo) = case_sensitive_repo();
+        let run = |args: &[&str]| crate::git::test_support::run(dir.path(), args);
+        if !write_name_that_isnt_utf8(dir.path(), b"caf\xe9/id_rsa", "key\n") {
+            return;
+        }
+        fs::write(dir.path().join("keep.txt"), "x\n").unwrap();
+        let findings = check(dir.path(), &repo.untracked_files().unwrap());
+        assert_eq!(findings.len(), 1, "{findings:?}");
+        assert!(
+            list(&findings).contains("caf\u{fffd}/id_rsa"),
+            "{findings:?}"
+        );
+
+        repo.stage_all_except(&exclude(&findings)).unwrap();
+        assert_eq!(run(&["diff", "--cached", "--name-only"]), "keep.txt\n");
+
+        run(&["reset", "-q"]);
+        add_to_gitignore(dir.path(), &findings).unwrap();
+        let line = fs::read(dir.path().join(".gitignore")).unwrap();
+        assert!(line.windows(4).any(|part| part == b"caf\xe9"), "{line:?}");
+        repo.stage_all_except(&exclude_what_gitignore_cant_hold(&findings))
+            .unwrap();
+        assert_eq!(
+            run(&["diff", "--cached", "--name-only"]),
+            ".gitignore\nkeep.txt\n"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn measures_a_large_file_whose_name_isnt_utf8() {
+        let dir = TempDir::new().unwrap();
+        let large = "x".repeat(LARGE_FILE_BYTES as usize);
+        if !write_name_that_isnt_utf8(dir.path(), b"caf\xe9.bin", &large) {
+            return;
+        }
+        let name = lossless::to_text(b"caf\xe9.bin");
+        let findings = check(dir.path(), &[name]);
+        assert_eq!(findings.len(), 1, "{findings:?}");
+        assert_eq!(findings[0].reason, "large file");
+        assert_eq!(findings[0].bytes, LARGE_FILE_BYTES);
     }
 }

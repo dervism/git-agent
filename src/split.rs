@@ -16,6 +16,7 @@ pub mod signals;
 
 use crate::fit;
 use crate::git::{lossless, names};
+use crate::safe_text::{escaped, without_hidden};
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashSet};
@@ -336,8 +337,14 @@ pub fn parse_plan(reply: &str, files: &[FilePatch], units: &[Unit]) -> Result<Se
         .context("the model's plan is cut off")?;
     let after_plan = reply.get(end + 1..).unwrap_or_default();
     let (value, repaired) = read_json(reply.get(start..=end).unwrap_or_default(), after_plan)?;
-    let raw = raw_commits(&value)?;
+    let (raw, hidden) = without_hidden_titles(raw_commits(&value)?);
     let mut settled = settle(raw, files, units);
+    if hidden > 0 {
+        settled.notes.insert(
+            0,
+            format!("the plan's titles held {hidden} control or invisible character(s); git-agent removed them"),
+        );
+    }
     if repaired {
         settled.notes.insert(
             0,
@@ -345,6 +352,21 @@ pub fn parse_plan(reply: &str, files: &[FilePatch], units: &[Unit]) -> Result<Se
         );
     }
     Ok(settled)
+}
+
+/// The plan's commits with hidden characters taken out of their titles, and how many
+/// were. JSON can spell them as `\\u001b`, so cleaning the reply as text can't catch them.
+fn without_hidden_titles(raw: Vec<(String, Vec<usize>)>) -> (Vec<(String, Vec<usize>)>, usize) {
+    let mut hidden = 0;
+    let cleaned = raw
+        .into_iter()
+        .map(|(title, numbers)| {
+            let title = without_hidden(&title);
+            hidden += title.removed;
+            (title.text.trim().to_owned(), numbers)
+        })
+        .collect();
+    (cleaned, hidden)
 }
 
 /// Reads the JSON of a plan, and says if it had to fix closing brackets the
@@ -589,7 +611,7 @@ pub fn to_text(plan: &Plan, files: &[FilePatch], units: &[Unit]) -> String {
         }
         text.push('\n');
     }
-    text
+    escaped(&text)
 }
 
 /// Reads a plan the user edited (see [`to_text`]). A plan without commits
@@ -895,7 +917,7 @@ mod tests {
             let patch = patch(&files, &units, &chosen, &committed);
             index.read_tree("HEAD").unwrap();
             index.apply_to_index(&patch.text).unwrap();
-            index.commit(message, Scope::Staged, &[]).unwrap();
+            index.commit(message, Scope::Staged, &[], &[]).unwrap();
             committed.record(&patch);
         }
         assert_eq!(run(dir.path(), &["rev-parse", "HEAD^{tree}"]), original);
@@ -1304,7 +1326,7 @@ mod tests {
             let patch = patch(&files, &described.units, &[unit], &committed);
             index.read_tree("HEAD").unwrap();
             index.apply_to_index(&patch.text).unwrap();
-            index.commit(message, Scope::Staged, &[]).unwrap();
+            index.commit(message, Scope::Staged, &[], &[]).unwrap();
             committed.record(&patch);
         }
         assert_eq!(run(dir.path(), &["rev-parse", "HEAD^{tree}"]), original);
@@ -1419,5 +1441,18 @@ mod tests {
         assert_eq!((hunk.old_start, hunk.old_len, hunk.new_len), (10, 3, 1));
         assert_eq!(hunk.section, " fn main() {");
         assert!(parse_hunk_header("@@ nonsense\n").is_none());
+    }
+
+    #[test]
+    fn takes_hidden_characters_out_of_titles_that_json_spelled() {
+        let (cleaned, hidden) = without_hidden_titles(vec![
+            ("a\u{1b}[2Jb\u{202e}".to_owned(), vec![1]),
+            ("  plain æøå ".to_owned(), vec![2]),
+            ("\u{1b}".to_owned(), vec![3]),
+        ]);
+        assert_eq!(hidden, 3);
+        assert_eq!(cleaned[0].0, "a[2Jb");
+        assert_eq!(cleaned[1].0, "plain æøå");
+        assert_eq!(cleaned[2].0, "");
     }
 }

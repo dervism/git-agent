@@ -1,0 +1,5 @@
+# The Rust that CI checks with. Dependabot proposes each new version, so a new clippy lint
+# shows up in that pull request and not in an unrelated push.
+[toolchain]
+channel = "1.99.1"
+components = ["rustfmt", "clippy"]

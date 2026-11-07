@@ -9,14 +9,14 @@ use super::{Committed, FilePatch, Patch, Plan, Planned, Unit};
 use crate::cli::{SettingArgs, SplitArgs};
 use crate::config::{Config, OnSecrets};
 use crate::git::worktree::TempWorktree;
-use crate::git::{Changes, Repo, Scope};
+use crate::git::{Changes, Repo, Scope, names};
 use crate::models::Model;
 use crate::server::{Message, ModelServer};
 use crate::ui::{self, Action, Choice, Review};
 use crate::{
     check_outgoing, commit, commit_message, connect, conversation_tokens, generate_message, prompt,
     push, redact, reject_added, report_fit, report_model, report_secrets, review, separated, split,
-    stage_all,
+    staging,
 };
 use anyhow::{Context, Result, bail};
 use std::fs;
@@ -94,14 +94,13 @@ fn changes_to_split(repo: &Repo, args: &SplitArgs, config: &Config) -> Result<Op
     if let Some(operation) = repo.operation_in_progress()? {
         bail!("{operation} is in progress; finish or abort it before splitting changes");
     }
-    if repo.has_unmerged_paths()? {
-        bail!("some files have unresolved conflicts; resolve them before splitting changes");
-    }
+    staging::refuse_unresolved_conflicts(repo, "splitting changes")?;
     let ask = !args.commit && io::stdin().is_terminal();
-    if args.all && !stage_all(repo, ask)? {
+    if args.all && !staging::stage_all(repo, ask)? {
         ui::info("Nothing staged or committed.");
         return Ok(None);
     }
+    staging::report_hidden_pointers(&staging::hidden_pointers(repo, false)?, true);
     let Some((scope, changes)) = repo.changes(&config.exclude)? else {
         ui::info("✨ No changes to split.");
         return Ok(None);
@@ -180,7 +179,7 @@ async fn split_changes<S: ModelServer>(
             "the split stopped; the commits made so far stay, and the rest of the changes are as \
              they were",
         )?;
-    finish(repo, args, config, work.scope, &outcome)
+    finish(repo, args, config, work, &outcome)
 }
 
 fn report_what_is_split(work: &Work, by_file: bool) {
@@ -203,7 +202,7 @@ fn finish(
     repo: &Repo,
     args: &SplitArgs,
     config: &Config,
-    scope: Scope,
+    work: &Work,
     outcome: &Outcome,
 ) -> Result<()> {
     const NOT_PUSHED: &str = "the commits were made, but not pushed";
@@ -214,22 +213,25 @@ fn finish(
             ui::info(format!("   {line}"));
         }
     }
-    let left = match scope {
-        Scope::Staged => repo.has_staged_changes()?,
-        Scope::Tracked => repo.has_uncommitted_changes()?,
+    let (left, place) = match work.scope {
+        Scope::Staged => (repo.has_staged_changes()?, "staged"),
+        Scope::Tracked => (repo.has_uncommitted_changes()?, "uncommitted"),
     };
     if left {
-        let place = match scope {
-            Scope::Staged => "staged",
-            Scope::Tracked => "uncommitted",
-        };
-        if outcome.skipped > 0 || outcome.stopped {
-            ui::info(format!("The changes you didn't commit are still {place}."));
-        } else {
-            ui::warn(format!(
+        let holds_everything = repo.tree("HEAD")? == work.snapshot.tree;
+        match Left::after(outcome, holds_everything) {
+            Left::NotCommitted => {
+                ui::info(format!("The changes you didn't commit are still {place}."));
+            }
+            Left::ChangedMeanwhile => {
+                ui::info(format!(
+                    "What you changed during the split is still {place}."
+                ));
+            }
+            Left::Missing => ui::warn(format!(
                 "the commits don't hold all of the changes; the rest are still {place} \
                  (see `git status`)"
-            ));
+            )),
         }
     }
     if args.push && outcome.made > 0 {
@@ -237,6 +239,59 @@ fn finish(
         push(repo, !args.commit).context(NOT_PUSHED)?;
     }
     Ok(())
+}
+
+/// What the changes still there after a split are.
+#[derive(Debug, PartialEq)]
+enum Left {
+    /// Those of a commit the user skipped, or the ones after stopping.
+    NotCommitted,
+    /// The commits hold all that was planned, so these came during the split.
+    ChangedMeanwhile,
+    Missing,
+}
+
+impl Left {
+    fn after(outcome: &Outcome, holds_everything: bool) -> Self {
+        if outcome.skipped > 0 || outcome.stopped {
+            Self::NotCommitted
+        } else if holds_everything {
+            Self::ChangedMeanwhile
+        } else {
+            Self::Missing
+        }
+    }
+}
+
+/// Says what catching up the index cost or changed.
+fn report_caught_up(caught_up: &CaughtUp) {
+    for path in &caught_up.unstaged {
+        ui::warn(format!(
+            "you staged {} during the split, and this commit touches it, so it's unstaged \
+             again; the file is unchanged",
+            names::shown(path)
+        ));
+    }
+    for path in &caught_up.changed_by_hook {
+        ui::warn(format!(
+            "a commit hook changed {}, so the index now holds what the commit holds there",
+            names::shown(path)
+        ));
+    }
+}
+
+/// Of the paths a commit touched, those whose index entry differs from both the commit and
+/// its parent: the user staged something there that the commit doesn't hold.
+fn staged_something_else(
+    touched: &[String],
+    against_parent: &[String],
+    against_commit: &[String],
+) -> Vec<String> {
+    touched
+        .iter()
+        .filter(|path| against_parent.contains(path) && against_commit.contains(path))
+        .cloned()
+        .collect()
 }
 
 /// What making the commits of a split needs.
@@ -267,6 +322,17 @@ struct Outcome {
     skipped: usize,
     /// Whether the user stopped before the last commit.
     stopped: bool,
+    /// Paths the user staged during the split that a commit touched, so they're unstaged.
+    unstaged: Vec<String>,
+    /// Paths a commit hook changed, which the index now holds as the commit does.
+    changed_by_hooks: Vec<String>,
+}
+
+/// How the real index caught up with a commit made in a temporary one.
+#[derive(Default)]
+struct CaughtUp {
+    unstaged: Vec<String>,
+    changed_by_hook: Vec<String>,
 }
 
 impl<S: ModelServer> Splitter<'_, S> {
@@ -473,8 +539,8 @@ impl<S: ModelServer> Splitter<'_, S> {
     }
 
     /// Makes the planned commits one by one, each built in a temporary index
-    /// from HEAD and its own changes, so the real index is left alone. With
-    /// `review_messages`, the user reviews each commit's message.
+    /// from HEAD and its own changes. With `review_messages`, the user reviews each
+    /// commit's message.
     async fn make_commits(&self, prepared: &CommitPlan, review_messages: bool) -> Result<Outcome> {
         let path = self.repo.git_path("GIT_AGENT_SPLIT_INDEX")?;
         let index = self.repo.with_index(path.clone());
@@ -492,11 +558,59 @@ impl<S: ModelServer> Splitter<'_, S> {
             )
             .await;
         let _ = fs::remove_file(&path);
-        // Nothing was staged before the split, so the real index stays at HEAD.
-        if self.work.scope == Scope::Tracked {
-            self.repo.reset_index()?;
-        }
         outcome
+    }
+
+    /// Brings the real index up with a commit made in a temporary one. With tracked
+    /// changes, nothing of the commit was staged, so the index gets all the paths the
+    /// commit changed, and only those: what the user staged elsewhere during the split
+    /// stays. With staged changes, the rest of them stay staged, so the index only gets
+    /// what a hook changed, or a later commit would undo that. Such a path then follows
+    /// each later commit that changes it, in `diverged`, or that commit would be undone.
+    fn catch_up_index(
+        &self,
+        parent: &str,
+        made: &str,
+        planned_tree: &str,
+        diverged: &mut Vec<String>,
+    ) -> Result<CaughtUp> {
+        match self.work.scope {
+            Scope::Tracked => {
+                let touched = self.repo.changed_between(parent, made)?;
+                let unstaged = staged_something_else(
+                    &touched,
+                    &self.repo.staged_against(parent)?,
+                    &self.repo.staged_against(made)?,
+                );
+                self.repo.reset_paths(made, &touched)?;
+                Ok(CaughtUp {
+                    unstaged,
+                    changed_by_hook: Vec::new(),
+                })
+            }
+            Scope::Staged => {
+                let changed_by_hook = self.repo.changed_between(planned_tree, made)?;
+                let mut paths: Vec<String> = self
+                    .repo
+                    .changed_between(parent, made)?
+                    .into_iter()
+                    .filter(|path| diverged.contains(path))
+                    .collect();
+                for path in &changed_by_hook {
+                    if !paths.contains(path) {
+                        paths.push(path.clone());
+                    }
+                    if !diverged.contains(path) {
+                        diverged.push(path.clone());
+                    }
+                }
+                self.repo.reset_paths(made, &paths)?;
+                Ok(CaughtUp {
+                    unstaged: Vec::new(),
+                    changed_by_hook,
+                })
+            }
+        }
     }
 
     /// Lets the user decide about a commit from its message.
@@ -546,6 +660,7 @@ impl<S: ModelServer> Splitter<'_, S> {
         // A skipped commit, or a hook that changes one, changes what the later
         // ones hold, so they can no longer be held to what was planned.
         let mut follows_plan = true;
+        let mut diverged = Vec::new();
         let total = prepared.plan.commits.len();
         for ((number, planned), planned_tree) in
             (1..).zip(&prepared.plan.commits).zip(&prepared.trees)
@@ -595,21 +710,23 @@ impl<S: ModelServer> Splitter<'_, S> {
                 }
             };
             self.ensure_head_is(&parent)?;
-            commit(index, &message, Scope::Staged, &self.args.git_args)?;
+            commit(index, &message, Scope::Staged, &self.args.git_args, &[])?;
             committed.record(&patch);
             outcome.made += 1;
-            parent = self
+            let made = self
                 .repo
                 .resolve("HEAD")?
                 .context("HEAD is gone after a commit")?;
+            let caught_up = self.catch_up_index(&parent, &made, &tree, &mut diverged)?;
+            report_caught_up(&caught_up);
+            outcome.unstaged.extend(caught_up.unstaged);
+            outcome.changed_by_hooks.extend(caught_up.changed_by_hook);
+            parent = made;
             if self.repo.tree(&parent)? != tree {
                 follows_plan = false;
                 if self.args.check.is_some() {
                     ui::warn("a commit hook changed this commit, so it isn't what was checked");
                 }
-            }
-            if self.work.scope == Scope::Tracked {
-                self.repo.reset_index()?;
             }
         }
         Ok(outcome)
@@ -684,68 +801,10 @@ mod tests {
     use super::*;
     use crate::git::test_support::{isolated_repo, numbered_lines, run, with_submodule};
     use crate::models::ContextSource;
-    use crate::server::ModelInfo;
-    use std::cell::{Cell, RefCell};
+    use crate::server::test_support::FakeServer;
+    use std::cell::RefCell;
     use std::path::Path;
     use tempfile::TempDir;
-
-    /// A model that replies with fixed text, and can do something while the user
-    /// waits for its reply.
-    struct FakeServer<'a> {
-        plans: RefCell<Vec<&'a str>>,
-        message: &'a str,
-        message_requests: Cell<usize>,
-        during_plan: RefCell<Option<Box<dyn FnOnce() + 'a>>>,
-        during_message: RefCell<Option<Box<dyn FnOnce() + 'a>>>,
-    }
-
-    impl<'a> FakeServer<'a> {
-        fn new(plan: &'a str, message: &'a str) -> Self {
-            Self {
-                plans: RefCell::new(vec![plan]),
-                message,
-                message_requests: Cell::new(0),
-                during_plan: RefCell::new(None),
-                during_message: RefCell::new(None),
-            }
-        }
-
-        fn during_plan(self, action: impl FnOnce() + 'a) -> Self {
-            *self.during_plan.borrow_mut() = Some(Box::new(action));
-            self
-        }
-
-        fn during_message(self, action: impl FnOnce() + 'a) -> Self {
-            *self.during_message.borrow_mut() = Some(Box::new(action));
-            self
-        }
-    }
-
-    impl ModelServer for FakeServer<'_> {
-        async fn models(&self) -> Result<Vec<ModelInfo>> {
-            Ok(Vec::new())
-        }
-
-        async fn complete(&self, _model: &str, messages: &[Message]) -> Result<String> {
-            if messages[0].content == prompt::SPLIT_PROMPT {
-                if let Some(action) = self.during_plan.borrow_mut().take() {
-                    action();
-                }
-                let mut plans = self.plans.borrow_mut();
-                let plan = if plans.len() > 1 {
-                    plans.remove(0)
-                } else {
-                    plans[0]
-                };
-                return Ok(plan.to_owned());
-            }
-            self.message_requests.set(self.message_requests.get() + 1);
-            if let Some(action) = self.during_message.borrow_mut().take() {
-                action();
-            }
-            Ok(self.message.to_owned())
-        }
-    }
 
     fn model() -> Model {
         Model {
@@ -753,6 +812,7 @@ mod tests {
             picked: None,
             context_length: 100_000,
             context_source: ContextSource::Config,
+            max_output_tokens: crate::config::DEFAULT_MAX_OUTPUT_TOKENS,
         }
     }
 
@@ -1124,34 +1184,8 @@ mod tests {
         args: &SplitArgs,
         decisions: Vec<Decision>,
     ) -> Result<Outcome> {
-        let config = Config::default();
-        let work = changes_to_split(repo, args, &config)?.expect("changes to split");
-        let units = split::describe(&work.files, 100_000)?.units;
         let server = FakeServer::new(TWO_COMMITS, "feat: change");
-        let model = model();
-        let splitter = Splitter {
-            repo,
-            config: &config,
-            args,
-            work: &work,
-            units: &units,
-            server: &server,
-            model: &model,
-        };
-        let conversation = [Message::system(prompt::SPLIT_PROMPT)];
-        let plan = splitter.new_plan(&conversation).await?;
-        let prepared = splitter.prepare_commits(&plan).await?;
-        let index = repo.with_index(repo.git_path("test-split-index")?);
-        let decisions = RefCell::new(decisions.into_iter());
-        splitter
-            .commit_each(
-                &prepared,
-                &index,
-                async |_: String, _: &[Message], _: Option<Kind>| {
-                    Ok(decisions.borrow_mut().next().expect("a decision"))
-                },
-            )
-            .await
+        commit_with_server(repo, args, decisions, &server).await
     }
 
     #[tokio::test]
@@ -1226,5 +1260,405 @@ mod tests {
         write(&dir.path().join("library"), "loose.txt", "x\n");
         let work = changes_to_split(&repo, &args(true, None), &Config::default()).unwrap();
         assert!(work.is_none());
+    }
+
+    /// The staged paths, as git lists them.
+    fn staged(dir: &Path) -> Vec<String> {
+        run(dir, &["diff", "--cached", "--name-only", "-z"])
+            .split('\0')
+            .filter(|name| !name.is_empty())
+            .map(str::to_owned)
+            .collect()
+    }
+
+    /// Runs the commits of `server`'s plan with scripted decisions, and returns the outcome.
+    async fn commit_with_server(
+        repo: &Repo,
+        args: &SplitArgs,
+        decisions: Vec<Decision>,
+        server: &FakeServer<'_>,
+    ) -> Result<Outcome> {
+        let config = Config::default();
+        let work = changes_to_split(repo, args, &config)?.expect("changes to split");
+        let units = split::describe(&work.files, 100_000)?.units;
+        let model = model();
+        let splitter = Splitter {
+            repo,
+            config: &config,
+            args,
+            work: &work,
+            units: &units,
+            server,
+            model: &model,
+        };
+        let conversation = [Message::system(prompt::SPLIT_PROMPT)];
+        let plan = splitter.new_plan(&conversation).await?;
+        let prepared = splitter.prepare_commits(&plan).await?;
+        let index = repo.with_index(repo.git_path("test-split-index")?);
+        let decisions = RefCell::new(decisions.into_iter());
+        splitter
+            .commit_each(
+                &prepared,
+                &index,
+                async |_: String, _: &[Message], _: Option<Kind>| {
+                    Ok(decisions.borrow_mut().next().expect("a decision"))
+                },
+            )
+            .await
+    }
+
+    fn commit_all() -> Vec<Decision> {
+        vec![
+            Decision::Commit("feat: first".to_owned()),
+            Decision::Commit("feat: second".to_owned()),
+        ]
+    }
+
+    #[tokio::test]
+    async fn keeps_a_file_staged_during_the_wait_for_a_plan_or_a_message() {
+        for during_plan in [true, false] {
+            let (dir, repo) = tracked_two_places();
+            let stage = || {
+                write(dir.path(), "other.txt", "other\n");
+                run(dir.path(), &["add", "other.txt"]);
+            };
+            let server = FakeServer::new(TWO_COMMITS, "feat: change");
+            let server = if during_plan {
+                server.during_plan(stage)
+            } else {
+                server.during_message(stage)
+            };
+            split(&repo, &args(true, None), &server).await.unwrap();
+            assert_eq!(staged(dir.path()), ["other.txt"], "plan: {during_plan}");
+            let in_head = run(dir.path(), &["show", "HEAD:lib.txt"]);
+            assert!(in_head.contains("thirty-seven") && in_head.contains("and a half"));
+            assert_eq!(
+                fs::read_to_string(dir.path().join("lib.txt")).unwrap(),
+                in_head
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn keeps_a_selection_staged_in_another_file() {
+        let (dir, repo) = tracked_two_places();
+        write(dir.path(), "notes.txt", "one\n");
+        run(dir.path(), &["add", "notes.txt"]);
+        run(dir.path(), &["commit", "-q", "-m", "add notes"]);
+        let stage = || {
+            write(dir.path(), "notes.txt", "one\nstaged\n");
+            run(dir.path(), &["add", "notes.txt"]);
+            write(dir.path(), "notes.txt", "one\nstaged\nnot staged\n");
+        };
+        let server = FakeServer::new(TWO_COMMITS, "feat: change").during_plan(stage);
+        split(&repo, &args(true, None), &server).await.unwrap();
+        assert_eq!(run(dir.path(), &["show", ":notes.txt"]), "one\nstaged\n");
+        assert_eq!(
+            fs::read_to_string(dir.path().join("notes.txt")).unwrap(),
+            "one\nstaged\nnot staged\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn unstages_and_reports_another_hunk_of_a_file_the_commit_touches() {
+        let (dir, repo) = tracked_two_places();
+        let in_work_tree = fs::read_to_string(dir.path().join("lib.txt")).unwrap();
+        let stage = || {
+            let other = numbered_lines(40).replace("line 20\n", "twenty\n");
+            write(dir.path(), "lib.txt", &other);
+            run(dir.path(), &["add", "lib.txt"]);
+            write(dir.path(), "lib.txt", &in_work_tree);
+        };
+        let server = FakeServer::new(TWO_COMMITS, "feat: change").during_plan(stage);
+        let outcome = commit_with_server(&repo, &args(true, None), commit_all(), &server)
+            .await
+            .unwrap();
+        assert_eq!(outcome.unstaged, ["lib.txt"]);
+        assert_eq!(staged(dir.path()), Vec::<String>::new());
+        assert_eq!(
+            fs::read_to_string(dir.path().join("lib.txt")).unwrap(),
+            in_work_tree
+        );
+    }
+
+    #[tokio::test]
+    async fn says_nothing_when_what_was_staged_is_what_the_commit_holds() {
+        let (dir, repo) = isolated_repo();
+        write(dir.path(), "a.txt", "a\n");
+        write(dir.path(), "b.txt", "b\n");
+        run(dir.path(), &["add", "--all"]);
+        run(dir.path(), &["commit", "-q", "-m", "add both"]);
+        write(dir.path(), "a.txt", "a2\n");
+        write(dir.path(), "b.txt", "b2\n");
+        let stage = || {
+            run(dir.path(), &["add", "a.txt"]);
+        };
+        let server = FakeServer::new(TWO_COMMITS, "feat: change").during_plan(stage);
+        let outcome = commit_with_server(&repo, &args(true, None), commit_all(), &server)
+            .await
+            .unwrap();
+        assert_eq!(outcome.made, 2);
+        assert_eq!(outcome.unstaged, Vec::<String>::new());
+        assert_eq!(staged(dir.path()), Vec::<String>::new());
+    }
+
+    #[tokio::test]
+    async fn keeps_an_intent_to_add_entry_and_a_rename_outside_the_commits() {
+        let (dir, repo) = tracked_two_places();
+        write(dir.path(), "old.txt", "stays the same\n");
+        run(dir.path(), &["add", "old.txt"]);
+        run(dir.path(), &["commit", "-q", "-m", "add old"]);
+        let stage = || {
+            write(dir.path(), "new.txt", "new\n");
+            run(dir.path(), &["add", "-N", "new.txt"]);
+            run(dir.path(), &["mv", "old.txt", "moved.txt"]);
+        };
+        let server = FakeServer::new(TWO_COMMITS, "feat: change").during_plan(stage);
+        split(&repo, &args(true, None), &server).await.unwrap();
+        let status = run(dir.path(), &["status", "--porcelain"]);
+        assert!(status.contains(" A new.txt"), "{status}");
+        assert!(status.contains("R  old.txt -> moved.txt"), "{status}");
+    }
+
+    #[tokio::test]
+    async fn resets_both_paths_of_a_rename_inside_a_commit() {
+        let (dir, repo) = tracked_two_places();
+        write(dir.path(), "old.txt", "stays the same\n");
+        run(dir.path(), &["add", "old.txt"]);
+        run(dir.path(), &["commit", "-q", "-m", "add old"]);
+        fs::rename(dir.path().join("old.txt"), dir.path().join("moved.txt")).unwrap();
+        run(dir.path(), &["add", "-N", "moved.txt"]);
+        let server = FakeServer::new(TWO_COMMITS, "feat: change");
+        split(&repo, &args(true, None), &server).await.unwrap();
+        assert_eq!(run(dir.path(), &["status", "--porcelain"]), "");
+        assert_eq!(
+            run(dir.path(), &["show", "HEAD:moved.txt"]),
+            "stays the same\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn reads_the_names_of_a_commit_literally() {
+        let (dir, repo) = isolated_repo();
+        let names = ["a*.txt", "blå bær.txt", ":colon.txt"];
+        for name in names {
+            write(dir.path(), name, "one\n");
+        }
+        write(dir.path(), "a1.txt", "one\n");
+        run(dir.path(), &["add", "--all"]);
+        run(dir.path(), &["commit", "-q", "-m", "add them"]);
+        for name in names {
+            write(dir.path(), name, "two\n");
+        }
+        let stage = || {
+            write(dir.path(), "a1.txt", "two\n");
+            run(dir.path(), &["add", "a1.txt"]);
+        };
+        let server = FakeServer::new(TWO_COMMITS, "feat: change").during_plan(stage);
+        split(&repo, &args(true, None), &server).await.unwrap();
+        assert_eq!(staged(dir.path()), ["a1.txt"]);
+        for name in names {
+            assert_eq!(
+                run(dir.path(), &["show", &format!("HEAD:./{name}")]),
+                "two\n"
+            );
+        }
+    }
+
+    /// A pre-commit hook that lets the first commit through and rejects the next.
+    fn hook_that_rejects_the_second_commit(dir: &Path) {
+        let hooks = dir.join("hooks");
+        fs::create_dir(&hooks).unwrap();
+        let script = "#!/bin/sh\n\
+                      test -f .git/hook-ran && exit 1\n\
+                      touch .git/hook-ran\n";
+        write(&hooks, "pre-commit", script);
+        let executable = std::os::unix::fs::PermissionsExt::from_mode(0o755);
+        fs::set_permissions(hooks.join("pre-commit"), executable).unwrap();
+        run(dir, &["config", "core.hooksPath", "hooks"]);
+    }
+
+    #[tokio::test]
+    async fn keeps_what_is_staged_when_a_hook_rejects_a_commit() {
+        let (dir, repo) = tracked_two_places();
+        hook_that_rejects_the_second_commit(dir.path());
+        let stage = || {
+            write(dir.path(), "other.txt", "other\n");
+            run(dir.path(), &["add", "other.txt"]);
+        };
+        let server = FakeServer::new(TWO_COMMITS, "feat: change").during_plan(stage);
+        let error = commit_with_server(&repo, &args(true, None), commit_all(), &server)
+            .await
+            .map(|_| ())
+            .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("git commit failed"),
+            "{error:#}"
+        );
+        assert_eq!(staged(dir.path()), ["other.txt"]);
+    }
+
+    #[tokio::test]
+    async fn keeps_what_is_staged_when_head_moves() {
+        let (dir, repo) = tracked_two_places();
+        let during = || {
+            write(dir.path(), "other.txt", "other\n");
+            run(dir.path(), &["add", "other.txt"]);
+            run(
+                dir.path(),
+                &["commit", "-q", "--allow-empty", "-m", "elsewhere", "--only"],
+            );
+        };
+        let server = FakeServer::new(TWO_COMMITS, "feat: change").during_message(during);
+        let error = commit_with_server(&repo, &args(true, None), commit_all(), &server)
+            .await
+            .map(|_| ())
+            .unwrap_err();
+        assert!(error.to_string().contains("HEAD moved"), "{error:#}");
+        assert_eq!(staged(dir.path()), ["other.txt"]);
+    }
+
+    #[tokio::test]
+    async fn keeps_what_is_staged_when_a_commit_is_skipped_or_the_split_stops() {
+        for decisions in [
+            vec![Decision::Skip, Decision::Skip],
+            vec![Decision::Stop],
+            vec![Decision::Commit("feat: first".to_owned()), Decision::Stop],
+        ] {
+            let (dir, repo) = tracked_two_places();
+            let stage = || {
+                write(dir.path(), "other.txt", "other\n");
+                run(dir.path(), &["add", "other.txt"]);
+            };
+            let server = FakeServer::new(TWO_COMMITS, "feat: change").during_plan(stage);
+            commit_with_server(&repo, &args(true, None), decisions, &server)
+                .await
+                .unwrap();
+            assert_eq!(staged(dir.path()), ["other.txt"]);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_later_commit_doesnt_undo_what_a_hook_did() {
+        let (dir, repo) = staged_three_parts();
+        hook_that_rewrites(dir.path());
+        let server = FakeServer::new(DOCS_USES_DEFS, "feat: change");
+        split(&repo, &args(true, None), &server).await.unwrap();
+        assert_eq!(staged(dir.path()), Vec::<String>::new());
+
+        let (dir, repo) = tracked_two_places();
+        hook_that_rewrites(dir.path());
+        let server = FakeServer::new(TWO_COMMITS, "feat: change");
+        split(&repo, &args(true, None), &server).await.unwrap();
+        assert_eq!(staged(dir.path()), Vec::<String>::new());
+        assert_eq!(
+            run(dir.path(), &["show", "HEAD:formatted.txt"]),
+            "formatted\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn keeps_the_rest_of_staged_changes_staged_when_a_hook_changes_a_commit() {
+        let (dir, repo) = staged_three_parts();
+        hook_that_rewrites(dir.path());
+        let server = FakeServer::new(DOCS_USES_DEFS, "feat: change");
+        let decisions = vec![Decision::Commit("feat: first".to_owned()), Decision::Stop];
+        commit_with_server(&repo, &args(true, None), decisions, &server)
+            .await
+            .unwrap();
+        let left = staged(dir.path());
+        assert!(!left.contains(&"formatted.txt".to_owned()), "{left:?}");
+        assert_eq!(left.len(), 2, "{left:?}");
+    }
+
+    /// A pre-commit hook that rewrites line 20 of lib.txt in the commit, the first time only.
+    fn hook_that_formats_once(dir: &Path) {
+        let hooks = dir.join("hooks");
+        fs::create_dir(&hooks).unwrap();
+        let script = "#!/bin/sh\n\
+                      test -f .git/formatted && exit 0\n\
+                      touch .git/formatted\n\
+                      blob=$(git show :lib.txt | sed 's/^line 20$/formatted 20/' | \
+                      git hash-object -w --stdin)\n\
+                      git update-index --cacheinfo 100644,$blob,lib.txt\n";
+        write(&hooks, "pre-commit", script);
+        let executable = std::os::unix::fs::PermissionsExt::from_mode(0o755);
+        fs::set_permissions(hooks.join("pre-commit"), executable).unwrap();
+        run(dir, &["config", "core.hooksPath", "hooks"]);
+    }
+
+    #[tokio::test]
+    async fn keeps_a_later_commit_of_a_file_a_hook_formatted_from_being_undone() {
+        let (dir, repo) = tracked_two_places();
+        run(dir.path(), &["add", "--all"]);
+        hook_that_formats_once(dir.path());
+        let server = FakeServer::new(TWO_COMMITS, "feat: change");
+        let outcome = commit_with_server(&repo, &args(true, None), commit_all(), &server)
+            .await
+            .unwrap();
+        assert_eq!(outcome.made, 2);
+        assert_eq!(outcome.changed_by_hooks, ["lib.txt"]);
+        let in_head = run(dir.path(), &["show", "HEAD:lib.txt"]);
+        assert!(in_head.contains("formatted 20") && in_head.contains("thirty-seven"));
+        assert_eq!(staged(dir.path()), Vec::<String>::new());
+    }
+
+    #[test]
+    fn finds_what_the_user_staged_that_the_commit_doesnt_hold() {
+        let names = |list: &[&str]| -> Vec<String> { list.iter().map(|n| n.to_string()).collect() };
+        assert_eq!(
+            staged_something_else(
+                &names(&["same.txt", "other.txt", "untouched.txt"]),
+                &names(&["same.txt", "other.txt"]),
+                &names(&["other.txt", "untouched.txt"]),
+            ),
+            ["other.txt"]
+        );
+        assert!(staged_something_else(&[], &names(&["a"]), &names(&["a"])).is_empty());
+    }
+
+    #[test]
+    fn tells_what_is_left_after_a_split() {
+        let outcome = |skipped, stopped| Outcome {
+            made: 1,
+            skipped,
+            stopped,
+            unstaged: Vec::new(),
+            changed_by_hooks: Vec::new(),
+        };
+        assert_eq!(Left::after(&outcome(1, false), true), Left::NotCommitted);
+        assert_eq!(Left::after(&outcome(0, true), false), Left::NotCommitted);
+        assert_eq!(
+            Left::after(&outcome(0, false), true),
+            Left::ChangedMeanwhile
+        );
+        assert_eq!(Left::after(&outcome(0, false), false), Left::Missing);
+    }
+
+    #[tokio::test]
+    async fn refuses_conflicts_before_all_can_mark_them_resolved() {
+        let (dir, repo) = tracked_two_places();
+        run(dir.path(), &["checkout", "-q", "--", "lib.txt"]);
+        let stash_change = || write(dir.path(), "lib.txt", "stashed\n");
+        stash_change();
+        run(dir.path(), &["stash", "-q"]);
+        write(dir.path(), "lib.txt", "theirs\n");
+        run(dir.path(), &["commit", "-q", "-a", "-m", "theirs"]);
+        let popped = std::process::Command::new("git")
+            .current_dir(dir.path())
+            .args(["stash", "pop", "-q"])
+            .output()
+            .unwrap();
+        assert!(!popped.status.success());
+        let mut with_all = args(true, None);
+        with_all.all = true;
+        let error = changes_to_split(&repo, &with_all, &Config::default())
+            .map(|_| ())
+            .unwrap_err();
+        assert!(
+            format!("{error:#}").starts_with("1 file has unresolved conflicts"),
+            "{error:#}"
+        );
+        assert_eq!(repo.unmerged_paths().unwrap(), ["lib.txt"]);
     }
 }

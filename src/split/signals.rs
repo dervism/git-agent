@@ -1,9 +1,9 @@
 //! The signals that stop a check, and keeping them working after one.
 
+#[cfg(unix)]
+use crate::ui;
 use std::fmt;
 use std::io;
-#[cfg(unix)]
-use std::io::IsTerminal;
 
 /// The user or the system stopped git-agent during a check. The value is the
 /// exit code a program ended by that signal has.
@@ -40,7 +40,7 @@ impl StopSignals {
         Ok(Self {
             interrupt: signal(SignalKind::interrupt())?,
             terminate: signal(SignalKind::terminate())?,
-            hangup: if io::stdout().is_terminal() || io::stderr().is_terminal() {
+            hangup: if ui::stdout_is_terminal() || ui::stderr_is_terminal() {
                 Some(signal(SignalKind::hangup())?)
             } else {
                 None
@@ -135,7 +135,10 @@ mod tests {
                 .unwrap();
         }
         std::thread::sleep(Duration::from_millis(200));
-        println!("helper is ready");
+        #[allow(clippy::print_stdout)]
+        {
+            println!("helper is ready");
+        }
         std::thread::sleep(Duration::from_secs(30));
     }
 

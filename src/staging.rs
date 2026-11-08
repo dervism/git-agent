@@ -38,15 +38,27 @@ fn listed(names_to_show: &[String]) -> String {
     lines.join("\n")
 }
 
-/// Stages everything for `--all`, after checking the untracked files for
+/// Stages everything for a command's `--all`, after checking the untracked files for
 /// build output, dependencies, secrets and large files that a `.gitignore`
 /// should keep out. With `ask`, the user decides what happens to them;
 /// otherwise they are left out.
 ///
 /// A hidden submodule pointer the user staged stays exactly as they staged it, as does a
-/// staged removal of one, whatever the work tree holds now. Returns `None` if the user quit,
-/// and otherwise those of them that the work tree has moved on from, for [`report_kept`].
-pub fn stage_all(repo: &Repo, ask: bool) -> Result<Option<Kept>> {
+/// staged removal of one, whatever the work tree holds now; those the work tree has moved on
+/// from get a note. `splitting` says whether the note is for a split. Returns `false`, having
+/// said so, if the user quit.
+pub fn stage_all_and_report(repo: &Repo, ask: bool, splitting: bool) -> Result<bool> {
+    let Some(kept) = stage_all(repo, ask)? else {
+        ui::info("Nothing staged or committed.");
+        return Ok(false);
+    };
+    report_kept(&kept, splitting);
+    Ok(true)
+}
+
+/// Stages everything as [`stage_all_and_report`] describes. Returns `None` if the user quit,
+/// and otherwise the pointers it kept that the work tree has moved on from.
+fn stage_all(repo: &Repo, ask: bool) -> Result<Option<Kept>> {
     let Some(staged) = stage_all_but_findings(repo, ask)? else {
         return Ok(None);
     };
@@ -55,8 +67,8 @@ pub fn stage_all(repo: &Repo, ask: bool) -> Result<Option<Kept>> {
     kept_and_moved_on(repo, &kept).map(Some)
 }
 
-/// Stages everything but the untracked files that should be ignored, as [`stage_all`]
-/// describes. Returns `None` if the user quit, and otherwise the hidden entries the user had
+/// Stages everything but the untracked files that should be ignored, as
+/// [`stage_all_and_report`] describes. Returns `None` if the user quit, and otherwise the hidden entries the user had
 /// staged, which it kept.
 fn stage_all_but_findings(repo: &Repo, ask: bool) -> Result<Option<Vec<IndexEntry>>> {
     let top = repo.toplevel()?;
@@ -125,9 +137,9 @@ fn how_to_put_back(entries: &[IndexEntry]) -> String {
 /// whose submodule has moved to another commit, and those whose folder is gone or is something
 /// else now.
 #[derive(Debug, Default, PartialEq)]
-pub struct Kept {
-    pub moved_on: Vec<String>,
-    pub replaced: Vec<String>,
+struct Kept {
+    moved_on: Vec<String>,
+    replaced: Vec<String>,
 }
 
 fn kept_and_moved_on(repo: &Repo, kept: &[String]) -> Result<Kept> {
@@ -147,7 +159,7 @@ fn kept_and_moved_on(repo: &Repo, kept: &[String]) -> Result<Kept> {
 /// Says which pointers `--all` kept where the user staged them though the work tree has moved
 /// on, as [`stage_all`] returns them. A commit holds the staged commit, and a split leaves the
 /// pointer staged.
-pub fn report_kept(kept: &Kept, splitting: bool) {
+fn report_kept(kept: &Kept, splitting: bool) {
     if !kept.moved_on.is_empty() {
         ui::info(moved_on_note(&kept.moved_on, splitting));
     }

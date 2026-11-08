@@ -97,12 +97,8 @@ fn changes_to_split(repo: &Repo, args: &SplitArgs, config: &Config) -> Result<Op
     }
     staging::refuse_unresolved_conflicts(repo, "splitting changes")?;
     let ask = !args.commit && io::stdin().is_terminal();
-    if args.all {
-        let Some(kept) = staging::stage_all(repo, ask)? else {
-            ui::info("Nothing staged or committed.");
-            return Ok(None);
-        };
-        staging::report_kept(&kept, true);
+    if args.all && !staging::stage_all_and_report(repo, ask, true)? {
+        return Ok(None);
     }
     staging::report_hidden_pointers(&staging::hidden_pointers(repo, false)?, true);
     let Some((scope, changes)) = repo.changes(&config.exclude)? else {

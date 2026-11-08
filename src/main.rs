@@ -295,12 +295,8 @@ fn changes_to_commit(
     ask: bool,
 ) -> Result<Option<ToCommit>> {
     staging::refuse_unresolved_conflicts(repo, "committing")?;
-    if args.all {
-        let Some(kept) = staging::stage_all(repo, ask)? else {
-            ui::info("Nothing staged or committed.");
-            return Ok(None);
-        };
-        staging::report_kept(&kept, false);
+    if args.all && !staging::stage_all_and_report(repo, ask, false)? {
+        return Ok(None);
     }
     let found = repo.changes(&config.exclude)?;
     let commits_all = matches!(found, Some((Scope::Tracked, _)));

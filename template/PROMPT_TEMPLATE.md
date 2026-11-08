@@ -151,11 +151,13 @@ The script works these out itself:
 │   │   ├── roadmap/
 │   │   │   ├── ROADMAP.md
 │   │   │   ├── items/
-│   │   │   └── finished/
+│   │   │   ├── finished/
+│   │   │   └── rejected/
 │   │   └── backlog/
 │   │       ├── BACKLOG.md
 │   │       ├── items/
-│   │       └── finished/
+│   │       ├── finished/
+│   │       └── rejected/
 │   ├── iterations/                  private: git-ignored
 │   ├── architecture/
 │   │   ├── design/                  private: git-ignored
@@ -562,8 +564,8 @@ writes. Then check these:
 
 - `scripts/check.sh` passes on the new scaffold.
 - `git check-ignore docs/planning docs/iterations docs/architecture/design` lists all three.
-- The empty folders under "What gets created" exist, including `items/` and `finished/` in both
-  `docs/planning/roadmap/` and `docs/planning/backlog/`.
+- The empty folders under "What gets created" exist, including `items/`, `finished/` and
+  `rejected/` in both `docs/planning/roadmap/` and `docs/planning/backlog/`.
 - No file holds a leftover parameter, or a condition marker.
 - After `scripts/check.sh` has run, `git ls-files --others --exclude-standard tmp` lists only
   `tmp/.gitkeep`.
@@ -775,7 +777,7 @@ their own default model.
 | `{{ROLE}}` | `{{ROLE_DESCRIPTION}}` | `READ_ONLY` | `ROLE_USES_DESIGN_SKILL` | `{{ROLE_CLAUDE_MODEL}}` | `{{ROLE_CLAUDE_EFFORT}}` | `{{ROLE_CLAUDE_COLOR}}` |
 | --- | --- | --- | --- | --- | --- | --- |
 | `application-architect` | Application architect for {{PROJECT_NAME}}. Use for design reviews of the documents in docs/architecture/design/, for architecture code reviews (domain model, bounded contexts, packaging by feature, cohesion and coupling, complexity, testability), and for proposals to restructure or refactor the code. Reports findings and recommendations; doesn't change project files. | Yes | No | `opus` | `xhigh` | `blue` |
-| `security-architect` | Security architect for {{PROJECT_NAME}}. Use for threat modelling, risk assessments and security code reviews, especially of the application core, for keeping docs/security/ current, and for designing or implementing security guardrails when the lead asks. | No | No | `fable` | `high` | `red` |
+| `security-architect` | Security architect for {{PROJECT_NAME}}. Use for threat modelling, risk assessments and security code reviews, especially of the application core, for keeping docs/security/ current, and for designing or implementing security guardrails when the lead asks. | No | No | `opus` | `xhigh` | `red` |
 | `lead-frontend-developer` | Lead frontend developer for {{PROJECT_NAME}}'s frontend in {{FRONTEND_DIR}}/. Use to review frontend changes for semantic HTML, accessibility, responsive design, performance, TypeScript and framework usage, Node tooling, and use of the design system. Reports findings and recommendations; doesn't change project files. | Yes | Yes | `opus` | `xhigh` | `green` |
 | `product-ux-designer` | Product UX designer for {{PROJECT_NAME}}'s frontend. Use to review the design (visual hierarchy, layout, typography, color, motion, accessibility and the premium feel) and to propose design updates within the project's design system. Reports findings and proposals; doesn't change project files. | Yes | Yes | `opus` | `xhigh` | `purple` |
 

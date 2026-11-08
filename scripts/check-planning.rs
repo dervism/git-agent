@@ -18,8 +18,17 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::{env, fs};
 
-const STATUSES: [&str; 5] = ["OPEN", "IN_PROGRESS", "DONE", "BLOCKED", "PARKED"];
-const DESIGN_STATUSES: [&str; 4] = ["DRAFT", "IN_REVIEW", "APPROVED", "SUPERSEDED"];
+const STATUSES: [&str; 6] = [
+    "OPEN",
+    "IN_PROGRESS",
+    "DONE",
+    "BLOCKED",
+    "PARKED",
+    "REJECTED",
+];
+const DESIGN_STATUSES: [&str; 5] = ["DRAFT", "IN_REVIEW", "APPROVED", "SUPERSEDED", "REJECTED"];
+/// The folders a backlog or roadmap item can be in.
+const ITEM_FOLDERS: [&str; 3] = ["items", "finished", "rejected"];
 const LABELS: [&str; 10] = [
     "accessibility",
     "bug",
@@ -419,10 +428,10 @@ fn numbered_item_problems(document: &Document) -> Vec<String> {
     let number = document.text("number");
     let title = document.text("title");
     let status = document.text("status");
-    let folder = if status == "DONE" {
-        "finished"
-    } else {
-        "items"
+    let folder = match status {
+        "DONE" => "finished",
+        "REJECTED" => "rejected",
+        _ => "items",
     };
     let mut problems = Vec::new();
     if !document.file_name().starts_with(&format!("{number}-")) {
@@ -608,7 +617,7 @@ struct Planning {
 impl Planning {
     fn load(root: &Path) -> Self {
         let items_in = |base: &str| -> Vec<PathBuf> {
-            ["items", "finished"]
+            ITEM_FOLDERS
                 .iter()
                 .flat_map(|folder| entries(&root.join(base).join(folder), is_markdown))
                 .collect()
@@ -838,12 +847,14 @@ mod tests {
         | Item priority | Item number | Item title | Item group | Item labels | Item status |\n\
         | --- | --- | --- | --- | --- | --- |\n\
         | 001 | 0001 | [Done item](finished/0001-done-item.md) | - | bug, security | DONE |\n\
-        | 002 | 0002 | [Open item](items/0002-open-item.md) | - | bug, security | OPEN |\n";
+        | 002 | 0002 | [Open item](items/0002-open-item.md) | - | bug, security | OPEN |\n\
+        | 003 | 0003 | [Rejected item](rejected/0003-rejected-item.md) | - | bug, security | REJECTED |\n";
 
     const ROADMAP: &str = "# Roadmap\n\nIntro\n\n## Items\n\n\
         | Item number | Item title | Item category | Item status |\n\
         | --- | --- | --- | --- |\n\
-        | 0001 | [`git agent idea`](items/0001-idea.md) | Ideas | OPEN |\n";
+        | 0001 | [`git agent idea`](items/0001-idea.md) | Ideas | OPEN |\n\
+        | 0002 | [Old idea](rejected/0002-old-idea.md) | Ideas | REJECTED |\n";
 
     const OPEN_ITEM: &str = "docs/planning/backlog/items/0002-open-item.md";
     const ITERATION_DOC: &str = "docs/iterations/001/iteration-001.md";
@@ -885,9 +896,18 @@ mod tests {
                 &backlog_item("0001", "001", "DONE", "2026-11-05", "Done item"),
             );
             tree.write(
+                "docs/planning/backlog/rejected/0003-rejected-item.md",
+                &backlog_item("0003", "003", "REJECTED", "null", "Rejected item"),
+            );
+            tree.write(
                 "docs/planning/roadmap/items/0001-idea.md",
                 "---\nnumber: \"0001\"\ntitle: \"git agent idea\"\ncategory: \"Ideas\"\n\
                  status: OPEN\nroadmap_items: []\n---\n\n# 0001 - `git agent idea`\n",
+            );
+            tree.write(
+                "docs/planning/roadmap/rejected/0002-old-idea.md",
+                "---\nnumber: \"0002\"\ntitle: \"Old idea\"\ncategory: \"Ideas\"\n\
+                 status: REJECTED\nroadmap_items: []\n---\n\n# 0002 - Old idea\n",
             );
             tree.write(
                 ITERATION_DOC,
@@ -935,7 +955,29 @@ mod tests {
         assert_eq!(tree.problems(), Vec::<String>::new());
         assert_eq!(
             Planning::load(&tree.0).summary(),
-            "2 backlog items, 1 roadmap items, 1 iterations and 1 designs"
+            "3 backlog items, 2 roadmap items, 1 iterations and 1 designs"
+        );
+    }
+
+    #[test]
+    fn accepts_a_rejected_design() {
+        let tree = Tree::new();
+        tree.replace(DESIGN_DOC, "status: APPROVED", "status: REJECTED");
+        assert_eq!(tree.problems(), Vec::<String>::new());
+    }
+
+    #[test]
+    fn finds_a_rejected_item_outside_rejected() {
+        let tree = Tree::new();
+        tree.replace(
+            "docs/planning/roadmap/rejected/0002-old-idea.md",
+            "status: REJECTED",
+            "status: OPEN",
+        );
+        tree.replace(ROADMAP_INDEX, "| REJECTED |", "| OPEN |");
+        assert_eq!(
+            tree.problems(),
+            ["docs/planning/roadmap/rejected/0002-old-idea.md: status OPEN belongs in items/"]
         );
     }
 
@@ -980,6 +1022,12 @@ mod tests {
                 "status: OPEN",
                 "status: DONE",
                 "it's DONE, so it needs date_finished",
+            ),
+            (
+                OPEN_ITEM,
+                "status: OPEN",
+                "status: REJECTED",
+                "status REJECTED belongs in rejected/",
             ),
             (
                 OPEN_ITEM,

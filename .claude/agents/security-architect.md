@@ -1,8 +1,8 @@
 ---
 name: security-architect
 description: Security architect for git-agent. Use for threat modelling, risk assessments and security code reviews, especially of the application core and of the interface between git-agent and the language model (prompt injection, data sent to model servers, redaction, API keys, commands and files built from model output), and for designing or implementing security guardrails when the lead asks.
-model: fable
-effort: high
+model: opus
+effort: xhigh
 color: red
 ---
 

@@ -364,7 +364,7 @@ it what it needs in the prompt.
   in the design of secure AI-driven applications. Strong skills in tracing, logging,
   access management and privacy by design. An expert in suggesting and implementing
   security guardrails in the app, and in the interface between the app and the language
-  model. It uses the newest Fable model, at high effort.
+  model. It uses the newest Opus model, at extra high effort.
 - `lead-frontend-developer`: a deep expert in modern frontend development. Highly skilled
   in TypeScript, React, CSS, semantic HTML, responsive design, accessibility and testing,
   in Astro and Tailwind CSS, and in Node and its ecosystem. Its main responsibility is
@@ -404,6 +404,10 @@ paths to it. `ROADMAP.md` lists finished items too. A DONE roadmap item is never
 its description stays as it was. New changes to what it delivered go in as regular backlog
 items.
 
+A roadmap item we decide not to pursue is REJECTED: move it to
+`docs/planning/roadmap/rejected/`, update the paths to it, and say why in its description.
+`ROADMAP.md` lists rejected items too, and a REJECTED item is never reopened.
+
 `ROADMAP.md` has this layout:
 
 ```markdown
@@ -424,7 +428,7 @@ Document each roadmap item with this template:
 number: "NNNN"
 title: "[Title, as plain text]"
 category: "[A category of related items]"
-status: OPEN                  # OPEN, IN_PROGRESS, DONE, BLOCKED or PARKED
+status: OPEN                  # OPEN, IN_PROGRESS, DONE, BLOCKED, PARKED or REJECTED
 roadmap_items: []             # Relative paths to earlier roadmap items this one changes
 ---
 
@@ -506,12 +510,14 @@ verified.
 
 The backlog is `docs/planning/backlog/BACKLOG.md`, our index and database of items. Each
 item is one unit of work, with an optional list of subtasks, and is marked OPEN,
-IN_PROGRESS, DONE, BLOCKED or PARKED. The roadmap's items use the same statuses.
+IN_PROGRESS, DONE, BLOCKED, PARKED or REJECTED. The roadmap's items use the same statuses.
 
 Each item is a Markdown document in `docs/planning/backlog/items/`, named
 `{NNNN}-{title}.md`, where NNNN is an incremental identifier that never changes. When an
 item is DONE, move it to `docs/planning/backlog/finished/`, and update the paths and links to
-it. `BACKLOG.md` is only the index and overview, and it lists finished items too. When we tidy
+it. An item we decide not to build is REJECTED: move it to `docs/planning/backlog/rejected/`,
+update the paths and links to it, and say why in its log. `BACKLOG.md` is only the index and
+overview, and it lists finished and rejected items too. When we tidy
 up and groom the backlog, or reprioritize items, you update the `priority` field in each
 item's frontmatter (section 2.2.1).
 
@@ -519,7 +525,7 @@ An item can belong to one group, a named batch of work, through the `group` fiel
 frontmatter. Group names are lower-case words joined by hyphens, such as `search-rewrite`. An
 item outside any group has `null` there, shown as `-` in `BACKLOG.md`, and is a single item. An iteration can include single
 items, one or more groups, or both. Including a group includes all its items that aren't
-DONE, BLOCKED or PARKED.
+DONE, BLOCKED, PARKED or REJECTED.
 
 `BACKLOG.md` has this layout:
 
@@ -532,7 +538,7 @@ DONE, BLOCKED or PARKED.
 | --- | --- | --- | --- | --- | --- |
 ```
 
-An item marked DONE is never reopened. When bugs, updates or refactoring touch code that
+An item marked DONE or REJECTED is never reopened. When bugs, updates or refactoring touch code that
 an item delivered, we open new items in the backlog, and add references to the relevant
 older items in their `related_items`.
 
@@ -549,7 +555,7 @@ group: null                   # group-name, or null for a single item
 priority: "NNN"
 date_started: null            # YYYY-MM-DD
 date_finished: null           # YYYY-MM-DD
-status: OPEN                  # OPEN, IN_PROGRESS, DONE, BLOCKED or PARKED
+status: OPEN                  # OPEN, IN_PROGRESS, DONE, BLOCKED, PARKED or REJECTED
 target_release_version: null  # "X.Y.Z", as major.minor.patch
 roadmap_items: []             # Relative paths to roadmap items
 design_documents: []          # Relative paths to design documents, ADRs and architecture documents
@@ -595,13 +601,13 @@ An item has one or more of these labels, which GitHub issues use too:
 
 The humanizer is the `humanizer:humanizer` skill.
 
-### 2.3.1 When the roadmap is empty or all its items are DONE
+### 2.3.1 When the roadmap is empty or all its items are DONE or REJECTED
 
 1. We brainstorm ideas.
 2. We agree which of the ideas become roadmap items, as the project's strategy, vision and
    goals.
 
-### 2.3.2 When BACKLOG.md is empty or all its items are DONE
+### 2.3.2 When BACKLOG.md is empty or all its items are DONE or REJECTED
 
 1. We agree which of the open roadmap items to build.
 2. We create backlog items and index them in `BACKLOG.md`. Each item is created from the
@@ -613,7 +619,7 @@ The humanizer is the `humanizer:humanizer` skill.
 ### 2.3.3 When BACKLOG.md has open items
 
 1. Suggest the single items and groups for the next iteration, leaving out items that are
-   DONE, BLOCKED or PARKED. This starts a new iteration.
+   DONE, BLOCKED, PARKED or REJECTED. This starts a new iteration.
 2. Design a solution. Analyse the source code, and identify the significant requirements,
    and the possible solutions and their trade-offs when there is more than one. Consider
    an external library or framework only when the Rust standard library can't provide what
@@ -626,7 +632,7 @@ The humanizer is the `humanizer:humanizer` skill.
    title: "[Title]"
    iteration: "NNN"
    backlog_items: []        # Relative paths
-   status: DRAFT            # DRAFT, IN_REVIEW, APPROVED or SUPERSEDED
+   status: DRAFT            # DRAFT, IN_REVIEW, APPROVED, SUPERSEDED or REJECTED
    date: null               # YYYY-MM-DD, when the status last changed
    related_documents: []    # Relative paths
    ---
@@ -664,7 +670,7 @@ The humanizer is the `humanizer:humanizer` skill.
 
 1. After each iteration, we update the roadmap and the backlog. We update the statuses and
    the groups, and reprioritize where what we have learned calls for it. Finished roadmap
-   items move to `finished/`.
+   items move to `finished/`, and rejected ones to `rejected/`.
 2. Look at the direction the project is going, from facts and data, including the backlog
    items that aren't implemented yet, and consider whether new roadmap items are necessary.
    This isn't about the items the iteration just finished. New roadmap items are added only

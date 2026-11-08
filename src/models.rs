@@ -1,13 +1,8 @@
 //! Choosing the model, and the context to fit the prompt into.
 
-use crate::config::Config;
+use crate::config::{self, Config};
 use crate::server::{ModelInfo, ModelServer};
 use anyhow::{Context, Result, bail};
-
-/// Context length assumed when neither the config nor the server gives one.
-/// It fits the defaults of common local servers; Ollama, for one, silently
-/// cuts prompts that are longer than its context.
-pub const FALLBACK_CONTEXT_LENGTH: usize = 4096;
 
 /// The model to use and the context to fit the prompt into.
 pub struct Model {
@@ -33,7 +28,7 @@ pub enum ContextSource {
     /// `context_length` in the config file, or its flag or environment variable.
     Config,
     Server,
-    /// [`FALLBACK_CONTEXT_LENGTH`]
+    /// [`config::FALLBACK_CONTEXT_LENGTH`]
     Assumed,
 }
 
@@ -63,7 +58,7 @@ pub async fn resolve(server: &impl ModelServer, config: &Config) -> Result<Model
     let (context_length, context_source) = match (config.context_length, info.context_length) {
         (Some(tokens), _) => (tokens, ContextSource::Config),
         (None, Some(tokens)) => (tokens, ContextSource::Server),
-        (None, None) => (FALLBACK_CONTEXT_LENGTH, ContextSource::Assumed),
+        (None, None) => (config::FALLBACK_CONTEXT_LENGTH, ContextSource::Assumed),
     };
     Ok(Model {
         id: info.id,
@@ -184,7 +179,7 @@ mod tests {
             ..Config::default()
         };
         let model = resolve(&FakeServer(Vec::new()), &config).await.unwrap();
-        assert_eq!(model.context_length, FALLBACK_CONTEXT_LENGTH);
+        assert_eq!(model.context_length, config::FALLBACK_CONTEXT_LENGTH);
         assert_eq!(model.context_source, ContextSource::Assumed);
         // Without a configured model, a server that can't list its models is an error.
         assert!(

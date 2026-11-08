@@ -6,7 +6,7 @@
 //! The history follows the lines through renames.
 
 use crate::fit;
-use crate::git::Summary;
+use crate::git::{Summary, diff};
 use anyhow::{Result, anyhow, bail};
 use std::fmt::Write;
 
@@ -405,7 +405,7 @@ pub fn describe(intro: &str, history: &[Change], complete: bool, room: usize) ->
     let heads: Vec<String> = history.iter().map(head).collect();
     let diffs: Vec<String> = history
         .iter()
-        .map(|change| fit::compact_header(&change.patch))
+        .map(|change| diff::compact_header(&change.patch))
         .collect();
     let budget = room.saturating_sub(intro.len() + HISTORY_HEADING.len() + NOTE_BYTES);
 

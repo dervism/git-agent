@@ -1,6 +1,6 @@
 //! Command-line interface.
 
-use crate::config::OnSecrets;
+use crate::config::{OnSecrets, Overrides};
 use clap::error::ErrorKind;
 use clap::parser::ValueSource;
 use clap::{Arg, ArgMatches, Args, CommandFactory, FromArgMatches, Parser, Subcommand};
@@ -106,7 +106,41 @@ pub struct SettingArgs {
         value_name = "ACTION",
         value_enum
     )]
-    pub on_secrets: Option<OnSecrets>,
+    pub on_secrets: Option<SecretsAction>,
+}
+
+impl SettingArgs {
+    /// The settings as the config takes them.
+    pub fn overrides(&self) -> Overrides {
+        Overrides {
+            config: self.config.clone(),
+            model: self.model.clone(),
+            context_length: self.context_length,
+            max_output_tokens: self.max_output_tokens,
+            base_url: self.base_url.clone(),
+            api_key: self.api_key.clone(),
+            temperature: self.temperature,
+            on_secrets: self.on_secrets.map(OnSecrets::from),
+        }
+    }
+}
+
+/// `--on-secrets`, as the command line takes it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum SecretsAction {
+    /// Don't commit, push or create the pull request
+    Reject,
+    /// List them and carry on
+    Warn,
+}
+
+impl From<SecretsAction> for OnSecrets {
+    fn from(action: SecretsAction) -> Self {
+        match action {
+            SecretsAction::Reject => Self::Reject,
+            SecretsAction::Warn => Self::Warn,
+        }
+    }
 }
 
 /// Options for `git agent pr`.
@@ -423,6 +457,7 @@ fn quoted_list(items: &[String]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::ValueEnum;
 
     #[test]
     fn cli_definition_is_valid() {
@@ -451,7 +486,7 @@ mod tests {
         let cli = try_parse_from(["git-agent", "--context-length", "8192"]).unwrap();
         assert_eq!(cli.settings.context_length, Some(8192));
         let cli = try_parse_from(["git-agent", "pr", "--on-secrets", "warn"]).unwrap();
-        assert_eq!(cli.settings.on_secrets, Some(OnSecrets::Warn));
+        assert_eq!(cli.settings.on_secrets, Some(SecretsAction::Warn));
         assert!(try_parse_from(["git-agent", "--on-secrets", "ignore"]).is_err());
     }
 
@@ -765,6 +800,54 @@ mod tests {
         }
         let kind = parse(&["--all", "--version", "split"]).unwrap_err().kind();
         assert_eq!(kind, ErrorKind::DisplayVersion);
+    }
+
+    #[test]
+    fn hands_every_setting_to_the_config_as_given() {
+        let cli = parse(&[
+            "--config",
+            "c.toml",
+            "-m",
+            "m",
+            "--context-length",
+            "5000",
+            "--max-output-tokens",
+            "600",
+            "--base-url",
+            "http://b/v1",
+            "--api-key",
+            "k",
+            "-t",
+            "0.7",
+            "--on-secrets",
+            "warn",
+        ])
+        .unwrap();
+        let overrides = cli.settings.overrides();
+        assert_eq!(overrides.config, Some(PathBuf::from("c.toml")));
+        assert_eq!(overrides.model.as_deref(), Some("m"));
+        assert_eq!(overrides.context_length, Some(5000));
+        assert_eq!(overrides.max_output_tokens, Some(600));
+        assert_eq!(overrides.base_url.as_deref(), Some("http://b/v1"));
+        assert_eq!(overrides.api_key.as_deref(), Some("k"));
+        assert_eq!(overrides.temperature, Some(0.7));
+        assert_eq!(overrides.on_secrets, Some(OnSecrets::Warn));
+    }
+
+    #[test]
+    fn spells_each_secrets_action_as_the_config_file_does() {
+        for action in SecretsAction::value_variants() {
+            let flag = action.to_possible_value().unwrap();
+            assert_eq!(flag.get_name(), OnSecrets::from(*action).as_str());
+        }
+        // A new setting doesn't compile here until the command line takes it too.
+        for setting in [OnSecrets::Reject, OnSecrets::Warn] {
+            let action = match setting {
+                OnSecrets::Reject => SecretsAction::Reject,
+                OnSecrets::Warn => SecretsAction::Warn,
+            };
+            assert_eq!(OnSecrets::from(action), setting);
+        }
     }
 
     #[test]

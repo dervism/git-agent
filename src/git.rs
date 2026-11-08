@@ -1,5 +1,6 @@
 //! Wrapper around the `git` command line.
 
+pub mod diff;
 pub mod lossless;
 pub mod names;
 pub mod worktree;
@@ -1428,7 +1429,7 @@ fn top_literal_pathspecs(paths: &[String]) -> Vec<u8> {
 }
 
 fn without_dirty_submodules(patch: &str) -> String {
-    crate::fit::split_files(patch)
+    diff::split_files(patch)
         .into_iter()
         .filter_map(without_dirty_submodule)
         .collect()

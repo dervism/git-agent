@@ -1,12 +1,11 @@
 //! Settings for the model and the prompt.
 //!
 //! Later sources win: built-in defaults, then the config file, then
-//! environment variables and command-line flags (both parsed by clap, see `cli.rs`).
+//! environment variables and command-line flags, which `cli.rs` reads into [`Overrides`].
 //! API keys never come from the file: they come from a flag, the environment,
-//! or the macOS keychain (see `secrets.rs`).
+//! or the macOS keychain (see `api_keys.rs`).
 
-use crate::cli::SettingArgs;
-use crate::{providers, secrets};
+use crate::{api_keys, providers};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::env;
@@ -15,6 +14,10 @@ use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
 pub const DEFAULT_BASE_URL: &str = "http://localhost:1234/v1";
+/// Context length assumed when neither the config nor the server gives one.
+/// It fits the defaults of common local servers; Ollama, for one, silently
+/// cuts prompts that are longer than its context.
+pub const FALLBACK_CONTEXT_LENGTH: usize = 4096;
 pub const DEFAULT_TIMEOUT_SECS: u64 = 300;
 /// Most tokens a model may write in one reply, thinking included. Enough for the
 /// thinking current models do before a commit message, and small enough for a
@@ -55,10 +58,25 @@ Guidelines:
 
 Reply with the commit message only: no introduction, no Markdown headings, no code fences."#;
 
+/// Settings given for one run, on the command line or in the environment, which win over
+/// the config file.
+#[derive(Debug, Default)]
+pub struct Overrides {
+    /// The config file to read instead of the usual one.
+    pub config: Option<PathBuf>,
+    pub model: Option<String>,
+    pub context_length: Option<usize>,
+    pub max_output_tokens: Option<usize>,
+    pub base_url: Option<String>,
+    pub api_key: Option<String>,
+    pub temperature: Option<f32>,
+    pub on_secrets: Option<OnSecrets>,
+}
+
 /// What git-agent does when the changes it would commit, or the commits it
 /// would push or open a pull request for, add what look like secrets. Either
 /// way, the model gets them replaced (see `redact.rs`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, clap::ValueEnum)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum OnSecrets {
     /// Don't commit, push or create the pull request
@@ -127,20 +145,20 @@ pub struct Loaded {
 }
 
 impl Config {
-    pub fn load(args: &SettingArgs) -> Result<Loaded> {
-        let path = resolve_path(args);
+    pub fn load(overrides: &Overrides) -> Result<Loaded> {
+        let path = resolve_path(overrides);
         let file = match &path {
             Some(path) => Self::read_file(path)?,
             None => None,
         };
-        if file.is_none() && args.config.is_some() {
+        if file.is_none() && overrides.config.is_some() {
             bail!("config file {} does not exist", path.unwrap().display());
         }
         let file_found = file.is_some();
         let mut config = file.unwrap_or_default();
-        config.apply(args);
+        config.apply(overrides);
         if config.api_key.is_none() {
-            config.api_key = secrets::get(&config.base_url)?;
+            config.api_key = api_keys::get(&config.base_url)?;
         }
         config.validate()?;
         Ok(Loaded {
@@ -164,26 +182,26 @@ impl Config {
         Ok(Some(config))
     }
 
-    pub fn apply(&mut self, args: &SettingArgs) {
-        if let Some(base_url) = &args.base_url {
+    pub fn apply(&mut self, overrides: &Overrides) {
+        if let Some(base_url) = &overrides.base_url {
             self.base_url = base_url.clone();
         }
-        if let Some(model) = &args.model {
+        if let Some(model) = &overrides.model {
             self.model = Some(model.clone());
         }
-        if let Some(api_key) = &args.api_key {
+        if let Some(api_key) = &overrides.api_key {
             self.api_key = Some(api_key.clone());
         }
-        if let Some(temperature) = args.temperature {
+        if let Some(temperature) = overrides.temperature {
             self.temperature = Some(temperature);
         }
-        if let Some(context_length) = args.context_length {
+        if let Some(context_length) = overrides.context_length {
             self.context_length = Some(context_length);
         }
-        if let Some(tokens) = args.max_output_tokens {
+        if let Some(tokens) = overrides.max_output_tokens {
             self.max_output_tokens = tokens;
         }
-        if let Some(on_secrets) = args.on_secrets {
+        if let Some(on_secrets) = overrides.on_secrets {
             self.on_secrets = on_secrets;
         }
         self.model = self.model.take().filter(|model| !model.trim().is_empty());
@@ -236,8 +254,8 @@ impl Config {
 }
 
 /// The config file to use: `--config`/`GIT_AGENT_CONFIG`, else the per-user default location.
-pub fn resolve_path(args: &SettingArgs) -> Option<PathBuf> {
-    args.config.clone().or_else(default_path)
+pub fn resolve_path(overrides: &Overrides) -> Option<PathBuf> {
+    overrides.config.clone().or_else(default_path)
 }
 
 fn default_path() -> Option<PathBuf> {
@@ -347,7 +365,7 @@ system_prompt = {system_prompt}
         max_output_tokens = config.max_output_tokens,
         on_secrets = toml_string(config.on_secrets.as_str()),
         local_temperature = LOCAL_TEMPERATURE,
-        fallback = crate::models::FALLBACK_CONTEXT_LENGTH,
+        fallback = FALLBACK_CONTEXT_LENGTH,
     )
 }
 
@@ -391,9 +409,9 @@ mod tests {
         assert!(toml::from_str::<Config>("on_secrets = \"ignore\"").is_err());
 
         let mut config = Config::default();
-        config.apply(&SettingArgs {
+        config.apply(&Overrides {
             on_secrets: Some(OnSecrets::Warn),
-            ..SettingArgs::default()
+            ..Overrides::default()
         });
         assert_eq!(config.on_secrets, OnSecrets::Warn);
     }
@@ -442,13 +460,13 @@ mod tests {
             model: Some("from-file".into()),
             ..Config::default()
         };
-        config.apply(&SettingArgs {
+        config.apply(&Overrides {
             model: Some("other".into()),
             temperature: Some(1.0),
             context_length: Some(8192),
             max_output_tokens: Some(4096),
             api_key: Some("  ".into()),
-            ..SettingArgs::default()
+            ..Overrides::default()
         });
         assert_eq!(config.model.as_deref(), Some("other"));
         assert_eq!(config.temperature, Some(1.0));
@@ -458,9 +476,9 @@ mod tests {
         assert_eq!(config.base_url, DEFAULT_BASE_URL);
 
         let mut blank = Config::default();
-        blank.apply(&SettingArgs {
+        blank.apply(&Overrides {
             model: Some(" ".into()),
-            ..SettingArgs::default()
+            ..Overrides::default()
         });
         assert_eq!(blank.model, None);
     }

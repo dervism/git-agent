@@ -6,8 +6,8 @@ use super::command::BuildCheck;
 use super::dry_run::{CommitPlan, Snapshot, dry_run};
 use super::kinds::{self, Kind};
 use super::{Committed, FilePatch, Patch, Plan, Planned, Unit};
-use crate::cli::{SettingArgs, SplitArgs};
-use crate::config::{Config, OnSecrets};
+use crate::cli::SplitArgs;
+use crate::config::{Config, OnSecrets, Overrides};
 use crate::git::worktree::TempWorktree;
 use crate::git::{Changes, Repo, Scope, names};
 use crate::models::Model;
@@ -72,8 +72,8 @@ const SPLIT_COMMIT_REVIEW: Review<bool> = Review {
 };
 
 /// Runs `git agent split`.
-pub async fn run(args: &SplitArgs, settings: &SettingArgs) -> Result<()> {
-    let config = Config::load(settings)?.config;
+pub async fn run(args: &SplitArgs, overrides: &Overrides) -> Result<()> {
+    let config = Config::load(overrides)?.config;
     let repo = Repo::open_at_top(".")?;
     let Some(work) = changes_to_split(&repo, args, &config)? else {
         return Ok(());

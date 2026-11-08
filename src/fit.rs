@@ -7,6 +7,7 @@
 //! changes. Cutting the diff as a whole would drop every file after the first
 //! few large ones.
 
+use crate::git::diff::{compact_header, split_files};
 use crate::git::names;
 use std::fmt::Write;
 
@@ -133,43 +134,6 @@ pub fn head_lines(text: &str, limit: usize) -> &str {
     }
 }
 
-/// Splits a diff into one part per file. Each part starts with "diff --git".
-pub fn split_files(diff: &str) -> Vec<&str> {
-    let mut starts: Vec<usize> = diff
-        .match_indices("diff --git ")
-        .map(|(index, _)| index)
-        .filter(|&index| index == 0 || diff.as_bytes()[index - 1] == b'\n')
-        .collect();
-    if starts.first() != Some(&0) {
-        starts.insert(0, 0);
-    }
-    let ends = starts.iter().skip(1).copied().chain([diff.len()]);
-    starts
-        .iter()
-        .zip(ends)
-        .map(|(&start, end)| &diff[start..end])
-        .filter(|file| !file.is_empty())
-        .collect()
-}
-
-/// Drops header lines the model doesn't need: the blob hashes on the `index`
-/// line, and the `---` and `+++` lines that repeat the paths of the first line.
-/// Lines such as "new file mode" and "rename from" stay.
-pub fn compact_header(file: &str) -> String {
-    let hunks = file.find("\n@@").map_or(file.len(), |newline| newline + 1);
-    let (header, hunks) = file.split_at(hunks);
-    let mut out: String = header
-        .split_inclusive('\n')
-        .filter(|line| {
-            !["index ", "--- ", "+++ "]
-                .iter()
-                .any(|start| line.starts_with(start))
-        })
-        .collect();
-    out.push_str(hunks);
-    out
-}
-
 /// Keeps at most `keep` unchanged lines before and after each change.
 fn trim_context(file: &str, keep: usize) -> String {
     let mut out = String::with_capacity(file.len());
@@ -273,17 +237,6 @@ mod tests {
                 .contains("diff --git a/a.rs b/a.rs\n@@ -1,3 +1,3 @@ fn main\n")
         );
         assert_eq!(fitted.text.lines().count(), diff.lines().count() - 6);
-    }
-
-    #[test]
-    fn compacts_headers_but_keeps_what_happened_to_the_file() {
-        let new_file = "diff --git a/n.rs b/n.rs\nnew file mode 100644\nindex 0000000..1111111\n\
-                        --- /dev/null\n+++ b/n.rs\n@@ -0,0 +1 @@\n+fn n() {}\n--- a removed line\n";
-        assert_eq!(
-            compact_header(new_file),
-            "diff --git a/n.rs b/n.rs\nnew file mode 100644\n@@ -0,0 +1 @@\n+fn n() {}\n\
-             --- a removed line\n"
-        );
     }
 
     #[test]

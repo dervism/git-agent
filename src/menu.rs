@@ -1,20 +1,18 @@
 //! The interactive settings menu, `git agent config`.
 //!
 //! Each change is saved to the config file as soon as it is made. API keys go
-//! to the macOS keychain instead (see `secrets.rs`).
+//! to the macOS keychain instead (see `api_keys.rs`).
 
-use crate::cli::SettingArgs;
 use crate::config::{
     self, Config, DEFAULT_EXCLUDE, DEFAULT_MAX_OUTPUT_TOKENS, DEFAULT_SYSTEM_PROMPT,
-    LOCAL_TEMPERATURE, MIN_CONTEXT_LENGTH, MIN_OUTPUT_TOKENS, OnSecrets,
+    LOCAL_TEMPERATURE, MIN_CONTEXT_LENGTH, MIN_OUTPUT_TOKENS, OnSecrets, Overrides,
 };
-use crate::models::FALLBACK_CONTEXT_LENGTH;
 use crate::providers::{self, PROVIDERS};
 use crate::safe_text::one_line;
 use crate::server::{ModelInfo, ModelServer, Server};
 use crate::temp::PrivateDir;
 use crate::ui::{self, thousands};
-use crate::{git, secrets};
+use crate::{api_keys, git};
 use anyhow::{Context, Result, bail};
 use inquire::validator::Validation;
 use inquire::{
@@ -87,24 +85,24 @@ enum Key {
 }
 
 struct Menu<'a> {
-    settings: &'a SettingArgs,
+    overrides: &'a Overrides,
     path: PathBuf,
     config: Config,
     key: Key,
 }
 
-pub async fn run(settings: &SettingArgs) -> Result<()> {
+pub async fn run(overrides: &Overrides) -> Result<()> {
     if !io::stdin().is_terminal() || !ui::stderr_is_terminal() {
         bail!(
             "the settings menu needs a terminal; edit the config file instead \
              (`git agent config init` creates one)"
         );
     }
-    let path = config::resolve_path(settings)
+    let path = config::resolve_path(overrides)
         .context("could not find a config directory; set HOME or pass --config")?;
     let config = Config::read_file(&path)?.unwrap_or_default();
     let mut menu = Menu {
-        settings,
+        overrides,
         path,
         config,
         key: Key::Missing,
@@ -116,7 +114,7 @@ pub async fn run(settings: &SettingArgs) -> Result<()> {
         ui::bold("git-agent settings"),
         ui::dim(&format!("· {}", menu.path.display()))
     ));
-    warn_about_overrides(settings);
+    warn_about_overrides(overrides);
     let mut cursor = 0;
     loop {
         let labels: Vec<String> = ITEMS.iter().map(|&item| menu.label(item)).collect();
@@ -272,8 +270,8 @@ impl Menu<'_> {
             }
             Item::Model => {
                 let config = &self.config;
-                let api_key = flag_key(self.settings)
-                    .or_else(|| secrets::get(&config.base_url).ok().flatten());
+                let api_key = flag_key(self.overrides)
+                    .or_else(|| api_keys::get(&config.base_url).ok().flatten());
                 let local = providers::is_local(&config.base_url);
                 match choose_model(config, api_key, local).await? {
                     Some(choice) => {
@@ -322,10 +320,10 @@ impl Menu<'_> {
     }
 
     fn check_key(&mut self) {
-        self.key = if flag_key(self.settings).is_some() {
+        self.key = if flag_key(self.overrides).is_some() {
             Key::Flag
         } else {
-            match secrets::get(&self.config.base_url) {
+            match api_keys::get(&self.config.base_url) {
                 Ok(Some(_)) => Key::Keychain,
                 Ok(None) => Key::Missing,
                 Err(err) => {
@@ -397,7 +395,7 @@ impl Menu<'_> {
         }
         let local = providers::is_local(&config.base_url);
         let mut api_key =
-            flag_key(self.settings).or_else(|| secrets::get(&config.base_url).ok().flatten());
+            flag_key(self.overrides).or_else(|| api_keys::get(&config.base_url).ok().flatten());
         if api_key.is_none() && provider.is_some_and(|provider| !provider.local) {
             api_key = ask_and_save_api_key(&config.base_url)?;
         }
@@ -423,7 +421,7 @@ impl Menu<'_> {
     }
 
     fn change_api_key(&mut self) -> Result<()> {
-        if !secrets::SUPPORTED {
+        if !api_keys::SUPPORTED {
             ui::info(
                 "   git-agent can save API keys only in the macOS keychain. \
                  Set the GIT_AGENT_API_KEY environment variable instead.",
@@ -437,7 +435,7 @@ impl Menu<'_> {
                 return Ok(());
             };
             if choice == 1 {
-                secrets::delete(&base_url)?;
+                api_keys::delete(&base_url)?;
                 ui::info(ui::dim("   Removed the key from the macOS keychain."));
                 self.check_key();
                 return Ok(());
@@ -452,21 +450,21 @@ impl Menu<'_> {
 }
 
 /// The key from `--api-key` or `GIT_AGENT_API_KEY`, which wins over the keychain.
-fn flag_key(settings: &SettingArgs) -> Option<String> {
-    settings
+fn flag_key(overrides: &Overrides) -> Option<String> {
+    overrides
         .api_key
         .clone()
         .filter(|key| !key.trim().is_empty())
 }
 
-fn warn_about_overrides(settings: &SettingArgs) {
+fn warn_about_overrides(overrides: &Overrides) {
     let overridden: Vec<&str> = [
-        (settings.base_url.is_some(), "base URL"),
-        (settings.model.is_some(), "model"),
-        (settings.context_length.is_some(), "context length"),
-        (settings.max_output_tokens.is_some(), "output limit"),
-        (settings.temperature.is_some(), "temperature"),
-        (settings.on_secrets.is_some(), "secrets setting"),
+        (overrides.base_url.is_some(), "base URL"),
+        (overrides.model.is_some(), "model"),
+        (overrides.context_length.is_some(), "context length"),
+        (overrides.max_output_tokens.is_some(), "output limit"),
+        (overrides.temperature.is_some(), "temperature"),
+        (overrides.on_secrets.is_some(), "secrets setting"),
     ]
     .into_iter()
     .filter_map(|(set, name)| set.then_some(name))
@@ -509,9 +507,9 @@ fn ask_url(message: &str, initial: &str) -> Result<Option<String>> {
 fn ask_and_save_api_key(base_url: &str) -> Result<Option<String>> {
     let name = match providers::find(base_url) {
         Some(provider) => provider.name.to_owned(),
-        None => secrets::account(base_url).unwrap_or_else(|| base_url.to_owned()),
+        None => api_keys::account(base_url).unwrap_or_else(|| base_url.to_owned()),
     };
-    if !secrets::SUPPORTED {
+    if !api_keys::SUPPORTED {
         ui::info(format!(
             "   {name} needs an API key. Set it in the GIT_AGENT_API_KEY environment variable."
         ));
@@ -529,7 +527,7 @@ fn ask_and_save_api_key(base_url: &str) -> Result<Option<String>> {
     if key.is_empty() {
         return Ok(None);
     }
-    secrets::set(base_url, key)?;
+    api_keys::set(base_url, key)?;
     ui::info(ui::dim("   Saved the key in the macOS keychain."));
     Ok(Some(key.to_owned()))
 }
@@ -664,7 +662,7 @@ fn ask_context_length(model: &str) -> Result<Option<usize>> {
     let message = format!("Context window of {model}, in tokens:");
     let help = format!(
         "see the provider's model page; esc to skip, and git-agent assumes {} tokens",
-        thousands(FALLBACK_CONTEXT_LENGTH)
+        thousands(config::FALLBACK_CONTEXT_LENGTH)
     );
     let prompt = CustomType::<usize>::new(&message)
         .with_help_message(&help)
@@ -693,7 +691,7 @@ fn automatic_or<T>(
 fn context_length_setting(current: Option<usize>) -> Result<Option<Option<usize>>> {
     let automatic = format!(
         "Automatic: ask the server, or assume {} tokens",
-        thousands(FALLBACK_CONTEXT_LENGTH)
+        thousands(config::FALLBACK_CONTEXT_LENGTH)
     );
     automatic_or("Context length:", &automatic, current, |current| {
         let mut prompt = CustomType::<usize>::new("Context window, in tokens:")

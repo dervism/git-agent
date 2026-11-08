@@ -1,5 +1,6 @@
 #![warn(clippy::print_stdout, clippy::print_stderr, clippy::dbg_macro)]
 
+mod api_keys;
 mod branch;
 mod cli;
 mod config;
@@ -7,13 +8,14 @@ mod explain;
 mod fit;
 mod git;
 mod github;
+#[cfg(test)]
+mod layers;
 mod menu;
 mod models;
 mod prompt;
 mod providers;
 mod redact;
 mod safe_text;
-mod secrets;
 mod server;
 mod split;
 mod staging;
@@ -25,10 +27,9 @@ mod why;
 
 use anyhow::{Context, Result, bail};
 use cli::{
-    BranchArgs, Command, ConfigCommand, ExplainArgs, GenerateArgs, PrArgs, SettingArgs, TidyArgs,
-    WhyArgs,
+    BranchArgs, Command, ConfigCommand, ExplainArgs, GenerateArgs, PrArgs, TidyArgs, WhyArgs,
 };
-use config::{Config, OnSecrets};
+use config::{Config, OnSecrets, Overrides};
 use fit::Kept;
 use git::{Changes, CommitPatch, Repo, Scope};
 use github::PullRequest;
@@ -145,22 +146,23 @@ const BRANCH_REVIEW: Review<()> = Review {
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> ExitCode {
     let cli = cli::parse();
+    let overrides = cli.settings.overrides();
     let result = match cli.command {
-        None => generate(&cli.generate, &cli.settings).await,
-        Some(Command::Split(args)) => split::flow::run(&args, &cli.settings).await,
-        Some(Command::Pr(args)) => pull_request(&args, &cli.settings).await,
-        Some(Command::Branch(args)) => new_branch(&args, &cli.settings).await,
-        Some(Command::Tidy(args)) => tidy_commits(&args, &cli.settings).await,
-        Some(Command::Why(args)) => explain_lines(&args, &cli.settings).await,
-        Some(Command::Explain(args)) => explain_commits(&args, &cli.settings).await,
-        Some(Command::Models) => list_models(&cli.settings).await,
-        Some(Command::Config { command: None }) => menu::run(&cli.settings).await,
+        None => generate(&cli.generate, &overrides).await,
+        Some(Command::Split(args)) => split::flow::run(&args, &overrides).await,
+        Some(Command::Pr(args)) => pull_request(&args, &overrides).await,
+        Some(Command::Branch(args)) => new_branch(&args, &overrides).await,
+        Some(Command::Tidy(args)) => tidy_commits(&args, &overrides).await,
+        Some(Command::Why(args)) => explain_lines(&args, &overrides).await,
+        Some(Command::Explain(args)) => explain_commits(&args, &overrides).await,
+        Some(Command::Models) => list_models(&overrides).await,
+        Some(Command::Config { command: None }) => menu::run(&overrides).await,
         Some(Command::Config {
             command: Some(ConfigCommand::Init { force }),
-        }) => init_config(&cli.settings, force),
+        }) => init_config(&overrides, force),
         Some(Command::Config {
             command: Some(ConfigCommand::Show),
-        }) => show_config(&cli.settings),
+        }) => show_config(&overrides),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
@@ -172,10 +174,10 @@ async fn main() -> ExitCode {
     }
 }
 
-async fn generate(args: &GenerateArgs, settings: &SettingArgs) -> Result<()> {
+async fn generate(args: &GenerateArgs, overrides: &Overrides) -> Result<()> {
     const NOT_PUSHED: &str = "the commit was made, but not pushed";
 
-    let config = Config::load(settings)?.config;
+    let config = Config::load(overrides)?.config;
     let repo = Repo::open(".")?;
     let ask = !args.commit && !args.raw && io::stdin().is_terminal();
     let Some(ToCommit {
@@ -319,8 +321,8 @@ fn changes_to_commit(
     }))
 }
 
-async fn pull_request(args: &PrArgs, settings: &SettingArgs) -> Result<()> {
-    let config = Config::load(settings)?.config;
+async fn pull_request(args: &PrArgs, overrides: &Overrides) -> Result<()> {
+    let config = Config::load(overrides)?.config;
     let repo = Repo::open(".")?;
     let branch = repo.current_branch()?;
     // Also finds out early whether gh is installed and logged in.
@@ -446,8 +448,8 @@ async fn pull_request(args: &PrArgs, settings: &SettingArgs) -> Result<()> {
     create_pull_request(&repo, &config, &pull_request, !args.create)
 }
 
-async fn new_branch(args: &BranchArgs, settings: &SettingArgs) -> Result<()> {
-    let config = Config::load(settings)?.config;
+async fn new_branch(args: &BranchArgs, overrides: &Overrides) -> Result<()> {
+    let config = Config::load(overrides)?.config;
     let repo = Repo::open(".")?;
     if let Some(from) = &args.from
         && repo.resolve(from)?.is_none()
@@ -583,8 +585,8 @@ fn branch_name(repo: &Repo, text: &str) -> Result<String> {
         .with_context(|| format!("{:?} can't be made into a branch name", text.trim()))
 }
 
-async fn tidy_commits(args: &TidyArgs, settings: &SettingArgs) -> Result<()> {
-    let config = Config::load(settings)?.config;
+async fn tidy_commits(args: &TidyArgs, overrides: &Overrides) -> Result<()> {
+    let config = Config::load(overrides)?.config;
     let repo = Repo::open(".")?;
     if let Some(operation) = repo.operation_in_progress()? {
         bail!("{operation} is in progress; finish or abort it before tidying commits");
@@ -908,8 +910,8 @@ impl Tidier<'_> {
     }
 }
 
-async fn explain_lines(args: &WhyArgs, settings: &SettingArgs) -> Result<()> {
-    let config = Config::load(settings)?.config;
+async fn explain_lines(args: &WhyArgs, overrides: &Overrides) -> Result<()> {
+    let config = Config::load(overrides)?.config;
     let repo = Repo::open(".")?;
     let target = why::Target::parse(&args.target, |path| Path::new(path).is_file())?;
     if !repo.in_head(&target.path) {
@@ -1094,8 +1096,8 @@ fn look_up(repo: &Repo, target: &why::Target) -> Result<Option<Known>> {
     }))
 }
 
-async fn explain_commits(args: &ExplainArgs, settings: &SettingArgs) -> Result<()> {
-    let config = Config::load(settings)?.config;
+async fn explain_commits(args: &ExplainArgs, overrides: &Overrides) -> Result<()> {
+    let config = Config::load(overrides)?.config;
     let repo = Repo::open(".")?;
     let subject = explain::subject(&repo, args)?;
     let log: Vec<&str> = subject.log.iter().map(String::as_str).collect();
@@ -1599,8 +1601,8 @@ fn push(repo: &Repo, ask: bool) -> Result<bool> {
     Ok(true)
 }
 
-async fn list_models(settings: &SettingArgs) -> Result<()> {
-    let config = Config::load(settings)?.config;
+async fn list_models(overrides: &Overrides) -> Result<()> {
+    let config = Config::load(overrides)?.config;
     let models = Server::connect(&config)?.models().await?;
     let chosen = match &config.model {
         Some(model) => Some(model.clone()),
@@ -1650,8 +1652,8 @@ async fn list_models(settings: &SettingArgs) -> Result<()> {
     Ok(())
 }
 
-fn init_config(settings: &SettingArgs, force: bool) -> Result<()> {
-    let path = config::resolve_path(settings)
+fn init_config(overrides: &Overrides, force: bool) -> Result<()> {
+    let path = config::resolve_path(overrides)
         .context("could not find a config directory; set HOME or pass --config")?;
     if path.exists() && !force {
         bail!(
@@ -1660,14 +1662,14 @@ fn init_config(settings: &SettingArgs, force: bool) -> Result<()> {
         );
     }
     let mut config = Config::default();
-    config.apply(settings);
+    config.apply(overrides);
     config.save(&path)?;
     ui::info(format!("Wrote {}", path.display()));
     Ok(())
 }
 
-fn show_config(settings: &SettingArgs) -> Result<()> {
-    let loaded = Config::load(settings)?;
+fn show_config(overrides: &Overrides) -> Result<()> {
+    let loaded = Config::load(overrides)?;
     let source = match (&loaded.path, loaded.file_found) {
         (Some(path), true) => format!("# Loaded from {}", path.display()),
         (Some(path), false) => format!("# No file at {}; using defaults", path.display()),
@@ -1682,10 +1684,10 @@ fn show_config(settings: &SettingArgs) -> Result<()> {
     if loaded.config.context_length.is_none() {
         ui::raw_out(&format!(
             "# `context_length` is not set: git-agent asks the server, or assumes {} tokens.",
-            models::FALLBACK_CONTEXT_LENGTH
+            config::FALLBACK_CONTEXT_LENGTH
         ));
     }
-    let flag_key = settings
+    let flag_key = overrides
         .api_key
         .as_deref()
         .is_some_and(|key| !key.trim().is_empty());

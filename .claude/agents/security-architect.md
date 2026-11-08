@@ -47,7 +47,7 @@ Start from these places. They are pointers, not findings: verify each one in the
   (`src/untracked.rs`).
 - Processes git-agent starts: `git`, `gh`, and the user's editor (`edit_file` in
   `src/git.rs`). Hooks are turned off for the tidy rewrite (`NO_HOOKS` in `src/git.rs`).
-- API keys, kept in the macOS Keychain (`src/secrets.rs`) and never in a file.
+- API keys, kept in the macOS Keychain (`src/api_keys.rs`) and never in a file.
 - Temporary files, from `std::env::temp_dir()` in `src/menu.rs` and `src/git.rs`.
 - Settings that change where data goes: server addresses and providers (`src/config.rs`,
   `src/providers.rs`).

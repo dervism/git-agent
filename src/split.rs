@@ -15,7 +15,7 @@ pub mod kinds;
 pub mod signals;
 
 use crate::fit;
-use crate::git::{lossless, names};
+use crate::git::{diff, lossless, names};
 use crate::safe_text::{escaped, without_hidden};
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
@@ -81,7 +81,7 @@ pub struct Unit {
 /// Reads a patch from [`Repo::patch`](crate::git::Repo::patch). Files not in
 /// `included` are shown to the model by name only.
 pub fn parse(patch: &str, included: &HashSet<String>) -> Vec<FilePatch> {
-    fit::split_files(patch)
+    diff::split_files(patch)
         .into_iter()
         .map(|text| {
             let path = names::of_diff(text);

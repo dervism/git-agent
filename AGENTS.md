@@ -99,7 +99,7 @@ The modules the commands share:
 | `models.rs` | Choosing the model, and the context size to fit the prompt into. |
 | `fit.rs` | Shortens a diff to a size limit. |
 | `redact.rs` | Finds secrets in text before it goes to a model, and replaces them with `[REDACTED]`. |
-| `secrets.rs` | API keys in the macOS Keychain, so they are never written to a file. |
+| `api_keys.rs` | API keys in the macOS Keychain, so they are never written to a file. |
 | `config.rs` | The settings, and the order of the places they come from. |
 | `ui.rs` | Terminal output and the review prompt. Everything it prints goes through one gate that escapes control characters. |
 | `safe_text.rs` | Escapes or removes the characters that could change the terminal or hide text. |
@@ -130,7 +130,7 @@ in a test directory from walking up into this repository.
 
 The tests are unit tests, in a `mod tests` at the end of the module they test. Tests that
 need git create throwaway repositories and run the real `git`. None of them need a model
-server. `secrets::tests::keychain_round_trip` is ignored, because it needs the macOS
+server. `api_keys::tests::keychain_round_trip` is ignored, because it needs the macOS
 Keychain.
 
 These checks must pass before a piece of work is done. The release script runs the same

@@ -97,7 +97,8 @@ mark them as resolved. A merge whose conflicts you've resolved commits as usual.
 
 If a submodule's `ignore` setting hides its change from `git diff`, neither you nor the
 model would see it, so git-agent leaves it out of the commit and says so. `--all` doesn't
-stage it either. If you stage it yourself, it's committed, with a note.
+stage it either. If you stage it yourself, it's committed, with a note, and `--all` keeps it
+at the commit you staged even if the submodule has moved on since.
 
 ### Untracked files
 
@@ -718,6 +719,10 @@ API keys come from `--api-key`, then `GIT_AGENT_API_KEY`, then the macOS keychai
 | `exclude` | | | common lockfiles |
 | `system_prompt` | | | Conventional Commits instructions |
 | (file location) | `--config` | `GIT_AGENT_CONFIG` | see above |
+
+These flags work before or after a subcommand, so `git agent -m qwen3 split` is the same as
+`git agent split -m qwen3`. The other options belong to one command: a subcommand's go after its
+name, and those of plain `git agent` only work without a subcommand.
 
 ### Temperature
 

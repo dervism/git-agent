@@ -97,9 +97,12 @@ fn changes_to_split(repo: &Repo, args: &SplitArgs, config: &Config) -> Result<Op
     }
     staging::refuse_unresolved_conflicts(repo, "splitting changes")?;
     let ask = !args.commit && io::stdin().is_terminal();
-    if args.all && !staging::stage_all(repo, ask)? {
-        ui::info("Nothing staged or committed.");
-        return Ok(None);
+    if args.all {
+        let Some(kept) = staging::stage_all(repo, ask)? else {
+            ui::info("Nothing staged or committed.");
+            return Ok(None);
+        };
+        staging::report_kept(&kept, true);
     }
     staging::report_hidden_pointers(&staging::hidden_pointers(repo, false)?, true);
     let Some((scope, changes)) = repo.changes(&config.exclude)? else {
@@ -1289,6 +1292,28 @@ mod tests {
             format!("{error:#}").contains("unresolved conflicts"),
             "{error:#}"
         );
+    }
+
+    #[test]
+    fn all_leaves_a_hidden_pointer_staged_at_the_commit_the_user_staged() {
+        let (dir, repo, _library, moved) = with_submodule();
+        run(dir.path(), &["config", "diff.ignoreSubmodules", "all"]);
+        let in_head = run(dir.path(), &["rev-parse", "HEAD:library"]);
+        crate::git::test_support::move_pointer(dir.path(), &moved);
+        run(dir.path(), &["add", "library"]);
+        run(
+            &dir.path().join("library"),
+            &["checkout", "-q", in_head.trim()],
+        );
+        write(dir.path(), "notes.txt", "new\n");
+        let with_all = SplitArgs {
+            all: true,
+            ..args(true, None)
+        };
+
+        let work = changes_to_split(&repo, &with_all, &Config::default()).unwrap();
+        assert!(work.is_some());
+        assert_eq!(run(dir.path(), &["rev-parse", ":library"]).trim(), moved);
     }
 
     #[tokio::test]

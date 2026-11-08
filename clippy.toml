@@ -1,6 +1,11 @@
 # Everything git-agent writes to the terminal goes through `ui`, which escapes what could
-# change the terminal or hide text. Only `ui` may take these handles.
+# change the terminal or hide text. Only `ui` may take these handles. And the command line is
+# read only through `cli`, which refuses the default command's options next to a subcommand.
 disallowed-methods = [
     { path = "std::io::stdout", reason = "write through `ui`, which makes text safe for the terminal" },
     { path = "std::io::stderr", reason = "write through `ui`, which makes text safe for the terminal" },
+    { path = "clap::Parser::parse", reason = "use `cli::parse`, which refuses options that came with the wrong command" },
+    { path = "clap::Parser::try_parse", reason = "use `cli::try_parse_from`, which refuses options that came with the wrong command" },
+    { path = "clap::Parser::parse_from", reason = "use `cli::try_parse_from`, which refuses options that came with the wrong command" },
+    { path = "clap::Parser::try_parse_from", reason = "use `cli::try_parse_from`, which refuses options that came with the wrong command" },
 ]

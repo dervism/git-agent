@@ -262,7 +262,8 @@ pub fn check(top: &Path, untracked: &[String]) -> Vec<Finding> {
 /// path out when staging.
 type Classified = (String, String, String, String, String);
 
-/// A pathspec that leaves out exactly `path`, a file or a directory.
+/// A pathspec that leaves out `path`, from the top of the work tree, with no character in it
+/// read as a wildcard. For a folder, it leaves out everything in it too.
 pub fn literal(path: &str) -> String {
     format!(":(top,exclude,literal){path}")
 }

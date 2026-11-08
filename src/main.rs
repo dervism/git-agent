@@ -24,10 +24,9 @@ mod untracked;
 mod why;
 
 use anyhow::{Context, Result, bail};
-use clap::Parser;
 use cli::{
-    BranchArgs, Cli, Command, ConfigCommand, ExplainArgs, GenerateArgs, PrArgs, SettingArgs,
-    TidyArgs, WhyArgs,
+    BranchArgs, Command, ConfigCommand, ExplainArgs, GenerateArgs, PrArgs, SettingArgs, TidyArgs,
+    WhyArgs,
 };
 use config::{Config, OnSecrets};
 use fit::Kept;
@@ -145,7 +144,7 @@ const BRANCH_REVIEW: Review<()> = Review {
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> ExitCode {
-    let cli = Cli::parse();
+    let cli = cli::parse();
     let result = match cli.command {
         None => generate(&cli.generate, &cli.settings).await,
         Some(Command::Split(args)) => split::flow::run(&args, &cli.settings).await,
@@ -296,9 +295,12 @@ fn changes_to_commit(
     ask: bool,
 ) -> Result<Option<ToCommit>> {
     staging::refuse_unresolved_conflicts(repo, "committing")?;
-    if args.all && !staging::stage_all(repo, ask)? {
-        ui::info("Nothing staged or committed.");
-        return Ok(None);
+    if args.all {
+        let Some(kept) = staging::stage_all(repo, ask)? else {
+            ui::info("Nothing staged or committed.");
+            return Ok(None);
+        };
+        staging::report_kept(&kept, false);
     }
     let found = repo.changes(&config.exclude)?;
     let commits_all = matches!(found, Some((Scope::Tracked, _)));
@@ -1744,7 +1746,7 @@ mod tests {
 
     fn generate_args(arguments: &[&str]) -> GenerateArgs {
         let command = std::iter::once("git-agent").chain(arguments.iter().copied());
-        Cli::parse_from(command).generate
+        cli::try_parse_from(command).unwrap().generate
     }
 
     /// A repository where `git stash pop` left `f.txt` and `Kjøre plan.txt` in conflict.
@@ -1821,6 +1823,26 @@ mod tests {
         let found =
             changes_to_commit(&repo, &generate_args(&[]), &Config::default(), false).unwrap();
         assert!(found.is_none());
+    }
+
+    #[test]
+    fn all_commits_a_hidden_pointer_at_the_commit_the_user_staged() {
+        let (dir, repo, _library, moved) = crate::git::test_support::with_submodule();
+        run(dir.path(), &["config", "submodule.library.ignore", "all"]);
+        let in_head = run(dir.path(), &["rev-parse", "HEAD:library"]);
+        crate::git::test_support::move_pointer(dir.path(), &moved);
+        run(dir.path(), &["add", "library"]);
+        run(
+            &dir.path().join("library"),
+            &["checkout", "-q", in_head.trim()],
+        );
+        fs::write(dir.path().join("lib.rs"), "fn b() {}\n").unwrap();
+
+        let found = changes_to_commit(&repo, &generate_args(&["--all"]), &Config::default(), false)
+            .unwrap()
+            .expect("the change to lib.rs");
+        assert_eq!(found.scope, Scope::Staged);
+        assert_eq!(run(dir.path(), &["rev-parse", ":library"]).trim(), moved);
     }
 
     #[test]

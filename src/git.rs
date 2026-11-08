@@ -64,6 +64,22 @@ pub struct Pull {
     pub when: String,
 }
 
+/// A path the index holds differently from `HEAD`, as `git diff --cached --raw` shows it: the
+/// mode and object a commit would hold, or mode `000000` and a zero object for a removal.
+#[derive(Debug, Clone, PartialEq)]
+pub struct IndexEntry {
+    pub mode: String,
+    pub object: String,
+    pub path: String,
+}
+
+impl IndexEntry {
+    /// Whether the index holds no entry at the path: it's staged for removal.
+    pub fn is_removal(&self) -> bool {
+        self.mode.bytes().all(|digit| digit == b'0')
+    }
+}
+
 /// A commit's message and patch, as pushing it would publish them.
 #[derive(Debug)]
 pub struct CommitPatch {
@@ -390,12 +406,8 @@ impl Repo {
         }
     }
 
-    pub fn stage_all(&self) -> Result<()> {
-        self.git(&["add", "--all"]).map(drop)
-    }
-
-    /// Stages all changes like [`Repo::stage_all`], except what the `exclude`
-    /// pathspecs name.
+    /// Stages all changes, as `git add --all` does, except what the `exclude` pathspecs
+    /// name.
     pub fn stage_all_except(&self, exclude: &[String]) -> Result<()> {
         let pathspecs: Vec<Vec<u8>> = std::iter::once(":/")
             .chain(exclude.iter().map(String::as_str))
@@ -573,25 +585,71 @@ impl Repo {
     /// Staged submodule pointers that `git diff --cached` doesn't show, because of an
     /// `ignore` setting. A plain `git commit` commits them all the same.
     pub fn hidden_staged_pointers(&self) -> Result<Vec<String>> {
-        let all = self.diff_names(&[
+        Ok(self
+            .hidden_staged_entries()?
+            .into_iter()
+            .map(|entry| entry.path)
+            .collect())
+    }
+
+    /// The index entries of the [hidden staged pointers](Repo::hidden_staged_pointers),
+    /// so that they can be put back as they are.
+    pub fn hidden_staged_entries(&self) -> Result<Vec<IndexEntry>> {
+        let all = raw_entries(&self.diff_names(&[
             "diff",
             "--cached",
-            "--name-only",
+            "--raw",
+            "--no-abbrev",
             "-z",
+            "--no-renames",
             "--ignore-submodules=none",
-        ])?;
-        let shown = self.diff_names(&["diff", "--cached", "--name-only", "-z"])?;
+        ])?)?;
+        let shown = self.diff_names(&["diff", "--cached", "--name-only", "-z", "--no-renames"])?;
         Ok(all
             .into_iter()
-            .filter(|path| !shown.contains(path))
+            .filter(|entry| !shown.contains(&entry.path))
             .collect())
+    }
+
+    /// Puts `entries` into the index as they are: a pointer at its object, and a removal
+    /// as no entry at all.
+    pub fn restore_index_entries(&self, entries: &[IndexEntry]) -> Result<()> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+        let records: Vec<u8> = entries
+            .iter()
+            .flat_map(|entry| {
+                let record = format!("{} {}\t{}", entry.mode, entry.object, entry.path);
+                lossless::to_bytes(&record).into_iter().chain([0])
+            })
+            .collect();
+        self.git_with_input(&["update-index", "-z", "--index-info"], &records)
+    }
+
+    /// Paths whose work tree differs from the index, with a submodule whose checkout moved,
+    /// whatever its `ignore` setting says, but not one that's only dirty.
+    pub fn changed_in_work_tree(&self) -> Result<Vec<String>> {
+        self.diff_names(&["diff", "--name-only", "-z", "--ignore-submodules=dirty"])
+    }
+
+    /// Paths whose work tree holds the same kind of thing as the index, but changed: a
+    /// submodule whose checkout moved counts, one that's gone or only dirty doesn't.
+    pub fn modified_in_work_tree(&self) -> Result<Vec<String>> {
+        self.diff_names(&[
+            "diff",
+            "--name-only",
+            "-z",
+            "--ignore-submodules=dirty",
+            "--diff-filter=M",
+        ])
     }
 
     /// Moved submodule pointers in the work tree that `git commit --all` commits though
     /// `git diff` doesn't show them. That's so for `submodule.<name>.ignore=all`, and not
     /// for `diff.ignoreSubmodules=all`, under which `git commit --all` leaves them out.
     pub fn hidden_changed_pointers(&self) -> Result<Vec<String>> {
-        let moved = self.diff_names(&["diff", "--name-only", "-z", "--ignore-submodules=dirty"])?;
+        let moved = self.changed_in_work_tree()?;
         let shown = self.diff_names(&[
             "-c",
             "diff.ignoreSubmodules=none",
@@ -1335,6 +1393,30 @@ fn nul_joined(paths: &[String]) -> Vec<u8> {
         .collect()
 }
 
+/// Reads `git diff --raw -z --no-renames`, split at its NULs, into entries: each is a header
+/// such as `:160000 160000 <old> <new> M`, then the path.
+fn raw_entries(fields: &[String]) -> Result<Vec<IndexEntry>> {
+    fields
+        .chunks(2)
+        .map(|pair| match pair {
+            [header, path] => raw_entry(header, path),
+            _ => bail!("`git diff --raw` ended in the middle of an entry"),
+        })
+        .collect()
+}
+
+fn raw_entry(header: &str, path: &str) -> Result<IndexEntry> {
+    let parts: Vec<&str> = header.strip_prefix(':').unwrap_or("").split(' ').collect();
+    match parts[..] {
+        [_, mode, _, object, _] => Ok(IndexEntry {
+            mode: mode.to_owned(),
+            object: object.to_owned(),
+            path: path.to_owned(),
+        }),
+        _ => bail!("`git diff --raw` gave a line git-agent can't read: {header:?}"),
+    }
+}
+
 /// `paths` as pathspecs that name exactly those paths from the top of the work tree,
 /// wherever git runs, for git's standard input.
 fn top_literal_pathspecs(paths: &[String]) -> Vec<u8> {
@@ -1475,6 +1557,48 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
+    fn fields(raw: &[&str]) -> Vec<String> {
+        raw.iter().map(ToString::to_string).collect()
+    }
+
+    #[test]
+    fn reads_each_kind_of_raw_entry() {
+        let zero = "0".repeat(40);
+        let (old, new) = ("a".repeat(40), "b".repeat(40));
+        let raw = fields(&[
+            &format!(":160000 160000 {old} {new} M"),
+            "library",
+            &format!(":000000 160000 {zero} {new} A"),
+            "a\nb",
+            &format!(":160000 000000 {old} {zero} D"),
+            "gone lib",
+        ]);
+        let entry = |mode: &str, object: &str, path: &str| IndexEntry {
+            mode: mode.to_owned(),
+            object: object.to_owned(),
+            path: path.to_owned(),
+        };
+        assert_eq!(
+            raw_entries(&raw).unwrap(),
+            [
+                entry("160000", &new, "library"),
+                entry("160000", &new, "a\nb"),
+                entry("000000", &zero, "gone lib"),
+            ]
+        );
+        assert!(raw_entries(&[]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn refuses_raw_output_it_cant_read() {
+        let half = fields(&[":160000 160000 a b M"]);
+        assert!(raw_entries(&half).is_err());
+        let short = fields(&[":160000 a M", "library"]);
+        assert!(raw_entries(&short).is_err());
+        let no_colon = fields(&["160000 160000 a b M", "library"]);
+        assert!(raw_entries(&no_colon).is_err());
+    }
+
     /// Runs git in `dir`, panicking on failure, and returns its stdout.
     fn run(dir: &Path, args: &[&str]) -> String {
         let output = Command::new("git")
@@ -1596,7 +1720,7 @@ mod tests {
         fs::create_dir(dir.path().join("sub")).unwrap();
         fs::write(dir.path().join("sub/Cargo.lock"), "lock\n").unwrap();
         fs::write(dir.path().join("main.rs"), "fn main() {}\n").unwrap();
-        repo.stage_all().unwrap();
+        repo.stage_all_except(&[]).unwrap();
 
         let (_, changes) = repo.changes(&["Cargo.lock".into()]).unwrap().unwrap();
         assert!(changes.stat.contains("sub/Cargo.lock"));
@@ -1695,7 +1819,7 @@ mod tests {
         )
         .unwrap();
         fs::write(dir.path().join("new.rs"), "fn c() {}\n").unwrap();
-        repo.stage_all().unwrap();
+        repo.stage_all_except(&[]).unwrap();
         repo.commit("test: cover c", Scope::Staged, &[], &[])
             .unwrap();
         // The base moves on without the branch; its commit is not the branch's.
@@ -1883,7 +2007,7 @@ mod tests {
         repo.commit("feat: add b", Scope::Tracked, &[], &[])
             .unwrap();
         write("notes.md", "notes\n");
-        repo.stage_all().unwrap();
+        repo.stage_all_except(&[]).unwrap();
         repo.commit("wip", Scope::Staged, &[], &[]).unwrap();
         write("lib.rs", "fn a() {}\nfn b() { }\n");
         repo.commit("fix typo", Scope::Tracked, &[], &[]).unwrap();
@@ -1975,7 +2099,7 @@ mod tests {
 
         // Once ignored, they stay out of a plain `git add --all` too.
         crate::untracked::add_to_gitignore(&repo.toplevel().unwrap(), &findings).unwrap();
-        repo.stage_all().unwrap();
+        repo.stage_all_except(&[]).unwrap();
         assert!(repo.untracked_files().unwrap().is_empty());
         let staged = run(dir.path(), &["diff", "--cached", "--name-only"]);
         assert!(staged.contains(".gitignore") && !staged.contains("target"));

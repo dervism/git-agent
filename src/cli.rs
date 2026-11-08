@@ -1,8 +1,16 @@
 //! Command-line interface.
 
 use crate::config::OnSecrets;
-use clap::{Args, Parser, Subcommand};
+use clap::error::ErrorKind;
+use clap::parser::ValueSource;
+use clap::{Arg, ArgMatches, Args, CommandFactory, FromArgMatches, Parser, Subcommand};
+use std::ffi::OsString;
 use std::path::PathBuf;
+
+/// The two ways to call git-agent. Settings may come before a subcommand, but
+/// the default command's own options may not, so a single `[OPTIONS] <COMMAND>`
+/// line would promise too much.
+const USAGE: &str = "git-agent [OPTIONS] [-- <GIT_COMMIT_ARGS>...]\n       git-agent <COMMAND>";
 
 /// Write git commit messages from your changes with a local LLM.
 ///
@@ -10,7 +18,7 @@ use std::path::PathBuf;
 /// changes to tracked files), shows the proposed message, and lets you commit
 /// it, edit it, regenerate it, or ask the model to revise it.
 #[derive(Parser, Debug)]
-#[command(name = "git-agent", version, args_conflicts_with_subcommands = true)]
+#[command(name = "git-agent", version, override_usage = USAGE)]
 pub struct Cli {
     #[command(subcommand)]
     pub command: Option<Command>,
@@ -277,10 +285,144 @@ pub enum ConfigCommand {
     Show,
 }
 
+/// Parses the command line, and exits the way clap does when it's wrong.
+pub fn parse() -> Cli {
+    try_parse_from(std::env::args_os()).unwrap_or_else(|error| error.exit())
+}
+
+/// Parses `args`, and refuses the default command's options when they come with a subcommand.
+pub fn try_parse_from<I, T>(args: I) -> Result<Cli, clap::Error>
+where
+    I: IntoIterator<Item = T>,
+    T: Into<OsString> + Clone,
+{
+    let mut matches = Cli::command().try_get_matches_from(args)?;
+    refuse_misplaced_options(&matches)?;
+    Cli::from_arg_matches_mut(&mut matches).map_err(|error| error.format(&mut Cli::command()))
+}
+
+/// `git agent --all split` would run `split` without `--all`, so the default
+/// command's own options can't come with a subcommand. Settings are global and can.
+fn refuse_misplaced_options(matches: &ArgMatches) -> Result<(), clap::Error> {
+    let Some((name, _)) = matches.subcommand() else {
+        return Ok(());
+    };
+    let mut command = Cli::command();
+    match misplaced(&command, name, matches) {
+        Some(message) => Err(command.error(ErrorKind::ArgumentConflict, message)),
+        None => Ok(()),
+    }
+}
+
+/// What's wrong with the default command's options that came with the subcommand `name`,
+/// if any did.
+fn misplaced(command: &clap::Command, name: &str, matches: &ArgMatches) -> Option<String> {
+    let subcommand = command.find_subcommand(name)?;
+    let (its_own, not_its): (Vec<&Arg>, Vec<&Arg>) = command
+        .get_arguments()
+        .filter(|arg| !arg.is_global_set() && given(matches, arg))
+        .partition(|arg| takes(subcommand, arg));
+    let parts: Vec<String> = [
+        goes_after(name, &its_own),
+        stays_alone(name, &not_its),
+        same_short(name, subcommand, &not_its),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    (!parts.is_empty()).then(|| parts.join("; "))
+}
+
+fn given(matches: &ArgMatches, arg: &Arg) -> bool {
+    matches.value_source(arg.get_id().as_str()) == Some(ValueSource::CommandLine)
+}
+
+fn takes(subcommand: &clap::Command, arg: &Arg) -> bool {
+    subcommand
+        .get_arguments()
+        .any(|own| own.get_id() == arg.get_id())
+}
+
+fn long_name(arg: &Arg) -> String {
+    arg.get_long()
+        .map_or_else(|| arg.get_id().to_string(), |long| format!("--{long}"))
+}
+
+/// The option as it's typed, with a placeholder for a value it takes, such as
+/// `--hint <TEXT>`.
+fn as_typed(arg: &Arg) -> String {
+    let name = long_name(arg);
+    if !arg.get_action().takes_values() {
+        return name;
+    }
+    let value = arg.get_value_names().and_then(<[_]>::first).map_or_else(
+        || arg.get_id().to_string().to_uppercase(),
+        ToString::to_string,
+    );
+    format!("{name} <{value}>")
+}
+
+/// Options the subcommand has too: they go after it.
+fn goes_after(name: &str, args: &[&Arg]) -> Option<String> {
+    let verb = match args {
+        [] => return None,
+        [_] => "goes",
+        _ => "go",
+    };
+    let names: Vec<String> = args.iter().map(|arg| long_name(arg)).collect();
+    let typed: Vec<String> = args.iter().map(|arg| as_typed(arg)).collect();
+    Some(format!(
+        "{} {verb} after the subcommand: 'git agent {name} {}'",
+        quoted_list(&names),
+        typed.join(" ")
+    ))
+}
+
+/// Options only the default command has.
+fn stays_alone(name: &str, args: &[&Arg]) -> Option<String> {
+    let (verb, pronoun) = match args {
+        [] => return None,
+        [_] => ("is", "it"),
+        _ => ("are", "they"),
+    };
+    let names: Vec<String> = args.iter().map(|arg| long_name(arg)).collect();
+    Some(format!(
+        "{} {verb} for 'git agent' alone, so {pronoun} can't come with '{name}'",
+        quoted_list(&names)
+    ))
+}
+
+/// The short flags among `args` that the subcommand gives an option of its own, as
+/// `branch` gives `-c` to `--create`, which the user may have meant.
+fn same_short(name: &str, subcommand: &clap::Command, args: &[&Arg]) -> Option<String> {
+    let clashes: Vec<String> = args
+        .iter()
+        .filter_map(|arg| {
+            let short = arg.get_short()?;
+            let theirs = subcommand
+                .get_arguments()
+                .find(|own| own.get_short() == Some(short))?;
+            Some(format!(
+                "'-{short}' after '{name}' is '{}'",
+                long_name(theirs)
+            ))
+        })
+        .collect();
+    (!clashes.is_empty()).then(|| clashes.join("; "))
+}
+
+/// `'a'`, `'a' and 'b'`, or `'a', 'b' and 'c'`.
+fn quoted_list(items: &[String]) -> String {
+    let quoted: Vec<String> = items.iter().map(|item| format!("'{item}'")).collect();
+    match quoted.split_last() {
+        Some((last, rest)) if !rest.is_empty() => format!("{} and {last}", rest.join(", ")),
+        _ => quoted.concat(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use clap::CommandFactory;
 
     #[test]
     fn cli_definition_is_valid() {
@@ -289,33 +431,33 @@ mod tests {
 
     #[test]
     fn passes_trailing_args_to_git_commit() {
-        let cli = Cli::try_parse_from(["git-agent", "-c", "--", "--no-verify", "-s"]).unwrap();
+        let cli = try_parse_from(["git-agent", "-c", "--", "--no-verify", "-s"]).unwrap();
         assert!(cli.generate.commit);
         assert_eq!(cli.generate.git_args, ["--no-verify", "-s"]);
     }
 
     #[test]
     fn push_combines_with_commit_but_not_raw() {
-        let cli = Cli::try_parse_from(["git-agent", "-cp"]).unwrap();
+        let cli = try_parse_from(["git-agent", "-cp"]).unwrap();
         assert!(cli.generate.commit && cli.generate.push);
-        assert!(Cli::try_parse_from(["git-agent", "--push", "--raw"]).is_err());
+        assert!(try_parse_from(["git-agent", "--push", "--raw"]).is_err());
     }
 
     #[test]
     fn setting_flags_work_with_subcommands() {
-        let cli = Cli::try_parse_from(["git-agent", "models", "--model", "qwen3"]).unwrap();
+        let cli = try_parse_from(["git-agent", "models", "--model", "qwen3"]).unwrap();
         assert!(matches!(cli.command, Some(Command::Models)));
         assert_eq!(cli.settings.model.as_deref(), Some("qwen3"));
-        let cli = Cli::try_parse_from(["git-agent", "--context-length", "8192"]).unwrap();
+        let cli = try_parse_from(["git-agent", "--context-length", "8192"]).unwrap();
         assert_eq!(cli.settings.context_length, Some(8192));
-        let cli = Cli::try_parse_from(["git-agent", "pr", "--on-secrets", "warn"]).unwrap();
+        let cli = try_parse_from(["git-agent", "pr", "--on-secrets", "warn"]).unwrap();
         assert_eq!(cli.settings.on_secrets, Some(OnSecrets::Warn));
-        assert!(Cli::try_parse_from(["git-agent", "--on-secrets", "ignore"]).is_err());
+        assert!(try_parse_from(["git-agent", "--on-secrets", "ignore"]).is_err());
     }
 
     #[test]
     fn pr_takes_its_own_options_and_settings() {
-        let cli = Cli::try_parse_from([
+        let cli = try_parse_from([
             "git-agent",
             "pr",
             "--base",
@@ -338,15 +480,14 @@ mod tests {
         assert_eq!(args.hint.as_deref(), Some("fixes #3"));
         assert_eq!(args.gh_args, ["--label", "bug"]);
         assert_eq!(cli.settings.model.as_deref(), Some("qwen3"));
-        assert!(Cli::try_parse_from(["git-agent", "pr", "--raw", "--create"]).is_err());
+        assert!(try_parse_from(["git-agent", "pr", "--raw", "--create"]).is_err());
         // The commit options belong to plain `git agent`.
-        assert!(Cli::try_parse_from(["git-agent", "--all", "pr"]).is_err());
+        assert!(try_parse_from(["git-agent", "--all", "pr"]).is_err());
     }
 
     #[test]
     fn split_takes_its_own_options() {
-        let cli =
-            Cli::try_parse_from(["git-agent", "split", "-a", "-c", "--", "--signoff"]).unwrap();
+        let cli = try_parse_from(["git-agent", "split", "-a", "-c", "--", "--signoff"]).unwrap();
         let Some(Command::Split(args)) = cli.command else {
             panic!("expected the split command");
         };
@@ -356,7 +497,7 @@ mod tests {
 
     #[test]
     fn branch_takes_a_description_without_quotes() {
-        let cli = Cli::try_parse_from([
+        let cli = try_parse_from([
             "git-agent",
             "branch",
             "fix",
@@ -371,17 +512,16 @@ mod tests {
         };
         assert_eq!(args.description, ["fix", "login", "timeout"]);
         assert_eq!(args.from.as_deref(), Some("origin/main"));
-        let cli = Cli::try_parse_from(["git-agent", "branch", "-c"]).unwrap();
+        let cli = try_parse_from(["git-agent", "branch", "-c"]).unwrap();
         assert!(
             matches!(cli.command, Some(Command::Branch(args)) if args.create && args.description.is_empty())
         );
-        assert!(Cli::try_parse_from(["git-agent", "branch", "-c", "-r", "42"]).is_err());
+        assert!(try_parse_from(["git-agent", "branch", "-c", "-r", "42"]).is_err());
     }
 
     #[test]
     fn tidy_takes_a_base_and_applies_without_review() {
-        let cli =
-            Cli::try_parse_from(["git-agent", "tidy", "--base", "HEAD~3", "--apply"]).unwrap();
+        let cli = try_parse_from(["git-agent", "tidy", "--base", "HEAD~3", "--apply"]).unwrap();
         let Some(Command::Tidy(args)) = cli.command else {
             panic!("expected the tidy command");
         };
@@ -391,19 +531,19 @@ mod tests {
 
     #[test]
     fn why_takes_lines_and_a_question() {
-        let cli = Cli::try_parse_from(["git-agent", "why", "src/fit.rs:120", "why 400?"]).unwrap();
+        let cli = try_parse_from(["git-agent", "why", "src/fit.rs:120", "why 400?"]).unwrap();
         let Some(Command::Why(args)) = cli.command else {
             panic!("expected the why command");
         };
         assert_eq!(args.target, "src/fit.rs:120");
         assert_eq!(args.question.as_deref(), Some("why 400?"));
-        assert!(Cli::try_parse_from(["git-agent", "why"]).is_err());
+        assert!(try_parse_from(["git-agent", "why"]).is_err());
     }
 
     #[test]
     fn explain_takes_a_commit_a_branch_or_the_last_pull() {
         let parse = |args: &[&str]| {
-            let cli = Cli::try_parse_from([&["git-agent", "explain"], args].concat())?;
+            let cli = try_parse_from([&["git-agent", "explain"], args].concat())?;
             match cli.command {
                 Some(Command::Explain(args)) => Ok::<_, clap::Error>(args),
                 _ => panic!("expected the explain command"),
@@ -425,17 +565,227 @@ mod tests {
 
     #[test]
     fn config_opens_the_menu_without_a_subcommand() {
-        let cli = Cli::try_parse_from(["git-agent", "config"]).unwrap();
+        let cli = try_parse_from(["git-agent", "config"]).unwrap();
         assert!(matches!(
             cli.command,
             Some(Command::Config { command: None })
         ));
-        let cli = Cli::try_parse_from(["git-agent", "config", "show"]).unwrap();
+        let cli = try_parse_from(["git-agent", "config", "show"]).unwrap();
         assert!(matches!(
             cli.command,
             Some(Command::Config {
                 command: Some(ConfigCommand::Show)
             })
         ));
+    }
+
+    /// Each subcommand with the arguments it needs.
+    const SUBCOMMANDS: [&[&str]; 8] = [
+        &["split"],
+        &["pr"],
+        &["branch"],
+        &["tidy"],
+        &["why", "f:1"],
+        &["explain"],
+        &["models"],
+        &["config"],
+    ];
+
+    /// Each setting with a value it takes.
+    const SETTINGS: [&[&str]; 8] = [
+        &["--config", "f.toml"],
+        &["--model", "m"],
+        &["--context-length", "8192"],
+        &["--max-output-tokens", "100"],
+        &["--base-url", "http://localhost:1/v1"],
+        &["--api-key", "k"],
+        &["--temperature", "0.5"],
+        &["--on-secrets", "warn"],
+    ];
+
+    fn parse(args: &[&str]) -> Result<Cli, clap::Error> {
+        try_parse_from(std::iter::once("git-agent").chain(args.iter().copied()))
+    }
+
+    #[test]
+    fn the_tables_cover_every_subcommand_and_setting() {
+        let command = Cli::command();
+        let subcommands: Vec<&str> = command
+            .get_subcommands()
+            .map(clap::Command::get_name)
+            .collect();
+        assert_eq!(subcommands, SUBCOMMANDS.map(|call| call[0]));
+        let settings: Vec<String> = command
+            .get_arguments()
+            .filter(|arg| arg.is_global_set())
+            .filter_map(Arg::get_long)
+            .map(|long| format!("--{long}"))
+            .collect();
+        assert_eq!(settings, SETTINGS.map(|setting| setting[0]));
+    }
+
+    #[test]
+    fn a_setting_works_before_and_after_every_subcommand() {
+        for call in SUBCOMMANDS {
+            for setting in SETTINGS {
+                let before = parse(&[setting, call].concat()).unwrap();
+                let after = parse(&[call, setting].concat()).unwrap();
+                assert_eq!(
+                    format!("{before:?}"),
+                    format!("{after:?}"),
+                    "{setting:?} and {call:?}"
+                );
+                assert_ne!(
+                    format!("{:?}", before.settings),
+                    format!("{:?}", SettingArgs::default())
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_default_commands_options_fail_before_every_subcommand() {
+        let command = Cli::command();
+        let options: Vec<&Arg> = command
+            .get_arguments()
+            .filter(|arg| !arg.is_global_set() && !arg.is_last_set())
+            .collect();
+        assert!(!options.is_empty());
+        for arg in options {
+            let option = format!("--{}", arg.get_long().unwrap());
+            let given = if arg.get_action().takes_values() {
+                vec![option.as_str(), "x"]
+            } else {
+                vec![option.as_str()]
+            };
+            for call in SUBCOMMANDS {
+                let error = parse(&[given.as_slice(), call].concat()).unwrap_err();
+                assert_eq!(
+                    error.kind(),
+                    ErrorKind::ArgumentConflict,
+                    "{given:?} before {call:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_default_command_takes_settings_and_its_own_options_in_any_order() {
+        for args in [
+            &["--model", "m", "-c", "--", "--signoff"][..],
+            &["-c", "--model", "m", "--", "--signoff"],
+        ] {
+            let cli = parse(args).unwrap();
+            assert!(cli.command.is_none() && cli.generate.commit);
+            assert_eq!(cli.settings.model.as_deref(), Some("m"));
+            assert_eq!(cli.generate.git_args, ["--signoff"]);
+        }
+        let cli = parse(&["--model", "m"]).unwrap();
+        assert!(cli.command.is_none() && !cli.generate.commit);
+    }
+
+    #[test]
+    fn a_word_after_an_option_or_the_dashes_is_no_subcommand() {
+        let cli = parse(&["-H", "split"]).unwrap();
+        assert!(cli.command.is_none());
+        assert_eq!(cli.generate.hint.as_deref(), Some("split"));
+        let cli = parse(&["--", "--signoff", "split"]).unwrap();
+        assert!(cli.command.is_none());
+        assert_eq!(cli.generate.git_args, ["--signoff", "split"]);
+        let cli = parse(&["split", "--", "--signoff"]).unwrap();
+        let Some(Command::Split(args)) = cli.command else {
+            panic!("expected the split command");
+        };
+        assert_eq!(args.git_args, ["--signoff"]);
+    }
+
+    #[test]
+    fn says_where_a_misplaced_option_goes() {
+        let message = |args: &[&str]| parse(args).unwrap_err().to_string();
+        let after = message(&["--all", "split"]);
+        assert!(
+            after.contains("'--all' goes after the subcommand: 'git agent split --all'"),
+            "{after}"
+        );
+        let alone = message(&["--raw", "why", "f:1"]);
+        assert!(
+            alone.contains("'--raw' is for 'git agent' alone, so it can't come with 'why'"),
+            "{alone}"
+        );
+        let both = message(&["-r", "-a", "-H", "x", "split"]);
+        assert!(
+            both.contains(
+                "'--all' and '--hint' go after the subcommand: \
+                 'git agent split --all --hint <TEXT>'; \
+                 '--raw' is for 'git agent' alone, so it can't come with 'split'"
+            ),
+            "{both}"
+        );
+        let clash = message(&["-c", "branch"]);
+        assert!(
+            clash.contains(
+                "'--commit' is for 'git agent' alone, so it can't come with 'branch'; \
+                 '-c' after 'branch' is '--create'"
+            ),
+            "{clash}"
+        );
+        let value = message(&["-H", "x", "tidy"]);
+        assert!(value.contains("'git agent tidy --hint <TEXT>'"), "{value}");
+        let several = message(&["-c", "-p", "-a", "models"]);
+        assert!(
+            several.contains("'--commit', '--push' and '--all' are for 'git agent' alone, so they"),
+            "{several}"
+        );
+    }
+
+    #[test]
+    fn settings_reach_nested_subcommands_and_the_last_one_wins() {
+        for args in [
+            &["--model", "x", "config", "init", "--force"][..],
+            &["config", "--model", "x", "init", "--force"],
+        ] {
+            let cli = parse(args).unwrap();
+            assert_eq!(cli.settings.model.as_deref(), Some("x"), "{args:?}");
+            assert!(matches!(
+                cli.command,
+                Some(Command::Config {
+                    command: Some(ConfigCommand::Init { force: true })
+                })
+            ));
+        }
+        let cli = parse(&["-m", "a", "split", "-m", "b"]).unwrap();
+        assert_eq!(cli.settings.model.as_deref(), Some("b"));
+    }
+
+    #[test]
+    fn help_and_version_win_over_a_misplaced_option() {
+        for args in [&["--all", "help"][..], &["--all", "--help", "split"]] {
+            let kind = parse(args).unwrap_err().kind();
+            assert_eq!(kind, ErrorKind::DisplayHelp, "{args:?}");
+        }
+        let kind = parse(&["--all", "--version", "split"]).unwrap_err().kind();
+        assert_eq!(kind, ErrorKind::DisplayVersion);
+    }
+
+    #[test]
+    fn lists_with_commas_and_a_final_and() {
+        let list = |items: &[&str]| {
+            quoted_list(&items.iter().map(ToString::to_string).collect::<Vec<_>>())
+        };
+        assert_eq!(list(&[]), "");
+        assert_eq!(list(&["a"]), "'a'");
+        assert_eq!(list(&["a", "b"]), "'a' and 'b'");
+        assert_eq!(list(&["a", "b", "c"]), "'a', 'b' and 'c'");
+    }
+
+    #[test]
+    fn keeps_both_usage_lines() {
+        let usage = Cli::command().render_usage().to_string();
+        assert!(
+            usage.contains(
+                "git-agent [OPTIONS] [-- <GIT_COMMIT_ARGS>...]\n       git-agent <COMMAND>"
+            ),
+            "{usage}"
+        );
     }
 }

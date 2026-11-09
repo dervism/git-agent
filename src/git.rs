@@ -429,7 +429,13 @@ impl Repo {
 
     fn has_diff(&self, args: &[&str]) -> Result<bool> {
         let output = self
-            .command(&[&WHOLE_TREE[..], &["diff", "--quiet", "--no-ext-diff"]].concat())
+            .command(
+                &[
+                    &WHOLE_TREE[..],
+                    &["diff", "--quiet", "--no-ext-diff", "--no-textconv"],
+                ]
+                .concat(),
+            )
             .args(args)
             .output()
             .context("failed to run git; is it installed?")?;
@@ -763,7 +769,7 @@ impl Repo {
     /// The changes `git diff` shows with `range` (e.g. `--cached`), without the
     /// diffs of files matching `exclude`.
     fn diff(&self, range: &[&str], exclude: &[String]) -> Result<Changes> {
-        let base = ["diff", "--no-color", "--no-ext-diff"];
+        let base = ["diff", "--no-color", "--no-ext-diff", "--no-textconv"];
         let stat = self.git_readable(&[&base[..], range, &["--stat=120"]].concat())?;
 
         let excludes = exclude_pathspecs(exclude);
@@ -793,6 +799,7 @@ impl Repo {
             "--patch",
             "--no-color",
             "--no-ext-diff",
+            "--no-textconv",
             "--irreversible-delete",
             "--ignore-submodules=none",
             "--submodule=short",
@@ -1177,6 +1184,15 @@ impl Repo {
         }))
     }
 
+    /// The `filter` attribute of `path`, if one is set: the driver that turns the file in the
+    /// work tree into what git stores, as git-crypt's encrypts it or Git LFS's swaps it for a
+    /// pointer.
+    pub fn filter_of(&self, path: &str) -> Result<Option<String>> {
+        let output = self.git(&["check-attr", "-z", "filter", "--", path])?;
+        let value = output.split('\0').nth(2).unwrap_or_default();
+        Ok((!["", "unspecified", "unset"].contains(&value)).then(|| value.to_owned()))
+    }
+
     /// Whether HEAD has a file at `path`, which may be absolute or relative
     /// to the directory git runs in.
     pub fn in_head(&self, path: &str) -> bool {
@@ -1191,6 +1207,7 @@ impl Repo {
         self.git_readable(&[
             "blame",
             "--porcelain",
+            "--no-textconv",
             "-w",
             "-M",
             "-C",
@@ -1207,6 +1224,7 @@ impl Repo {
             "diff",
             "--no-color",
             "--no-ext-diff",
+            "--no-textconv",
             "--unified=0",
             "HEAD",
             "--",
@@ -1227,6 +1245,7 @@ impl Repo {
             "log",
             "--no-color",
             "--no-ext-diff",
+            "--no-textconv",
             &format!("--max-count={limit}"),
             &format,
             &format!("-L{range}:{path}"),
@@ -3164,5 +3183,80 @@ mod tests {
         assert!(repo.object_size(&missing).is_err());
         assert!(repo.open_blob("HEAD").is_err());
         assert!(repo.object_size(&"a".repeat(41)).is_err());
+    }
+
+    /// Sets `textconv`, a shell command given the file, as the textconv driver for `*.txt`.
+    fn convert_text_files(dir: &Path, textconv: &str) {
+        fs::write(dir.join(".gitattributes"), "*.txt diff=shown\n").unwrap();
+        run(dir, &["config", "diff.shown.textconv", textconv]);
+    }
+
+    /// A repository's textconv driver changes nothing git-agent reads: not the diff the model
+    /// gets, a commit's patch, blame, uncommitted hunks or a line's history. A stat shows no
+    /// content to check.
+    #[test]
+    fn reads_past_a_textconv_driver() {
+        let (dir, repo) = setup();
+        let dir = dir.path();
+        convert_text_files(dir, "sed 's/^/converted-by-the-driver /'");
+        fs::write(dir.join("notes.txt"), "first\n").unwrap();
+        run(dir, &["add", "--all"]);
+        run(dir, &["commit", "-q", "-m", "add notes"]);
+        fs::write(dir.join("notes.txt"), "first\nsecond\n").unwrap();
+        assert!(run(dir, &["diff"]).contains("converted-by-the-driver"));
+
+        let (_, changes) = repo.changes(&[]).unwrap().unwrap();
+        run(dir, &["commit", "-q", "-am", "add a line"]);
+        fs::write(dir.join("notes.txt"), "first\nsecond\nthird\n").unwrap();
+        let reads = [
+            changes.diff,
+            repo.commit_patches(&["HEAD~1..HEAD"], &[]).unwrap()[0]
+                .patch
+                .clone(),
+            repo.blame("notes.txt", "1,2").unwrap(),
+            repo.uncommitted_hunks("notes.txt").unwrap(),
+            repo.line_history("notes.txt", "1,2", 5)
+                .unwrap()
+                .text()
+                .to_owned(),
+        ];
+
+        for read in &reads {
+            assert!(!read.contains("converted-by-the-driver"), "{read}");
+        }
+        assert!(reads[0].contains("+second"), "{}", reads[0]);
+    }
+
+    /// A driver that prints the same for every version can't hide a change.
+    #[test]
+    fn sees_a_change_a_textconv_driver_hides() {
+        let (dir, repo) = setup();
+        let dir = dir.path();
+        convert_text_files(dir, "echo the-same-for-every-version #");
+        fs::write(dir.join("notes.txt"), "one\n").unwrap();
+        run(dir, &["add", "--all"]);
+        run(dir, &["commit", "-q", "-m", "add notes"]);
+        fs::write(dir.join("notes.txt"), "two\n").unwrap();
+
+        assert!(repo.has_uncommitted_changes().unwrap());
+        run(dir, &["add", "notes.txt"]);
+        assert!(repo.has_staged_changes().unwrap());
+    }
+
+    #[test]
+    fn reads_the_filter_a_file_is_stored_through() {
+        let (dir, repo) = setup();
+        let attributes = "secret.env filter=crypt\nopen.env -filter\nplain.rs diff=rust\n\
+                          set.env filter\n";
+        fs::write(dir.path().join(".gitattributes"), attributes).unwrap();
+
+        assert_eq!(
+            repo.filter_of("secret.env").unwrap().as_deref(),
+            Some("crypt")
+        );
+        assert_eq!(repo.filter_of("set.env").unwrap().as_deref(), Some("set"));
+        for path in ["open.env", "plain.rs", "lib.rs", "missing.txt"] {
+            assert_eq!(repo.filter_of(path).unwrap(), None, "{path}");
+        }
     }
 }

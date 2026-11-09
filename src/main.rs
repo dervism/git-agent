@@ -994,8 +994,13 @@ async fn explain_lines(args: &WhyArgs, overrides: &Overrides) -> Result<()> {
         ));
         return Ok(());
     }
-    let source =
-        fs::read(&target.path).with_context(|| format!("failed to read {}", target.path))?;
+    let asking = io::stdin()
+        .is_terminal()
+        .then_some(&Terminal as &dyn Person);
+    let Some(source) = why::source_to_send(&repo, &target.path, asking)? else {
+        ui::info("Nothing sent.");
+        return Ok(());
+    };
     let source = String::from_utf8_lossy(&source);
     let target = target.within(source.lines().count())?;
     // Built-in diff drivers let git find functions inside classes and impl blocks.

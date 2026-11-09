@@ -458,6 +458,13 @@ Lines with uncommitted changes are marked, and the rest are explained from the
 committed version. If none of the lines are committed yet, there is no history to
 explain, and git-agent says so.
 
+git-agent reads the lines from the file in your work tree. When git stores the file
+through a filter, as git-crypt does to keep it encrypted in the repository while it
+stays readable in your work tree, or as Git LFS does, git-agent asks before it sends
+those lines to the model. Pressing Enter answers no, and without a terminal to ask
+at, it doesn't send them. It doesn't follow a symbolic link, or a path that leads out
+of the repository: name the file the link points to instead.
+
 ### Explaining commits
 
 `git agent explain` summarizes commits: what they change and why, and what you may
@@ -571,9 +578,12 @@ export GIT_AGENT_API_KEY="your-api-key"
 Before git-agent sends anything to the model, it looks for secrets in it and replaces
 each one with `[REDACTED]`. That covers the diff, the commit messages of pull requests
 and explained commits, the commits that `git agent tidy` sends, and the code and
-history that `git agent why` sends. The model
-still sees that something was there, but the secret itself never goes into a prompt,
-whichever server you use.
+history that `git agent why` sends. The model still sees that something was there,
+but the secret itself never goes into a prompt, whichever server you use.
+
+git-agent reads every diff as git stores the files, without the textconv drivers
+that turn a file into readable text for `git diff`. So a file that git-crypt
+encrypts reaches the model as a binary file, not decrypted.
 
 ### Rejecting or warning
 

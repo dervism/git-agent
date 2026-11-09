@@ -6,9 +6,13 @@
 //! The history follows the lines through renames.
 
 use crate::conversation::fit;
-use crate::git::{MarkedLog, Summary, diff};
-use anyhow::{Result, anyhow, bail};
+use crate::git::{MarkedLog, Repo, Summary, diff};
+use crate::review::Person;
+use crate::safe_text::one_line;
+use crate::ui;
+use anyhow::{Context, Result, anyhow, bail};
 use std::fmt::Write;
+use std::fs;
 
 /// Most commits of the history to read.
 pub const HISTORY_LIMIT: usize = 30;
@@ -484,6 +488,74 @@ fn head(change: &Change) -> String {
     out
 }
 
+/// The content of the file at `path` to explain, read once it may go to the model: it isn't a
+/// symbolic link, whose committed content is only the name of the file it points to; it's
+/// inside the repository; and if git stores it through a filter, the person agreed to send it.
+/// `None` when the person said no. The path is read as the repository's folder resolves it.
+pub fn source_to_send(
+    repo: &Repo,
+    path: &str,
+    person: Option<&dyn Person>,
+) -> Result<Option<Vec<u8>>> {
+    let file = repo.workdir().join(path);
+    if fs::symlink_metadata(&file).is_ok_and(|found| found.file_type().is_symlink()) {
+        bail!(
+            "{} is a symbolic link; name the file it points to",
+            one_line(path)
+        );
+    }
+    let resolved =
+        fs::canonicalize(&file).with_context(|| format!("failed to find {}", one_line(path)))?;
+    if !resolved.starts_with(fs::canonicalize(repo.toplevel()?)?) {
+        bail!("{} is outside the repository", one_line(path));
+    }
+    if let Some(filter) = repo.filter_of(path)?
+        && !may_send_transformed(person, path, &filter)?
+    {
+        return Ok(None);
+    }
+    let content =
+        fs::read(&resolved).with_context(|| format!("failed to read {}", one_line(path)))?;
+    Ok(Some(content))
+}
+
+/// Whether the person lets the lines of `path` go to the model, when git stores the file
+/// transformed by the filter `filter`: the lines in the work tree can be what the filter hides,
+/// such as text git-crypt encrypts. No is the default, and with no one to ask, it refuses. A
+/// `filter` attribute set to `unset` or `unspecified` counts as none, though a driver could
+/// have one of those names.
+pub fn may_send_transformed(person: Option<&dyn Person>, path: &str, filter: &str) -> Result<bool> {
+    let Some(person) = person else {
+        bail!(
+            "{} is stored transformed in the repository (filter {}), so git-agent won't send its \
+             lines to the model without asking, and it can't ask here",
+            one_line(path),
+            one_line(filter)
+        );
+    };
+    let question = transformed_question(path, filter);
+    loop {
+        let Some(answer) = person.typed_at(&question)? else {
+            return Ok(false);
+        };
+        match answer.trim().to_lowercase().as_str() {
+            "" | "n" | "no" => return Ok(false),
+            "y" | "yes" => return Ok(true),
+            _ => ui::info("Please answer y or n."),
+        }
+    }
+}
+
+/// The question about sending the lines of `path`, which git stores through `filter`.
+fn transformed_question(path: &str, filter: &str) -> String {
+    format!(
+        "{} is stored transformed in the repository (filter {}); send its lines to the model? {}",
+        one_line(path),
+        one_line(filter),
+        ui::dim("[y/N] ›")
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -720,5 +792,91 @@ mod tests {
         assert!(text.contains(&note));
         assert!(text.contains("more lines of this diff not shown]"));
         assert!(text.ends_with("[The history goes back further than these 30 commits.]\n"));
+    }
+
+    #[test]
+    fn asks_before_sending_a_file_git_stores_transformed_with_no_by_default() {
+        use crate::review::test_support::ScriptedPerson;
+        let answer = |lines: &[&str]| {
+            let person = ScriptedPerson::typing(lines);
+            may_send_transformed(Some(&person), "secrets.env", "git-crypt").unwrap()
+        };
+        assert!(!answer(&[""]));
+        assert!(!answer(&["n"]));
+        assert!(!answer(&["No"]));
+        assert!(!answer(&[]));
+        assert!(answer(&["y"]));
+        assert!(answer(&["maybe", " YES "]));
+
+        let error = may_send_transformed(None, "secrets.env", "git-crypt").unwrap_err();
+        let message = error.to_string();
+        assert!(
+            message.contains("secrets.env") && message.contains("git-crypt"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn reads_a_plain_file_and_asks_about_one_git_stores_transformed() {
+        use crate::review::test_support::ScriptedPerson;
+        let (dir, repo) = isolated_repo();
+        fs::write(
+            dir.path().join(".gitattributes"),
+            "secret.env filter=crypt\n",
+        )
+        .unwrap();
+        fs::write(dir.path().join("secret.env"), "API=1\n").unwrap();
+        let send = |answer: &str| {
+            let person = ScriptedPerson::typing(&[answer]);
+            source_to_send(&repo, "secret.env", Some(&person)).unwrap()
+        };
+
+        assert_eq!(
+            source_to_send(&repo, "lib.rs", None).unwrap(),
+            Some(b"fn a() {}\n".to_vec())
+        );
+        assert_eq!(send("n"), None);
+        assert_eq!(send("y"), Some(b"API=1\n".to_vec()));
+        assert!(source_to_send(&repo, "secret.env", None).is_err());
+    }
+
+    /// A symbolic link's committed content is only the name of its file, so what git says of
+    /// the link says nothing of what reading it would send. It's refused, whatever the answer,
+    /// and so is a path that leads out of the repository.
+    #[cfg(unix)]
+    #[test]
+    fn refuses_a_symbolic_link_and_a_path_outside_the_repository() {
+        use crate::review::test_support::ScriptedPerson;
+        use std::os::unix::fs::symlink;
+        let (dir, repo) = isolated_repo();
+        let dir = dir.path();
+        fs::write(dir.join(".gitattributes"), "secret.env filter=crypt\n").unwrap();
+        fs::write(dir.join("secret.env"), "API=1\n").unwrap();
+        symlink("secret.env", dir.join("link.env")).unwrap();
+        let outside = tempfile::TempDir::new().unwrap();
+        fs::create_dir(outside.path().join("notes")).unwrap();
+        fs::write(outside.path().join("notes/plan.txt"), "plan\n").unwrap();
+        symlink(outside.path().join("notes"), dir.join("notes")).unwrap();
+        let person = ScriptedPerson::typing(&["y", "y"]);
+
+        let link = source_to_send(&repo, "link.env", Some(&person)).unwrap_err();
+        let away = source_to_send(&repo, "notes/plan.txt", Some(&person)).unwrap_err();
+
+        assert!(link.to_string().contains("symbolic link"), "{link}");
+        assert!(
+            away.to_string().contains("outside the repository"),
+            "{away}"
+        );
+    }
+
+    #[test]
+    fn names_the_file_and_its_filter_on_one_line_in_the_question() {
+        let question = transformed_question("odd\nname.env", "crypt\u{1b}[31m");
+        assert!(!question.contains("odd\nname"), "{question}");
+        assert!(!question.contains("\u{1b}[31m"), "{question}");
+        assert!(
+            question.contains("crypt") && question.contains("[y/N]"),
+            "{question}"
+        );
     }
 }

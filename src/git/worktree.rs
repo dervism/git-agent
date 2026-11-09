@@ -87,6 +87,7 @@ impl TempWorktree {
             "diff",
             "--quiet",
             "--no-ext-diff",
+            "--no-textconv",
             "--no-renames",
             "--diff-filter=D",
             from,

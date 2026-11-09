@@ -1,7 +1,7 @@
 //! The prompts of each command, until each moves into its feature.
 
 use crate::conversation::fit;
-use crate::conversation::{Fit, asks, describe_changes, notes, room, with_commits};
+use crate::conversation::{Budget, Fit, asks, describe_changes, notes, with_commits};
 use crate::git::Changes;
 use crate::github::Issue;
 use crate::server::Message;
@@ -79,12 +79,7 @@ pub enum Work<'a> {
 
 /// The conversation asking for the name of a branch for `work`, in the
 /// style of the repository's `examples` of branch names.
-pub fn branch_messages(
-    work: &Work,
-    examples: &[&str],
-    context_length: usize,
-    max_output_tokens: usize,
-) -> Vec<Message> {
+pub fn branch_messages(work: &Work, examples: &[&str], budget: Budget) -> Vec<Message> {
     let mut user = String::new();
     if !examples.is_empty() {
         let _ = writeln!(
@@ -117,7 +112,7 @@ pub fn branch_messages(
         }
         Work::Changes(changes) => {
             user.push_str("The work is in these uncommitted changes.\n\n");
-            let room = room(BRANCH_PROMPT, context_length, max_output_tokens);
+            let room = budget.user_message_bytes(BRANCH_PROMPT);
             user = describe_changes(user, changes, room.min(BRANCH_CHANGES_BYTES)).0;
         }
     }
@@ -241,8 +236,7 @@ pub fn pull_request_messages(
     commits: &[String],
     changes: &Changes,
     hint: Option<&str>,
-    context_length: usize,
-    max_output_tokens: usize,
+    budget: Budget,
 ) -> (Vec<Message>, Fit) {
     with_commits(
         PULL_REQUEST_PROMPT,
@@ -250,7 +244,7 @@ pub fn pull_request_messages(
         "Commits on the branch, oldest first:\n",
         commits,
         changes,
-        room(PULL_REQUEST_PROMPT, context_length, max_output_tokens),
+        budget.user_message_bytes(PULL_REQUEST_PROMPT),
     )
 }
 
@@ -262,8 +256,7 @@ pub fn explain_messages(
     commits: &[String],
     changes: &Changes,
     question: Option<&str>,
-    context_length: usize,
-    max_output_tokens: usize,
+    budget: Budget,
 ) -> (Vec<Message>, Fit) {
     with_commits(
         EXPLAIN_PROMPT,
@@ -271,7 +264,7 @@ pub fn explain_messages(
         "Commits, oldest first:\n",
         commits,
         changes,
-        room(EXPLAIN_PROMPT, context_length, max_output_tokens),
+        budget.user_message_bytes(EXPLAIN_PROMPT),
     )
 }
 
@@ -302,8 +295,31 @@ pub fn split_title(text: &str) -> (String, String) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::DEFAULT_MAX_OUTPUT_TOKENS as REPLY;
-    use crate::conversation::test_support::{changes, diff};
+    use crate::config::{DEFAULT_SYSTEM_PROMPT, MIN_CONTEXT_LENGTH, MIN_OUTPUT_TOKENS};
+    use crate::conversation::models::Model;
+    use crate::conversation::test_support::{changes, configured, diff};
+
+    #[test]
+    fn every_prompt_leaves_room_for_changes_in_the_smallest_context() {
+        let smallest = Model {
+            max_output_tokens: MIN_OUTPUT_TOKENS,
+            ..configured(MIN_CONTEXT_LENGTH)
+        }
+        .budget();
+        for prompt in [
+            DEFAULT_SYSTEM_PROMPT,
+            PULL_REQUEST_PROMPT,
+            WHY_PROMPT,
+            EXPLAIN_PROMPT,
+            BRANCH_PROMPT,
+            TIDY_PROMPT,
+            SPLIT_PROMPT,
+        ] {
+            let room = smallest.user_message_bytes(prompt);
+            let first_line = prompt.lines().next().unwrap_or_default();
+            assert!(room >= 1024, "{room} bytes after {first_line:?}");
+        }
+    }
 
     #[test]
     fn pull_request_message_lists_commits_before_the_changes() {
@@ -311,8 +327,12 @@ mod tests {
             "- feat: add b\n  b replaces a.".to_owned(),
             "- test: cover b".to_owned(),
         ];
-        let (messages, fit) =
-            pull_request_messages(&commits, &changes(&diff(1)), Some("fixes #7"), 8192, REPLY);
+        let (messages, fit) = pull_request_messages(
+            &commits,
+            &changes(&diff(1)),
+            Some("fixes #7"),
+            configured(8192).budget(),
+        );
         assert_eq!(messages[0].content, PULL_REQUEST_PROMPT);
         let user = &messages[1].content;
         assert!(user.starts_with(
@@ -333,8 +353,12 @@ mod tests {
                 )
             })
             .collect();
-        let (messages, fit) =
-            pull_request_messages(&commits, &changes(&diff(1)), None, 8192, REPLY);
+        let (messages, fit) = pull_request_messages(
+            &commits,
+            &changes(&diff(1)),
+            None,
+            configured(8192).budget(),
+        );
         let user = &messages[1].content;
         assert!(fit.commit_bodies_left_out && !fit.is_complete());
         assert!(!user.contains("A long explanation"));
@@ -352,8 +376,7 @@ mod tests {
             &commits,
             &changes(&diff(1)),
             Some("does it break anything?"),
-            8192,
-            REPLY,
+            configured(8192).budget(),
         );
         assert_eq!(messages[0].content, EXPLAIN_PROMPT);
         assert!(messages[1].content.starts_with(
@@ -377,8 +400,7 @@ mod tests {
         let messages = branch_messages(
             &Work::Described("fix login timeout"),
             &["feature/split", "bugfix/pr-base"],
-            8192,
-            REPLY,
+            configured(8192).budget(),
         );
         assert_eq!(messages[0].content, BRANCH_PROMPT);
         assert_eq!(
@@ -393,7 +415,8 @@ mod tests {
             body: format!("It hangs.\n{}", "More detail.\n".repeat(400)),
             labels: vec!["bug".into()],
         };
-        let user = &branch_messages(&Work::Issue(&issue), &[], 8192, REPLY)[1].content;
+        let user =
+            &branch_messages(&Work::Issue(&issue), &[], configured(8192).budget())[1].content;
         assert!(user.starts_with(
             "The work is GitHub issue #42: Login times out\nLabels: bug\n\n\
              Issue description:\nIt hangs.\n"
@@ -402,7 +425,8 @@ mod tests {
         assert!(user.len() < ISSUE_BYTES + 200);
 
         let big = changes(&diff(5000));
-        let user = &branch_messages(&Work::Changes(&big), &[], 131_072, REPLY)[1].content;
+        let user =
+            &branch_messages(&Work::Changes(&big), &[], configured(131_072).budget())[1].content;
         assert!(user.starts_with("The work is in these uncommitted changes.\n\nChanged files:\n"));
         assert!(user.len() <= BRANCH_CHANGES_BYTES + 200);
     }

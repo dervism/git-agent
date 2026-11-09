@@ -13,7 +13,7 @@ const CONTEXT_TRIMMED: &str = "   To fit, git-agent left out the unchanged lines
 #[derive(Debug, PartialEq)]
 enum FitReport {
     /// All of the changes were sent, with the unchanged lines around them.
-    Whole,
+    WithContext,
     /// Every changed line was sent, without the unchanged lines around them.
     WithoutContext,
     /// Part of the changes was sent.
@@ -29,8 +29,8 @@ enum FitReport {
 /// send less at a time, if there is a way.
 pub fn report_fit(model: &Model, fit: &Fit, noun: &str, smaller: Option<&str>) {
     report_model(model, fit.prompt_tokens);
-    match fit_report(model, fit, noun, smaller) {
-        FitReport::Whole => {}
+    match FitReport::of(model, fit, noun, smaller) {
+        FitReport::WithContext => {}
         FitReport::WithoutContext => ui::info(ui::dim(CONTEXT_TRIMMED)),
         FitReport::Shortened {
             warning,
@@ -44,17 +44,19 @@ pub fn report_fit(model: &Model, fit: &Fit, noun: &str, smaller: Option<&str>) {
     }
 }
 
-fn fit_report(model: &Model, fit: &Fit, noun: &str, smaller: Option<&str>) -> FitReport {
-    if !fit.is_complete() {
-        FitReport::Shortened {
-            warning: shortened(fit),
-            left_out: left_out(fit),
-            to_send_more: how_to_send_more(model, noun, smaller),
+impl FitReport {
+    fn of(model: &Model, fit: &Fit, noun: &str, smaller: Option<&str>) -> Self {
+        if !fit.is_complete() {
+            Self::Shortened {
+                warning: shortened(fit),
+                left_out: left_out(fit),
+                to_send_more: how_to_send_more(model, noun, smaller),
+            }
+        } else if fit.context_trimmed {
+            Self::WithoutContext
+        } else {
+            Self::WithContext
         }
-    } else if fit.context_trimmed {
-        FitReport::WithoutContext
-    } else {
-        FitReport::Whole
     }
 }
 
@@ -192,7 +194,7 @@ fn first_few(items: &[String]) -> String {
 mod tests {
     use super::*;
     use crate::conversation::fit::FileFit;
-    use crate::conversation::models::test_support::configured;
+    use crate::conversation::test_support::configured;
 
     fn model(picked: Option<Pick>, context_source: ContextSource) -> Model {
         Model {
@@ -267,9 +269,9 @@ mod tests {
     fn says_nothing_more_when_every_line_was_sent() {
         let report = |trimmed| {
             let fit = fit(vec![file("a.rs", Kept::Whole, 40)], trimmed);
-            fit_report(&model(None, ContextSource::Server), &fit, "message", None)
+            FitReport::of(&model(None, ContextSource::Server), &fit, "message", None)
         };
-        assert_eq!(report(false), FitReport::Whole);
+        assert_eq!(report(false), FitReport::WithContext);
         assert_eq!(report(true), FitReport::WithoutContext);
     }
 
@@ -289,7 +291,7 @@ mod tests {
             )
         };
         assert_eq!(
-            fit_report(&model(None, ContextSource::Server), &fit, "message", None),
+            FitReport::of(&model(None, ContextSource::Server), &fit, "message", None),
             FitReport::Shortened {
                 warning: WARNING.to_owned(),
                 left_out: texts(&[
@@ -314,7 +316,7 @@ mod tests {
             ..fit(vec![file("a.rs", Kept::Whole, 40)], false)
         };
         let FitReport::Shortened { left_out, .. } =
-            fit_report(&model(None, ContextSource::Server), &fit, "message", None)
+            FitReport::of(&model(None, ContextSource::Server), &fit, "message", None)
         else {
             panic!("the fit is shortened");
         };

@@ -1,5 +1,6 @@
 //! Choosing the model, and the context to fit the prompt into.
 
+use super::budget::Budget;
 use crate::config::{self, Config};
 use crate::server::{ModelInfo, ModelServer};
 use anyhow::{Context, Result, bail};
@@ -13,6 +14,13 @@ pub struct Model {
     pub context_source: ContextSource,
     /// The most tokens a reply may take, which the prompt leaves room for.
     pub max_output_tokens: usize,
+}
+
+impl Model {
+    /// What a conversation with this model has to fit in.
+    pub fn budget(&self) -> Budget {
+        Budget::new(self.context_length, self.max_output_tokens)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -171,6 +179,18 @@ mod tests {
         let model = resolve(&server, &configured).await.unwrap();
         assert_eq!(model.picked, None);
         assert_eq!(model.context_source, ContextSource::Config);
+    }
+
+    #[tokio::test]
+    async fn sizes_the_conversation_with_the_configured_output_limit() {
+        let config = Config {
+            model: Some("m".into()),
+            context_length: Some(100_000),
+            max_output_tokens: 2000,
+            ..Config::default()
+        };
+        let model = resolve(&FakeServer::unlisted(), &config).await.unwrap();
+        assert_eq!(model.budget(), Budget::new(100_000, 2000));
     }
 
     #[tokio::test]

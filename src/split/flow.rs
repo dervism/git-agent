@@ -10,7 +10,7 @@ use crate::cli::SplitArgs;
 use crate::config::{Config, OnSecrets, Overrides};
 use crate::conversation::models::Model;
 use crate::conversation::{
-    commit_message, connect, generate_message, initial_messages, report_fit, report_model, room,
+    commit_message, connect, generate_message, initial_messages, report_fit, report_model,
     separated, tokens_in,
 };
 use crate::git::worktree::TempWorktree;
@@ -144,11 +144,7 @@ async fn split_changes<S: ModelServer>(
     server: &S,
     model: &Model,
 ) -> Result<()> {
-    let room = room(
-        prompt::SPLIT_PROMPT,
-        model.context_length,
-        config.max_output_tokens,
-    );
+    let room = model.budget().user_message_bytes(prompt::SPLIT_PROMPT);
     let described = split::describe(&work.files, room)?;
     if described.units.len() < 2 {
         ui::info(
@@ -751,8 +747,7 @@ impl<S: ModelServer> Splitter<'_, S> {
             &self.config.system_prompt,
             &changes,
             Some(&hint),
-            self.model.context_length,
-            self.config.max_output_tokens,
+            self.model.budget(),
         );
         if !fit.is_complete() {
             report_fit(self.model, &fit, "message", None);
@@ -802,7 +797,7 @@ fn report_merged(merged: &[String], why: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::conversation::models::test_support::configured;
+    use crate::conversation::test_support::configured;
     use crate::git::test_support::{isolated_repo, numbered_lines, run, with_submodule};
     use crate::server::test_support::FakeServer;
     use std::cell::{Cell, RefCell};

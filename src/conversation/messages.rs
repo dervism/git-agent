@@ -1,6 +1,6 @@
 //! Building the conversation for the model, in the room its context leaves.
 
-use super::budget::{framed_tokens, room, tokens_in};
+use super::budget::{Budget, framed_tokens, tokens_in};
 use super::fit::{self, FileFit};
 use crate::git::Changes;
 use crate::server::Message;
@@ -34,18 +34,16 @@ impl Fit {
 }
 
 /// The system prompt plus a user message describing `changes`, shortened to
-/// fit a context of `context_length` tokens with room for a reply of up to
-/// `max_output_tokens`.
+/// fit the `budget`.
 pub fn initial_messages(
     system_prompt: &str,
     changes: &Changes,
     hint: Option<&str>,
-    context_length: usize,
-    max_output_tokens: usize,
+    budget: Budget,
 ) -> (Vec<Message>, Fit) {
     let intro = notes(hint);
     let intro_bytes = intro.len();
-    let room = room(system_prompt, context_length, max_output_tokens);
+    let room = budget.user_message_bytes(system_prompt);
     build(system_prompt, intro, intro_bytes, changes, room)
 }
 
@@ -270,8 +268,7 @@ mod tests {
             "system",
             &changes(&diff(1)),
             Some(" fixes #12 "),
-            4096,
-            REPLY,
+            Budget::new(4096, REPLY),
         );
         let user = &messages[1].content;
         assert!(user.starts_with("Notes from the author:\nfixes #12\n"));
@@ -283,7 +280,8 @@ mod tests {
 
     #[test]
     fn shortens_changes_to_fit_the_context() {
-        let (messages, fit) = initial_messages("s", &changes(&diff(2000)), None, 4096, REPLY);
+        let (messages, fit) =
+            initial_messages("s", &changes(&diff(2000)), None, Budget::new(4096, REPLY));
         let user = &messages[1].content;
         assert!(!fit.is_complete());
         assert!(user.contains("shortened to fit"));
@@ -292,7 +290,7 @@ mod tests {
         assert!(fit.prompt_tokens < 4096 - 1024);
         assert!(fit.full_tokens > 4096);
 
-        let (messages, fit) = initial_messages("s", &changes(""), None, 4096, REPLY);
+        let (messages, fit) = initial_messages("s", &changes(""), None, Budget::new(4096, REPLY));
         assert!(messages[1].content.contains("only excluded files"));
         assert!(fit.is_complete());
     }
@@ -307,7 +305,7 @@ mod tests {
             stat,
             diff: diff(10),
         };
-        let (messages, fit) = initial_messages("s", &changes, None, 4096, REPLY);
+        let (messages, fit) = initial_messages("s", &changes, None, Budget::new(4096, REPLY));
         let user = &messages[1].content;
         assert!(fit.list_lines_left_out > 0 && fit.list_lines_left_out < 3000);
         assert!(user.contains(&format!(
@@ -319,7 +317,7 @@ mod tests {
 
     #[test]
     fn refine_appends_current_message_and_feedback() {
-        let (base, _) = initial_messages("s", &changes("+x\n"), None, 4096, REPLY);
+        let (base, _) = initial_messages("s", &changes("+x\n"), None, Budget::new(4096, REPLY));
         let messages = refine_messages(&base, "feat: x", "shorter", "commit message");
         assert_eq!(messages.len(), 4);
         assert_eq!(messages[2].content, "feat: x");
@@ -358,7 +356,7 @@ mod tests {
 
     #[test]
     fn follows_up_with_the_answer_then_the_question() {
-        let (base, _) = initial_messages("s", &changes("+x\n"), None, 4096, REPLY);
+        let (base, _) = initial_messages("s", &changes("+x\n"), None, Budget::new(4096, REPLY));
         let next = follow_up(&base, "Because.", "And line 4?");
         assert_eq!(next.len(), 4);
         assert_eq!(next[..2], base[..]);
@@ -375,7 +373,8 @@ mod tests {
     #[test]
     fn counts_the_prompt_as_sent_and_the_changes_in_full() {
         let changes = changes(&diff(1));
-        let (messages, fit) = initial_messages("  system  ", &changes, None, 4096, REPLY);
+        let (messages, fit) =
+            initial_messages("  system  ", &changes, None, Budget::new(4096, REPLY));
         assert_eq!(messages[0].content, "system");
         assert_eq!(fit.prompt_tokens, tokens_in(&messages));
         assert_eq!(

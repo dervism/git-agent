@@ -1,7 +1,6 @@
 //! Sending the conversation to the model and reading its reply: connecting, generating a
 //! message, and a discussion with follow-up questions.
 
-use super::budget::{has_room, outgrew_context};
 use super::messages::follow_up;
 use super::models::{self, Model};
 use super::reply::{clean_reply, separated};
@@ -29,12 +28,10 @@ pub async fn generate_message(
     conversation: &[Message],
 ) -> Result<String> {
     let request = Request::escaped(&model.id, conversation);
-    if outgrew_context(
-        conversation,
-        request.messages(),
-        model.context_length,
-        model.max_output_tokens,
-    ) {
+    if model
+        .budget()
+        .outgrown_by_escaping(conversation, request.messages())
+    {
         bail!(
             "the changes hold so many control or invisible characters that, escaped, they no \
              longer fit in the model's context"
@@ -86,7 +83,7 @@ pub async fn discuss(
     }
     while let Some(question) = ui::ask_follow_up()? {
         let next = follow_up(&conversation, &answer, &question);
-        if !has_room(&next, model.context_length, model.max_output_tokens) {
+        if !model.budget().has_room_for_a_reply(&next) {
             ui::info(ui::dim(
                 "The conversation no longer fits in the model's context; ask your question in a \
                  new run.",
@@ -109,7 +106,7 @@ pub async fn discuss(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::conversation::models::test_support::configured;
+    use crate::conversation::test_support::configured;
     use crate::server::test_support::FakeServer;
 
     #[tokio::test(flavor = "current_thread")]

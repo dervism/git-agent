@@ -219,8 +219,19 @@ static KEY_BEGIN: LazyLock<Regex> = LazyLock::new(|| {
 
 /// Replaces the secrets in a diff. Findings name the file and the line.
 pub fn diff(diff: &str) -> Redacted {
-    let mut scanner = Scanner::default();
     let mut text = String::with_capacity(diff.len());
+    let findings = scan_diff(diff, |part| text.push_str(part));
+    Redacted { text, findings }
+}
+
+/// The secrets in a diff, as [`diff`] finds them, without a copy of the diff to send.
+pub fn diff_findings(diff: &str) -> Vec<Finding> {
+    scan_diff(diff, |_| {})
+}
+
+/// Finds the secrets in a diff, and gives `keep` the diff in order with them replaced.
+fn scan_diff(diff: &str, mut keep: impl FnMut(&str)) -> Vec<Finding> {
+    let mut scanner = Scanner::default();
     let mut findings = Vec::new();
     let mut path = String::new();
     let mut hunk: Option<Hunk> = None;
@@ -241,8 +252,8 @@ pub fn diff(diff: &str) -> Redacted {
             let (change, number) = hunk.take(markers.as_bytes());
             let mut kinds = Vec::new();
             if let Some(content) = scanner.scan(&line[markers.len()..], &mut kinds) {
-                text.push_str(markers);
-                text.push_str(&content);
+                keep(markers);
+                keep(&content);
             }
             findings.extend(kinds.into_iter().map(|kind| Finding {
                 place: path.clone(),
@@ -252,9 +263,9 @@ pub fn diff(diff: &str) -> Redacted {
             }));
             continue;
         }
-        text.push_str(line);
+        keep(line);
     }
-    Redacted { text, findings }
+    findings
 }
 
 /// Where a hunk has got to: the number of the next line in each parent and in the result. A
@@ -335,7 +346,7 @@ impl Hunk {
 /// The secrets in a commit's message and patch. Findings name the commit.
 pub fn commit(hash: &str, message: &str, patch: &str) -> Vec<Finding> {
     let mut findings = text(message, &format!("commit {hash} message")).findings;
-    findings.extend(diff(patch).findings.into_iter().map(|finding| Finding {
+    findings.extend(diff_findings(patch).into_iter().map(|finding| Finding {
         place: format!("commit {hash} {}", finding.place),
         ..finding
     }));
@@ -1053,6 +1064,7 @@ mod tests {
                 (".env", Some(2), Change::Added)
             ]
         );
+        assert_eq!(diff_findings(&diff), result.findings);
     }
 
     /// The places, lines and changes of what `diff` finds.
@@ -1095,6 +1107,7 @@ mod tests {
                 (place, Some(3), Change::Unchanged),
             ]
         );
+        assert_eq!(diff_findings(&diff), result.findings);
     }
 
     #[test]
@@ -1175,6 +1188,7 @@ mod tests {
         assert_eq!(result.findings.len(), 1);
         assert_eq!(result.findings[0].kind, "private key");
         assert_eq!(result.findings[0].line, Some(2));
+        assert_eq!(diff_findings(&diff), result.findings);
 
         // A key on one line, as in a cloud provider's JSON credentials.
         let line = format!(

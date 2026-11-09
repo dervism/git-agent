@@ -7,7 +7,7 @@ use super::dry_run::{CommitPlan, Snapshot, dry_run};
 use super::kinds::{self, Kind};
 use super::{Committed, FilePatch, Patch, Plan, Planned, Unit};
 use crate::cli::SplitArgs;
-use crate::config::{Config, OnSecrets, Overrides};
+use crate::config::{Config, Overrides};
 use crate::conversation::models::Model;
 use crate::conversation::{
     commit_message, connect, generate_message, initial_messages, report_fit, report_model,
@@ -17,7 +17,7 @@ use crate::delivery::{commit, push};
 use crate::git::worktree::TempWorktree;
 use crate::git::{Changes, Repo, Scope, names};
 use crate::review::{self, Action, Choice, Person, Review, Revisions, Terminal};
-use crate::secrets::{check_outgoing, redact, reject_added, report_secrets};
+use crate::secrets::{Wording, check_changes, check_outgoing, redact, report_secrets};
 use crate::server::{Message, ModelServer};
 use crate::staging::{self, Purpose, Staged};
 use crate::ui;
@@ -67,6 +67,13 @@ const PLAN_REVIEW: Review<PlanAcceptance> = Review {
 
 /// A plan that leaves out at least this many parts is asked for once more.
 const ASK_AGAIN_MISSING: usize = 3;
+
+/// What a split says when the changes add secrets.
+const SECRETS: Wording = Wording {
+    refused: "the changes add what look like secrets, so git-agent didn't split them",
+    fix: "Take them out of the changes.",
+    warned: "the changes add what look like secrets that the model doesn't read",
+};
 
 /// What accepting one commit of a split does.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -132,13 +139,7 @@ fn changes_to_split(repo: &Repo, args: &SplitArgs, config: &Config) -> Result<Op
         return Ok(None);
     };
     let redacted = redact::diff(&changes.diff);
-    if config.on_secrets == OnSecrets::Reject {
-        reject_added(
-            &redacted.findings,
-            "the changes add what look like secrets, so git-agent didn't split them",
-            "Take them out of the changes.",
-        )?;
-    }
+    check_changes(repo, scope, config.on_secrets, &redacted.findings, &SECRETS)?;
     report_secrets(
         &redacted.findings,
         "If they are real, take them out of the files before you commit.",
@@ -256,7 +257,7 @@ fn finish(
         }
     }
     if args.push && outcome.made > 0 {
-        check_outgoing(repo, config).context(NOT_PUSHED)?;
+        check_outgoing(repo, config.on_secrets).context(NOT_PUSHED)?;
         push(repo, !args.commit).context(NOT_PUSHED)?;
     }
     Ok(())

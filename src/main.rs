@@ -29,7 +29,7 @@ use anyhow::{Context, Result, bail};
 use cli::{
     BranchArgs, Command, ConfigCommand, ExplainArgs, GenerateArgs, PrArgs, TidyArgs, WhyArgs,
 };
-use config::{Config, OnSecrets, Overrides};
+use config::{Config, Overrides};
 use conversation::models::{self, Model};
 use conversation::{
     commit_message, connect, discuss, generate_message, initial_messages, notes_bytes,
@@ -41,7 +41,10 @@ use github::PullRequest;
 use prompt::Work;
 use review::{Action, Choice, Person, Review, Revisions, Terminal};
 use secrets::redact::{self, Finding};
-use secrets::{added, check_outgoing, list_findings, reject_added, report_secrets, scan_commits};
+use secrets::{
+    Wording, added, check_changes, check_commits, check_outgoing, list_findings, report_secrets,
+    warn_about_commits,
+};
 use server::{Message, ModelServer, Server};
 use split::signals::Stopped;
 use staging::{Purpose, Staged};
@@ -88,6 +91,13 @@ const COMMIT_REVIEW: Review<CommitAcceptance> = Review {
     quit: "quit without committing",
 };
 
+/// What a commit says when the changes add secrets.
+const COMMIT_SECRETS: Wording = Wording {
+    refused: "the changes add what look like secrets, so git-agent didn't commit them",
+    fix: "Take them out of the changes.",
+    warned: "the changes add what look like secrets that the model doesn't read",
+};
+
 /// What accepting a pull request does.
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum PullRequestAcceptance {
@@ -123,6 +133,15 @@ const PULL_REQUEST_REVIEW: Review<PullRequestAcceptance> = Review {
         },
     ],
     quit: "quit without creating it",
+};
+
+/// What a pull request says when the branch's commits add secrets.
+const PULL_REQUEST_SECRETS: Wording = Wording {
+    refused: "the branch's commits add what look like secrets, so git-agent won't open a pull \
+              request for it",
+    fix: "Remove them from the branch's history, for example with `git rebase -i`, and revoke \
+          any that were pushed already.",
+    warned: "the branch's commits add what look like secrets that the model doesn't read",
 };
 
 /// Accepting the plan of a tidy-up.
@@ -258,13 +277,13 @@ async fn generate(args: &GenerateArgs, overrides: &Overrides) -> Result<()> {
     }
     let redacted = redact::diff(&changes.diff);
     changes.diff = redacted.text;
-    if config.on_secrets == OnSecrets::Reject {
-        reject_added(
-            &redacted.findings,
-            "the changes add what look like secrets, so git-agent didn't commit them",
-            "Take them out of the changes.",
-        )?;
-    }
+    check_changes(
+        &repo,
+        scope,
+        config.on_secrets,
+        &redacted.findings,
+        &COMMIT_SECRETS,
+    )?;
     report_secrets(
         &redacted.findings,
         "If they are real, take them out of the files before you commit.",
@@ -295,7 +314,7 @@ async fn generate(args: &GenerateArgs, overrides: &Overrides) -> Result<()> {
     if args.commit {
         commit(&repo, &message, scope, &args.git_args, &leave_out)?;
         if args.push {
-            check_outgoing(&repo, &config).context(NOT_PUSHED)?;
+            check_outgoing(&repo, config.on_secrets).context(NOT_PUSHED)?;
             push(&repo, false).context(NOT_PUSHED)?;
         }
         return Ok(());
@@ -322,7 +341,7 @@ async fn generate(args: &GenerateArgs, overrides: &Overrides) -> Result<()> {
     };
     commit(&repo, &message, scope, &args.git_args, &leave_out)?;
     if acceptance.pushes() || args.push {
-        check_outgoing(&repo, &config).context(NOT_PUSHED)?;
+        check_outgoing(&repo, config.on_secrets).context(NOT_PUSHED)?;
         push(&repo, true).context(NOT_PUSHED)?;
     }
     Ok(())
@@ -413,19 +432,6 @@ async fn pull_request(args: &PrArgs, overrides: &Overrides) -> Result<()> {
         ));
     }
 
-    if config.on_secrets == OnSecrets::Reject {
-        // Commit by commit rather than the branch's overall diff: a secret added
-        // in one commit and removed in a later one is still in the history a
-        // push publishes.
-        let patches = repo.commit_patches(&[&format!("{base_ref}..HEAD")], &config.exclude)?;
-        reject_added(
-            &scan_commits(&patches),
-            "the branch's commits add what look like secrets, so git-agent won't open a pull \
-             request for it",
-            "Remove them from the branch's history, for example with `git rebase -i`, and \
-             revoke any that were pushed already.",
-        )?;
-    }
     let redacted = redact::diff(&changes.diff);
     changes.diff = redacted.text;
     let mut findings = redacted.findings;
@@ -435,6 +441,15 @@ async fn pull_request(args: &PrArgs, overrides: &Overrides) -> Result<()> {
         commit.message = redacted.text;
         findings.extend(redacted.findings);
     }
+    // Commit by commit rather than the branch's overall diff: a secret added in one commit and
+    // removed in a later one is still in the history a push publishes.
+    check_commits(
+        &repo,
+        &[&format!("{base_ref}..HEAD")],
+        config.on_secrets,
+        &findings,
+        &PULL_REQUEST_SECRETS,
+    )?;
     report_secrets(
         &findings,
         "They are in the branch's commits. If they are real, remove them from its history \
@@ -702,6 +717,12 @@ async fn tidy_commits(args: &TidyArgs, overrides: &Overrides) -> Result<()> {
             list_findings(&added)
         ));
     }
+    warn_about_commits(
+        &repo,
+        &[&range],
+        &findings,
+        "the commits add what look like secrets that the model doesn't read",
+    )?;
 
     let (server, model) = connect(&config).await?;
     let room = model
@@ -1200,7 +1221,7 @@ fn create_pull_request(
 ) -> Result<()> {
     const NOT_PUSHED: &str = "the branch was not pushed, so no pull request was created";
     if repo.has_unpushed_commits()? {
-        check_outgoing(repo, config).context(NOT_PUSHED)?;
+        check_outgoing(repo, config.on_secrets).context(NOT_PUSHED)?;
         ui::info(format!(
             "Pushing {} so GitHub has its commits.",
             pull_request.head

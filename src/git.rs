@@ -731,12 +731,7 @@ impl Repo {
     pub fn commit_patches(&self, range: &[&str], exclude: &[String]) -> Result<Vec<CommitPatch>> {
         let excludes = exclude_pathspecs(exclude);
         let marks = LogMarks::new();
-        let format = format!(
-            "--format={}%h{}%B{}",
-            marks.record_format(),
-            marks.field_format(),
-            marks.field_format()
-        );
+        let format = marks.patch_format();
         let mut args = vec![
             "log",
             "--patch",
@@ -752,21 +747,58 @@ impl Repo {
             text: self.git_readable(&args)?,
             marks,
         };
-        let commits = log.records(3).into_iter().filter_map(|parts| {
-            let mut parts = parts.into_iter();
-            let hash = parts.next()?.trim();
-            (!hash.is_empty()).then(|| CommitPatch {
-                hash: hash.to_owned(),
-                message: parts.next().unwrap_or_default().trim().to_owned(),
-                patch: parts.next().unwrap_or_default().to_owned(),
-            })
-        });
-        Ok(commits.collect())
+        Ok(log.patches())
     }
 
-    /// The commits a push of HEAD would send: those no remote-tracking branch has.
-    pub fn outgoing_patches(&self, exclude: &[String]) -> Result<Vec<CommitPatch>> {
-        self.commit_patches(&["HEAD", "--not", "--remotes"], exclude)
+    /// What a commit in `scope` will hold, read for the secret checks rather than for the
+    /// model: every file, whatever `exclude` says, with git's settings that change a diff
+    /// pinned, and HEAD as it is rather than as a replacement (`git replace`) shows it. The
+    /// Tracked scope reads from HEAD, so what's staged meanwhile is read too.
+    pub fn changes_to_publish(&self, scope: Scope) -> Result<String> {
+        let base = match scope {
+            Scope::Staged => "--cached".to_owned(),
+            Scope::Tracked => match self.resolve("HEAD")? {
+                Some(head) => head,
+                None => self.empty_tree()?,
+            },
+        };
+        let mut args = vec![
+            "--no-replace-objects",
+            "-c",
+            "diff.suppressBlankEmpty=false",
+            "diff",
+            &base,
+        ];
+        args.extend(PUBLISHED_DIFF);
+        args.extend(["--", ":/"]);
+        self.git_readable(&args)
+    }
+
+    /// The commits `range` (`git log` arguments) publishes, with their patches, read for the
+    /// secret checks: every commit and every file, what a merge adds itself, and the root
+    /// commit's diff, whatever the user's settings say.
+    pub fn published_commits(&self, range: &[&str]) -> Result<Vec<CommitPatch>> {
+        let marks = LogMarks::new();
+        let format = marks.patch_format();
+        let mut args = vec![
+            "--no-replace-objects",
+            "-c",
+            "diff.suppressBlankEmpty=false",
+            "log",
+            "--patch",
+            "--cc",
+            "--root",
+            "--no-show-signature",
+            &format,
+        ];
+        args.extend(PUBLISHED_DIFF);
+        args.extend_from_slice(range);
+        args.push("--");
+        let log = MarkedLog {
+            text: self.git_readable(&args)?,
+            marks,
+        };
+        Ok(log.patches())
     }
 
     /// The commits on HEAD that `base` lacks, oldest first, without merges.
@@ -1489,6 +1521,20 @@ impl MarkedLog {
             .collect()
     }
 
+    /// The commits of output in [`LogMarks::patch_format`], with their patches.
+    fn patches(&self) -> Vec<CommitPatch> {
+        let commits = self.records(3).into_iter().filter_map(|parts| {
+            let mut parts = parts.into_iter();
+            let hash = parts.next()?.trim();
+            (!hash.is_empty()).then(|| CommitPatch {
+                hash: hash.to_owned(),
+                message: parts.next().unwrap_or_default().trim().to_owned(),
+                patch: parts.next().unwrap_or_default().to_owned(),
+            })
+        });
+        commits.collect()
+    }
+
     /// The output as git wrote it.
     #[cfg(test)]
     pub fn text(&self) -> &str {
@@ -1531,6 +1577,12 @@ impl LogMarks {
     fn field_format(&self) -> String {
         format!("%x1f{}", self.value)
     }
+
+    /// The `--format` of a commit's hash and message, before its patch.
+    fn patch_format(&self) -> String {
+        let field = self.field_format();
+        format!("--format={}%h{field}%B{field}", self.record_format())
+    }
 }
 
 /// 32 hex digits from the random keys the standard library draws for its hash maps, which it
@@ -1544,6 +1596,20 @@ fn random_hex() -> String {
     };
     format!("{:016x}{:016x}", half(0), half(1))
 }
+
+/// The options of a diff read for the secret checks: no textconv, and the settings that change
+/// what a diff shows pinned to git's defaults.
+const PUBLISHED_DIFF: [&str; 9] = [
+    "--no-color",
+    "--no-ext-diff",
+    "--no-textconv",
+    "--irreversible-delete",
+    "--find-renames",
+    "--unified=3",
+    "--full-index",
+    "--src-prefix=a/",
+    "--dst-prefix=b/",
+];
 
 /// Pathspecs that leave `patterns` out of a diff, matched from the repository root.
 fn exclude_pathspecs(patterns: &[String]) -> Vec<String> {
@@ -1959,12 +2025,13 @@ mod tests {
             ]
         );
         assert!(patches[1].patch.contains("diff --git a/lib.rs b/lib.rs"));
-        assert_eq!(repo.outgoing_patches(&[]).unwrap().len(), 2);
+        let outgoing = ["HEAD", "--not", "--remotes"];
+        assert_eq!(repo.published_commits(&outgoing).unwrap().len(), 2);
 
         assert!(repo.has_unpushed_commits().unwrap());
         repo.push().unwrap();
         assert!(!repo.has_unpushed_commits().unwrap());
-        assert!(repo.outgoing_patches(&[]).unwrap().is_empty());
+        assert!(repo.published_commits(&outgoing).unwrap().is_empty());
         assert!(!repo.has_uncommitted_changes().unwrap());
         fs::write(dir.path().join("lib.rs"), "fn d() {}\n").unwrap();
         assert!(repo.has_uncommitted_changes().unwrap());

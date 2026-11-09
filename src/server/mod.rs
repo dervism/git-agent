@@ -10,7 +10,7 @@ mod http;
 mod openai;
 
 use crate::config::Config;
-use crate::providers;
+use crate::{providers, safe_text};
 use anthropic::Anthropic;
 use anyhow::Result;
 use openai::OpenAiCompatible;
@@ -74,13 +74,49 @@ impl ModelInfo {
     }
 }
 
+/// What goes to a model: which model, and the conversation, with its control and invisible
+/// characters escaped so that a file can't hide instructions from the person reviewing its
+/// diff. [`Request::new`] is the only way to make one, so nothing reaches a model unescaped.
+/// Patches aren't made from this text, so commits are unchanged.
+pub struct Request<'a> {
+    model: &'a str,
+    messages: Vec<Message>,
+}
+
+impl<'a> Request<'a> {
+    pub fn new(model: &'a str, conversation: &[Message]) -> Self {
+        let messages = conversation
+            .iter()
+            .map(|message| Message {
+                role: message.role,
+                content: safe_text::escaped(&message.content),
+            })
+            .collect();
+        Self { model, messages }
+    }
+
+    pub fn model(&self) -> &str {
+        self.model
+    }
+
+    /// The conversation as it goes to the model, escaped.
+    pub fn messages(&self) -> &[Message] {
+        &self.messages
+    }
+}
+
+/// A model's reply, as the server gave it.
+pub struct Reply {
+    pub text: String,
+}
+
 /// What git-agent needs from a model server.
 pub trait ModelServer {
     /// The server's models, with what it reports about each.
     async fn models(&self) -> Result<Vec<ModelInfo>>;
 
-    /// Sends `messages` to `model` and returns the text of its reply.
-    async fn complete(&self, model: &str, messages: &[Message]) -> Result<String>;
+    /// Sends `request` to its model and returns the reply.
+    async fn complete(&self, request: &Request<'_>) -> Result<Reply>;
 }
 
 /// The model server a config points at, speaking the API it offers.
@@ -112,52 +148,32 @@ impl ModelServer for Server {
         }
     }
 
-    async fn complete(&self, model: &str, messages: &[Message]) -> Result<String> {
+    async fn complete(&self, request: &Request<'_>) -> Result<Reply> {
         match self {
-            Self::OpenAi(server) => server.complete(model, messages).await,
-            Self::Anthropic(server) => server.complete(model, messages).await,
+            Self::OpenAi(server) => server.complete(request).await,
+            Self::Anthropic(server) => server.complete(request).await,
         }
     }
 }
 
 #[cfg(test)]
 pub mod test_support {
-    use super::{Message, ModelInfo, ModelServer};
-    use crate::prompt;
+    use super::{Message, ModelInfo, ModelServer, Reply, Request};
     use anyhow::Result;
-    use std::cell::{Cell, RefCell};
+    use std::cell::RefCell;
 
-    /// A model that replies with fixed text, keeps what it was sent, and can do something
-    /// while the user waits for its reply.
+    /// A model that always gives the same reply, and keeps each conversation it was sent.
     pub struct FakeServer<'a> {
-        pub plans: RefCell<Vec<&'a str>>,
-        pub message: &'a str,
-        pub message_requests: Cell<usize>,
+        reply: &'a str,
         pub received: RefCell<Vec<Vec<Message>>>,
-        during_plan: RefCell<Option<Box<dyn FnOnce() + 'a>>>,
-        during_message: RefCell<Option<Box<dyn FnOnce() + 'a>>>,
     }
 
     impl<'a> FakeServer<'a> {
-        pub fn new(plan: &'a str, message: &'a str) -> Self {
+        pub fn replying(reply: &'a str) -> Self {
             Self {
-                plans: RefCell::new(vec![plan]),
-                message,
-                message_requests: Cell::new(0),
+                reply,
                 received: RefCell::new(Vec::new()),
-                during_plan: RefCell::new(None),
-                during_message: RefCell::new(None),
             }
-        }
-
-        pub fn during_plan(self, action: impl FnOnce() + 'a) -> Self {
-            *self.during_plan.borrow_mut() = Some(Box::new(action));
-            self
-        }
-
-        pub fn during_message(self, action: impl FnOnce() + 'a) -> Self {
-            *self.during_message.borrow_mut() = Some(Box::new(action));
-            self
         }
     }
 
@@ -166,25 +182,34 @@ pub mod test_support {
             Ok(Vec::new())
         }
 
-        async fn complete(&self, _model: &str, messages: &[Message]) -> Result<String> {
-            self.received.borrow_mut().push(messages.to_vec());
-            if messages[0].content == prompt::SPLIT_PROMPT {
-                if let Some(action) = self.during_plan.borrow_mut().take() {
-                    action();
-                }
-                let mut plans = self.plans.borrow_mut();
-                let plan = if plans.len() > 1 {
-                    plans.remove(0)
-                } else {
-                    plans[0]
-                };
-                return Ok(plan.to_owned());
-            }
-            self.message_requests.set(self.message_requests.get() + 1);
-            if let Some(action) = self.during_message.borrow_mut().take() {
-                action();
-            }
-            Ok(self.message.to_owned())
+        async fn complete(&self, request: &Request<'_>) -> Result<Reply> {
+            self.received.borrow_mut().push(request.messages().to_vec());
+            Ok(Reply {
+                text: self.reply.to_owned(),
+            })
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn escapes_what_goes_to_the_model_and_keeps_the_rest() {
+        let conversation = [
+            Message::system("rules"),
+            Message::user("+ blåbær\u{e0041}\r\n+ \u{1b}[2J Kjøre.txt\u{202e}"),
+        ];
+        let request = Request::new("m", &conversation);
+        assert_eq!(request.model(), "m");
+        let sent = request.messages();
+        assert_eq!(sent[0].role, conversation[0].role);
+        assert_eq!(sent[1].role, conversation[1].role);
+        assert_eq!(sent[0].content, "rules");
+        assert_eq!(
+            sent[1].content,
+            "+ blåbær\\363\\240\\201\\201\r\n+ \\033[2J Kjøre.txt\\342\\200\\256"
+        );
     }
 }

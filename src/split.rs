@@ -14,7 +14,7 @@ pub mod flow;
 pub mod kinds;
 pub mod signals;
 
-use crate::fit;
+use crate::conversation::fit;
 use crate::git::{diff, lossless, names};
 use crate::safe_text::{escaped, without_hidden};
 use anyhow::{Context, Result, bail};

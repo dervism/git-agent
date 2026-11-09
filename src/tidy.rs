@@ -7,7 +7,7 @@
 //! `squash! <subject>` always fold into their target, as `git rebase
 //! --autosquash` would do.
 
-use crate::fit;
+use crate::conversation::fit;
 use crate::safe_text::{escaped, one_line};
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};

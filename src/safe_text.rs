@@ -163,6 +163,12 @@ fn escape(character: char, out: &mut String) {
     }
 }
 
+/// Trims trailing whitespace from every line and blank lines around the text.
+pub fn normalize(text: &str) -> String {
+    let lines: Vec<&str> = text.lines().map(str::trim_end).collect();
+    lines.join("\n").trim_matches('\n').to_owned()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -332,5 +338,13 @@ mod tests {
         ] {
             assert!(!is_unsafe_to_show(safe), "{safe:?}");
         }
+    }
+
+    #[test]
+    fn normalizes_line_ends_and_the_blank_lines_around_the_text() {
+        assert_eq!(normalize("\n\nfeat: x  \n\nbody\t\n\n"), "feat: x\n\nbody");
+        assert_eq!(normalize("  kept indent\n"), "  kept indent");
+        assert_eq!(normalize("a\r\nb"), "a\nb");
+        assert_eq!(normalize(""), "");
     }
 }

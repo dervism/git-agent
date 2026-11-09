@@ -1,7 +1,7 @@
 //! Anthropic's Messages API, which Anthropic recommends for its models.
 
 use super::http::Http;
-use super::{Message, ModelInfo, ModelServer, Role};
+use super::{Message, ModelInfo, ModelServer, Reply, Request, Role};
 use crate::config::Config;
 use anyhow::{Result, bail};
 use reqwest::RequestBuilder;
@@ -51,11 +51,12 @@ impl ModelServer for Anthropic {
         Ok(models.collect())
     }
 
-    async fn complete(&self, model: &str, messages: &[Message]) -> Result<String> {
+    async fn complete(&self, request: &Request<'_>) -> Result<Reply> {
         let url = format!("{}/messages", self.base_url);
-        let body = MessagesRequest::new(model, messages, self.max_tokens);
+        let body = MessagesRequest::new(request.model(), request.messages(), self.max_tokens);
         let response: MessagesResponse = self.send(self.http.post(&url).json(&body), &url).await?;
-        response.into_text(self.max_tokens)
+        let text = response.into_text(self.max_tokens)?;
+        Ok(Reply { text })
     }
 }
 

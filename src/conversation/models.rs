@@ -105,7 +105,7 @@ pub fn choose(models: Vec<ModelInfo>) -> Result<ModelInfo> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::server::Message;
+    use crate::server::{Reply, Request};
 
     fn info(id: &str, loaded: Option<bool>) -> ModelInfo {
         ModelInfo {
@@ -125,7 +125,7 @@ mod tests {
             }
         }
 
-        async fn complete(&self, _model: &str, _messages: &[Message]) -> Result<String> {
+        async fn complete(&self, _request: &Request<'_>) -> Result<Reply> {
             unreachable!("choosing a model sends no conversation")
         }
     }

@@ -4,14 +4,13 @@ mod api_keys;
 mod branch;
 mod cli;
 mod config;
+mod conversation;
 mod explain;
-mod fit;
 mod git;
 mod github;
 #[cfg(test)]
 mod layers;
 mod menu;
-mod models;
 mod prompt;
 mod providers;
 mod redact;
@@ -30,11 +29,14 @@ use cli::{
     BranchArgs, Command, ConfigCommand, ExplainArgs, GenerateArgs, PrArgs, TidyArgs, WhyArgs,
 };
 use config::{Config, OnSecrets, Overrides};
-use fit::Kept;
+use conversation::models::{self, Model};
+use conversation::{
+    commit_message, connect, conversation_tokens, discuss, generate_message, report_fit,
+    report_model, separated,
+};
 use git::{Changes, CommitPatch, Repo, Scope};
 use github::PullRequest;
-use models::{ContextSource, Model, Pick};
-use prompt::{Fit, Work};
+use prompt::Work;
 use redact::{Change, Finding};
 use server::{Message, ModelServer, Server};
 use split::signals::Stopped;
@@ -218,7 +220,7 @@ async fn generate(args: &GenerateArgs, overrides: &Overrides) -> Result<()> {
     );
 
     let (server, model) = connect(&config).await?;
-    let (conversation, fit) = prompt::initial_messages(
+    let (conversation, fit) = conversation::initial_messages(
         &config.system_prompt,
         &changes,
         args.hint.as_deref(),
@@ -669,12 +671,12 @@ async fn tidy_commits(args: &TidyArgs, overrides: &Overrides) -> Result<()> {
     }
 
     let (server, model) = connect(&config).await?;
-    let room = prompt::room(
+    let room = conversation::room(
         prompt::TIDY_PROMPT,
         model.context_length,
         config.max_output_tokens,
     )
-    .saturating_sub(prompt::notes_bytes(args.hint.as_deref()));
+    .saturating_sub(conversation::notes_bytes(args.hint.as_deref()));
     let text = redact::text(&tidy::describe(&commits, room), "commits").text;
     let conversation = prompt::tidy_messages(&text, args.hint.as_deref());
     report_model(&model, conversation_tokens(&conversation));
@@ -846,7 +848,7 @@ impl Tidier<'_> {
             if let Some(extra) = &args.hint {
                 hint = format!("{hint}\n{extra}");
             }
-            let (conversation, fit) = prompt::initial_messages(
+            let (conversation, fit) = conversation::initial_messages(
                 &config.system_prompt,
                 &changes,
                 Some(&hint),
@@ -1000,12 +1002,12 @@ async fn explain_lines(args: &WhyArgs, overrides: &Overrides) -> Result<()> {
     );
 
     let (server, model) = connect(&config).await?;
-    let room = prompt::room(
+    let room = conversation::room(
         prompt::WHY_PROMPT,
         model.context_length,
         config.max_output_tokens,
     )
-    .saturating_sub(prompt::question_bytes(args.question.as_deref()));
+    .saturating_sub(conversation::question_bytes(args.question.as_deref()));
     let intro = why::intro(&target, lines, &uncommitted, &excerpt.text, &blame.text);
     let described = why::describe(&intro, &history, complete, room);
     let conversation = prompt::why_messages(&described.text, args.question.as_deref());
@@ -1159,59 +1161,6 @@ async fn explain_commits(args: &ExplainArgs, overrides: &Overrides) -> Result<()
     discuss(&server, &model, &config, &subject.heading, conversation).await
 }
 
-/// Shows the model's answer to `conversation` under `heading`, then answers
-/// follow-up questions until the user is done or the context is full.
-async fn discuss(
-    server: &impl ModelServer,
-    model: &Model,
-    config: &Config,
-    heading: &str,
-    mut conversation: Vec<Message>,
-) -> Result<()> {
-    let mut answer = generate_message(server, model, &conversation).await?;
-    ui::show_answer(heading, &answer);
-    if !io::stdin().is_terminal() || !ui::stdout_is_terminal() {
-        return Ok(());
-    }
-    while let Some(question) = ui::ask_follow_up()? {
-        let next = prompt::follow_up(&conversation, &answer, &question);
-        if !prompt::has_room(&next, model.context_length, config.max_output_tokens) {
-            ui::info(ui::dim(
-                "The conversation no longer fits in the model's context; ask your question in a \
-                 new run.",
-            ));
-            return Ok(());
-        }
-        // A failed reply keeps the conversation as it was, so the user can ask again.
-        match generate_message(server, model, &next).await {
-            Ok(reply) => {
-                conversation = next;
-                answer = reply;
-                ui::show_answer(heading, &answer);
-            }
-            Err(err) => ui::error(&err),
-        }
-    }
-    Ok(())
-}
-
-fn conversation_tokens(conversation: &[Message]) -> usize {
-    conversation
-        .iter()
-        .map(|message| prompt::estimate_tokens(&message.content))
-        .sum()
-}
-
-/// Connects to the configured server and picks the model to use.
-async fn connect(config: &Config) -> Result<(Server, Model)> {
-    let server = Server::connect(config)?;
-    if config.temperature.is_some() && !server.takes_temperature() {
-        ui::warn("Anthropic's API takes no temperature, so git-agent doesn't send the one you set");
-    }
-    let model = models::resolve(&server, config).await?;
-    Ok((server, model))
-}
-
 /// Lets the user review `text` until they accept or quit it, revising it as
 /// they ask; `clean` checks and tidies each new reply from the model. Returns
 /// the accept choice and the final text, or `None` on quit.
@@ -1234,7 +1183,8 @@ async fn review<T: Copy>(
                 .and_then(&clean)
                 .map(Some),
             Action::Refine(feedback) => {
-                let refined = prompt::refine_messages(conversation, &text, &feedback, review.what);
+                let refined =
+                    conversation::refine_messages(conversation, &text, &feedback, review.what);
                 generate_message(server, model, &refined)
                     .await
                     .and_then(&clean)
@@ -1381,182 +1331,6 @@ fn list_findings(findings: &[&Finding]) -> String {
         lines.push(format!("   … and {} more", findings.len() - SHOWN));
     }
     lines.join("\n")
-}
-
-/// Says which model gets the changes and, if they didn't fit its context, what
-/// was left out. `noun` names what the model writes; `smaller` says how to
-/// send less at a time, if there is a way.
-fn report_fit(model: &Model, fit: &Fit, noun: &str, smaller: Option<&str>) {
-    report_model(model, fit.prompt_tokens);
-    if fit.is_complete() {
-        if fit.context_trimmed {
-            ui::info(ui::dim(
-                "   To fit, git-agent left out the unchanged lines around the changes; \
-                 every changed line was sent.",
-            ));
-        }
-        return;
-    }
-    report_shortened(model, fit, noun, smaller);
-}
-
-/// Says which model gets the prompt, and how much of its context the prompt takes.
-fn report_model(model: &Model, prompt_tokens: usize) {
-    let chosen = match model.picked {
-        Some(Pick::Loaded) => " (loaded on the server)",
-        Some(Pick::Only) => " (the server's only model)",
-        None => "",
-    };
-    ui::info(format!(
-        "🤖 {}{chosen} {}",
-        safe_text::one_line(&model.id),
-        ui::dim(&format!(
-            "· prompt about {} of {} context tokens",
-            thousands(prompt_tokens),
-            thousands(model.context_length)
-        ))
-    ));
-    if model.context_source == ContextSource::Assumed {
-        ui::info(ui::dim(&format!(
-            "   The server didn't report the model's context length, so git-agent assumes {} \
-             tokens.\n   If the model has more, set `context_length` in the config file or pass \
-             --context-length.",
-            thousands(model.context_length)
-        )));
-    }
-}
-
-/// Lists what was left out of changes that didn't fit, and how to send more.
-fn report_shortened(model: &Model, fit: &Fit, noun: &str, smaller: Option<&str>) {
-    ui::warn(format!(
-        "the changes need about {} tokens, more than fit in the context, so git-agent sent \
-         part of them:",
-        thousands(fit.full_tokens)
-    ));
-    let whole = fit.files.iter().filter(|file| file.is_whole()).count();
-    let cut: Vec<String> = fit
-        .files
-        .iter()
-        .filter(|file| file.kept == Kept::Start)
-        .map(|file| {
-            format!(
-                "{} ({} of {} changed lines)",
-                file.path, file.kept_changed_lines, file.changed_lines
-            )
-        })
-        .collect();
-    let dropped: Vec<String> = fit
-        .files
-        .iter()
-        .filter(|file| file.is_dropped())
-        .map(|file| file.path.clone())
-        .collect();
-    ui::info(format!(
-        "   {whole} of {} files in full, without the unchanged lines around the changes",
-        fit.files.len()
-    ));
-    if !cut.is_empty() {
-        ui::info(format!("   {} cut short: {}", cut.len(), first_few(&cut)));
-    }
-    if !dropped.is_empty() {
-        ui::info(format!(
-            "   {} by name only: {}",
-            dropped.len(),
-            first_few(&dropped)
-        ));
-    }
-    if fit.list_lines_left_out > 0 {
-        ui::info(format!(
-            "   {} files left out of the file list too",
-            fit.list_lines_left_out
-        ));
-    }
-    if fit.commit_bodies_left_out {
-        ui::info("   the commits by their subjects only, without the rest of their messages");
-    }
-    if fit.commits_left_out > 0 {
-        ui::info(format!(
-            "   {} commits left out of the commit list",
-            fit.commits_left_out
-        ));
-    }
-    let larger_context = match model.context_source {
-        ContextSource::Server => "load the model with a larger context length",
-        ContextSource::Config => "raise `context_length` if the model allows more",
-        ContextSource::Assumed => "set `context_length` if the model has more",
-    };
-    let ways = match smaller {
-        Some(smaller) => format!("{smaller}, or {larger_context}"),
-        None => larger_context.to_owned(),
-    };
-    ui::info(ui::dim(&format!(
-        "   The {noun} may miss details from these files. To send more, {ways}."
-    )));
-}
-
-/// The first three items, then how many more there are.
-fn first_few(items: &[String]) -> String {
-    const SHOWN: usize = 3;
-    let mut text = items[..items.len().min(SHOWN)].join(", ");
-    if items.len() > SHOWN {
-        text.push_str(&format!(", and {} more", items.len() - SHOWN));
-    }
-    text
-}
-
-/// Asks the model, with control and invisible characters escaped on the way out and
-/// taken out of its reply, so that what the user reviews is what gets committed.
-async fn generate_message(
-    server: &impl ModelServer,
-    model: &Model,
-    conversation: &[Message],
-) -> Result<String> {
-    let outgoing = prompt::for_model(conversation);
-    if prompt::outgrew_context(
-        conversation,
-        &outgoing,
-        model.context_length,
-        model.max_output_tokens,
-    ) {
-        bail!(
-            "the changes hold so many control or invisible characters that, escaped, they no \
-             longer fit in the model's context"
-        );
-    }
-    let reply = {
-        let _spinner = ui::Spinner::start(format!(
-            "Generating with {}",
-            safe_text::one_line(&model.id)
-        ));
-        server.complete(&model.id, &outgoing).await?
-    };
-    let cleaned = prompt::clean_reply(&reply);
-    if cleaned.removed > 0 {
-        ui::warn(format!(
-            "the model's reply held {} control or invisible character(s); git-agent removed them",
-            cleaned.removed
-        ));
-    }
-    if cleaned.text.is_empty() {
-        bail!("the model returned an empty message");
-    }
-    Ok(cleaned.text)
-}
-
-/// A commit message from the model, with its subject apart from its body.
-async fn commit_message(
-    server: &impl ModelServer,
-    model: &Model,
-    conversation: &[Message],
-) -> Result<String> {
-    generate_message(server, model, conversation)
-        .await
-        .and_then(separated)
-}
-
-/// A review's way of tidying a new commit message (see [`commit_message`]).
-fn separated(message: String) -> Result<String> {
-    Ok(prompt::separate_subject(&message))
 }
 
 fn commit(
@@ -1706,7 +1480,7 @@ mod tests {
     use super::*;
     use crate::git::test_support::{isolated_repo, run};
     use crate::server::test_support::FakeServer;
-    use models::ContextSource;
+    use conversation::models::ContextSource;
     use tempfile::TempDir;
 
     #[test]
@@ -1869,7 +1643,7 @@ mod tests {
         let (dir, repo) = isolated_repo();
         fs::write(dir.path().join("a.txt"), "a\n").unwrap();
         run(dir.path(), &["add", "--all"]);
-        let server = FakeServer::new("{}", "feat: add\u{1b}[2J a\u{202e}\n\nbody\rtext\u{9b}");
+        let server = FakeServer::replying("feat: add\u{1b}[2J a\u{202e}\n\nbody\rtext\u{9b}");
         let conversation = [Message::user("write a message")];
 
         let message = commit_message(&server, &model(100_000), &conversation)
@@ -1882,41 +1656,5 @@ mod tests {
             run(dir.path(), &["log", "-1", "--format=%B"]).trim_end(),
             message
         );
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn sends_the_model_escaped_text_with_letters_and_line_endings_intact() {
-        let server = FakeServer::new("{}", "feat: x");
-        let conversation = [Message::user("+ blåbær\r\n+ \u{e0041}\u{1b}[2J")];
-
-        generate_message(&server, &model(100_000), &conversation)
-            .await
-            .unwrap();
-
-        let sent = server.received.borrow();
-        assert_eq!(
-            sent[0][0].content,
-            "+ blåbær\r\n+ \\363\\240\\201\\201\\033[2J"
-        );
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn refuses_a_reply_of_only_hidden_characters() {
-        let server = FakeServer::new("{}", "\u{1b}\u{202e}");
-        let error = generate_message(&server, &model(100_000), &[Message::user("x")])
-            .await
-            .unwrap_err();
-        assert_eq!(error.to_string(), "the model returned an empty message");
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn says_why_when_escaping_overfills_the_context() {
-        let server = FakeServer::new("{}", "feat: x");
-        let conversation = [Message::user("\u{1b}".repeat(4000))];
-        let error = generate_message(&server, &model(3000), &conversation)
-            .await
-            .unwrap_err();
-        assert!(error.to_string().contains("no longer fit"), "{error}");
-        assert!(server.received.borrow().is_empty());
     }
 }

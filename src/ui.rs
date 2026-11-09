@@ -6,7 +6,6 @@
 #![allow(clippy::disallowed_methods)]
 
 use crate::git::{self, Repo};
-use crate::prompt;
 use crate::safe_text;
 use anyhow::{Context, Result};
 use std::fmt::Display;
@@ -497,12 +496,12 @@ fn edit(path: &Path, text: &str) -> Result<String> {
 fn strip_edit_help(text: &str) -> String {
     let start = PULL_REQUEST_EDIT_HELP.lines().next().unwrap_or_default();
     let kept = text.find(start).map_or(text, |index| &text[..index]);
-    prompt::normalize(kept)
+    safe_text::normalize(kept)
 }
 
 fn strip_comments(text: &str) -> String {
     let kept: Vec<&str> = text.lines().filter(|line| !line.starts_with('#')).collect();
-    prompt::normalize(&kept.join("\n"))
+    safe_text::normalize(&kept.join("\n"))
 }
 
 /// What the tests of the reviews share.

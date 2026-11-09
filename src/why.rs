@@ -5,7 +5,7 @@
 //! each commit that changed them, with its message and its diff of those lines.
 //! The history follows the lines through renames.
 
-use crate::fit;
+use crate::conversation::fit;
 use crate::git::{Summary, diff};
 use anyhow::{Result, anyhow, bail};
 use std::fmt::Write;

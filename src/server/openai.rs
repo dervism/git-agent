@@ -7,7 +7,7 @@
 //! model list itself.
 
 use super::http::Http;
-use super::{Message, ModelInfo, ModelServer};
+use super::{Message, ModelInfo, ModelServer, Reply, Request};
 use crate::config::Config;
 use anyhow::{Result, anyhow};
 use reqwest::RequestBuilder;
@@ -75,21 +75,22 @@ impl ModelServer for OpenAiCompatible {
         Ok(models)
     }
 
-    async fn complete(&self, model: &str, messages: &[Message]) -> Result<String> {
+    async fn complete(&self, request: &Request<'_>) -> Result<Reply> {
         let url = format!("{}/chat/completions", self.base_url);
         let body = ChatRequest {
-            model,
-            messages,
+            model: request.model(),
+            messages: request.messages(),
             temperature: self.temperature,
             stream: false,
         };
         let response: ChatResponse = self.send(self.http.post(&url).json(&body), &url).await?;
-        response
+        let text = response
             .choices
             .into_iter()
             .next()
             .and_then(|choice| choice.message.content)
-            .ok_or_else(|| anyhow!("the model returned no message"))
+            .ok_or_else(|| anyhow!("the model returned no message"))?;
+        Ok(Reply { text })
     }
 }
 

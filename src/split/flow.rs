@@ -8,14 +8,17 @@ use super::kinds::{self, Kind};
 use super::{Committed, FilePatch, Patch, Plan, Planned, Unit};
 use crate::cli::SplitArgs;
 use crate::config::{Config, OnSecrets, Overrides};
+use crate::conversation::models::Model;
+use crate::conversation::{
+    self, commit_message, connect, conversation_tokens, generate_message, report_fit, report_model,
+    separated,
+};
 use crate::git::worktree::TempWorktree;
 use crate::git::{Changes, Repo, Scope, names};
-use crate::models::Model;
 use crate::server::{Message, ModelServer};
 use crate::ui::{self, Action, Choice, Review};
 use crate::{
-    check_outgoing, commit, commit_message, connect, conversation_tokens, generate_message, prompt,
-    push, redact, reject_added, report_fit, report_model, report_secrets, review, separated, split,
+    check_outgoing, commit, prompt, push, redact, reject_added, report_secrets, review, split,
     staging,
 };
 use anyhow::{Context, Result, bail};
@@ -141,7 +144,7 @@ async fn split_changes<S: ModelServer>(
     server: &S,
     model: &Model,
 ) -> Result<()> {
-    let room = prompt::room(
+    let room = conversation::room(
         prompt::SPLIT_PROMPT,
         model.context_length,
         config.max_output_tokens,
@@ -744,7 +747,7 @@ impl<S: ModelServer> Splitter<'_, S> {
         };
         changes.diff = redact::diff(&changes.diff).text;
         let hint = prompt::split_commit_hint(&planned.title, self.args.hint.as_deref());
-        let (conversation, fit) = prompt::initial_messages(
+        let (conversation, fit) = conversation::initial_messages(
             &self.config.system_prompt,
             &changes,
             Some(&hint),
@@ -799,10 +802,78 @@ fn report_merged(merged: &[String], why: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::conversation::models::ContextSource;
     use crate::git::test_support::{isolated_repo, numbered_lines, run, with_submodule};
-    use crate::models::ContextSource;
-    use crate::server::test_support::FakeServer;
-    use std::cell::RefCell;
+    use crate::server::{ModelInfo, Reply, Request};
+    use std::cell::{Cell, RefCell};
+
+    /// A model for splits: it answers a plan with the plans in line, the last one again once
+    /// they run out, and every message with `message`. It keeps what it was sent, and can do
+    /// something while the user waits for a plan or a message.
+    struct FakeServer<'a> {
+        plans: RefCell<Vec<&'a str>>,
+        message: &'a str,
+        message_requests: Cell<usize>,
+        received: RefCell<Vec<Vec<Message>>>,
+        during_plan: RefCell<Option<Box<dyn FnOnce() + 'a>>>,
+        during_message: RefCell<Option<Box<dyn FnOnce() + 'a>>>,
+    }
+
+    impl<'a> FakeServer<'a> {
+        fn new(plan: &'a str, message: &'a str) -> Self {
+            Self {
+                plans: RefCell::new(vec![plan]),
+                message,
+                message_requests: Cell::new(0),
+                received: RefCell::new(Vec::new()),
+                during_plan: RefCell::new(None),
+                during_message: RefCell::new(None),
+            }
+        }
+
+        fn during_plan(self, action: impl FnOnce() + 'a) -> Self {
+            *self.during_plan.borrow_mut() = Some(Box::new(action));
+            self
+        }
+
+        fn during_message(self, action: impl FnOnce() + 'a) -> Self {
+            *self.during_message.borrow_mut() = Some(Box::new(action));
+            self
+        }
+
+        fn reply(&self, messages: &[Message]) -> String {
+            if messages[0].content == prompt::SPLIT_PROMPT {
+                if let Some(action) = self.during_plan.borrow_mut().take() {
+                    action();
+                }
+                let mut plans = self.plans.borrow_mut();
+                return if plans.len() > 1 {
+                    plans.remove(0)
+                } else {
+                    plans[0]
+                }
+                .to_owned();
+            }
+            self.message_requests.set(self.message_requests.get() + 1);
+            if let Some(action) = self.during_message.borrow_mut().take() {
+                action();
+            }
+            self.message.to_owned()
+        }
+    }
+
+    impl ModelServer for FakeServer<'_> {
+        async fn models(&self) -> Result<Vec<ModelInfo>> {
+            Ok(Vec::new())
+        }
+
+        async fn complete(&self, request: &Request<'_>) -> Result<Reply> {
+            self.received.borrow_mut().push(request.messages().to_vec());
+            Ok(Reply {
+                text: self.reply(request.messages()),
+            })
+        }
+    }
     use std::path::Path;
     use tempfile::TempDir;
 

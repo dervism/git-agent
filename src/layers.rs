@@ -44,8 +44,7 @@ const LAYERS: &[(&str, Layer)] = &[
     ("staging", Shared("staging")),
     ("untracked", Shared("staging")),
     ("redact", Shared("secrets")),
-    ("fit", Shared("conversation")),
-    ("models", Shared("conversation")),
+    ("conversation", Shared("conversation")),
     ("prompt", Shared("conversation")),
     ("api_keys", Core),
     ("config", Core),
@@ -76,11 +75,6 @@ const KNOWN: &[(&str, &str)] = &[
     ("split", "main"),
     // Step 3: git's test of `stage_all_except` with untracked files moves to staging's tests.
     ("git", "untracked"),
-    // Step 3: the fake server's split-specific part moves to split's tests, and server's test
-    // support keeps a generic fake.
-    ("server", "prompt"),
-    // Step 3: `prompt::normalize` moves to `safe_text`.
-    ("ui", "prompt"),
     // Step 5: why's parsers of git's output move to `git/blame.rs`, and git's tests build their
     // line ranges themselves instead of with `why::Target` and `why::head_line`.
     ("git", "why"),
@@ -478,7 +472,7 @@ mod tests {
         let sources = sources();
         let mut sends = calls(&sources, ".complete");
         sends.remove("server");
-        assert_eq!(sends, BTreeMap::from([("main".to_owned(), 1)]));
+        assert_eq!(sends, BTreeMap::from([("conversation".to_owned(), 1)]));
         let mut by_path = calls(&sources, "::complete");
         by_path.remove("server");
         assert!(by_path.is_empty(), "{by_path:?}");

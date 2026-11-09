@@ -238,8 +238,9 @@ fn help<T>(review: &Review<T>) -> String {
 #[cfg(test)]
 pub mod test_support {
     use super::{Choice, Key, Person, Review};
-    use crate::conversation::test_support::ScriptedPerson;
     use anyhow::Result;
+
+    pub use crate::conversation::test_support::ScriptedPerson;
 
     impl Person for ScriptedPerson {
         fn typed_at(&self, _prompt: &str) -> Result<Option<String>> {

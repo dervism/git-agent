@@ -42,6 +42,7 @@ use secrets::redact::{self, Finding};
 use secrets::{added, check_outgoing, list_findings, reject_added, report_secrets, scan_commits};
 use server::{Message, ModelServer, Server};
 use split::signals::Stopped;
+use staging::{For, Staged};
 use std::fs;
 use std::io::{self, IsTerminal};
 use std::path::{Path, PathBuf};
@@ -228,12 +229,13 @@ async fn generate(args: &GenerateArgs, overrides: &Overrides) -> Result<()> {
 
     let config = Config::load(overrides)?.config;
     let repo = Repo::open(".")?;
-    let ask = !args.commit && !args.raw && io::stdin().is_terminal();
+    let may_ask = !args.commit && !args.raw && io::stdin().is_terminal();
+    let asking = may_ask.then_some(&Terminal as &dyn Person);
     let Some(ToCommit {
         scope,
         mut changes,
         leave_out,
-    }) = changes_to_commit(&repo, args, &config, ask)?
+    }) = changes_to_commit(&repo, args, &config, asking)?
     else {
         return Ok(());
     };
@@ -339,16 +341,16 @@ fn changes_to_commit(
     repo: &Repo,
     args: &GenerateArgs,
     config: &Config,
-    ask: bool,
+    asking: Option<&dyn Person>,
 ) -> Result<Option<ToCommit>> {
     staging::refuse_unresolved_conflicts(repo, "committing")?;
-    if args.all && !staging::stage_all_and_report(repo, ask, false)? {
+    if args.all && staging::stage_all_and_report(repo, asking, For::Commit)? == Staged::Quit {
         return Ok(None);
     }
     let found = repo.changes(&config.exclude)?;
     let commits_all = matches!(found, Some((Scope::Tracked, _)));
     let hidden = staging::hidden_pointers(repo, commits_all)?;
-    staging::report_hidden_pointers(&hidden, false);
+    staging::report_hidden_pointers(&hidden, For::Commit);
     if found.is_none() {
         match repo.untracked_count()? {
             0 => ui::info("✨ No changes to commit."),
@@ -1460,7 +1462,7 @@ mod tests {
             let (dir, repo) = conflicted();
             let head = repo.resolve("HEAD").unwrap();
             let error =
-                changes_to_commit(&repo, &generate_args(arguments), &Config::default(), false)
+                changes_to_commit(&repo, &generate_args(arguments), &Config::default(), None)
                     .map(|_| ())
                     .unwrap_err();
             let message = format!("{error:#}");
@@ -1485,7 +1487,7 @@ mod tests {
         fs::write(dir.path().join("f.txt"), "resolved\n").unwrap();
         fs::write(dir.path().join("Kjøre plan.txt"), "resolved\n").unwrap();
         run(dir.path(), &["add", "--all"]);
-        let found = changes_to_commit(&repo, &generate_args(&[]), &Config::default(), false)
+        let found = changes_to_commit(&repo, &generate_args(&[]), &Config::default(), None)
             .unwrap()
             .expect("the resolved changes");
         assert_eq!(found.scope, Scope::Staged);
@@ -1495,7 +1497,7 @@ mod tests {
     fn finds_nothing_to_commit_in_a_clean_repository() {
         let (_dir, repo) = isolated_repo();
         let found =
-            changes_to_commit(&repo, &generate_args(&[]), &Config::default(), false).unwrap();
+            changes_to_commit(&repo, &generate_args(&[]), &Config::default(), None).unwrap();
         assert!(found.is_none());
     }
 
@@ -1512,7 +1514,7 @@ mod tests {
         );
         fs::write(dir.path().join("lib.rs"), "fn b() {}\n").unwrap();
 
-        let found = changes_to_commit(&repo, &generate_args(&["--all"]), &Config::default(), false)
+        let found = changes_to_commit(&repo, &generate_args(&["--all"]), &Config::default(), None)
             .unwrap()
             .expect("the change to lib.rs");
         assert_eq!(found.scope, Scope::Staged);
@@ -1526,14 +1528,14 @@ mod tests {
         crate::git::test_support::move_pointer(dir.path(), &moved);
         fs::write(dir.path().join("lib.rs"), "fn b() {}\n").unwrap();
         let args = generate_args(&[]);
-        let tracked = changes_to_commit(&repo, &args, &Config::default(), false)
+        let tracked = changes_to_commit(&repo, &args, &Config::default(), None)
             .unwrap()
             .unwrap();
         assert_eq!(tracked.scope, Scope::Tracked);
         assert_eq!(tracked.leave_out, ["library"]);
 
         run(dir.path(), &["add", "lib.rs"]);
-        let staged = changes_to_commit(&repo, &args, &Config::default(), false)
+        let staged = changes_to_commit(&repo, &args, &Config::default(), None)
             .unwrap()
             .unwrap();
         assert_eq!(staged.scope, Scope::Staged);

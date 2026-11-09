@@ -18,8 +18,9 @@ use crate::git::{Changes, Repo, Scope, names};
 use crate::review::{self, Action, Choice, Person, Review, Revisions, Terminal};
 use crate::secrets::{check_outgoing, redact, reject_added, report_secrets};
 use crate::server::{Message, ModelServer};
+use crate::staging::{self, For, Staged};
 use crate::ui;
-use crate::{commit, prompt, push, split, staging};
+use crate::{commit, prompt, push, split};
 use anyhow::{Context, Result, bail};
 use std::fs;
 use std::io::{self, IsTerminal};
@@ -119,11 +120,12 @@ fn changes_to_split(repo: &Repo, args: &SplitArgs, config: &Config) -> Result<Op
         bail!("{operation} is in progress; finish or abort it before splitting changes");
     }
     staging::refuse_unresolved_conflicts(repo, "splitting changes")?;
-    let ask = !args.commit && io::stdin().is_terminal();
-    if args.all && !staging::stage_all_and_report(repo, ask, true)? {
+    let may_ask = !args.commit && io::stdin().is_terminal();
+    let asking = may_ask.then_some(&Terminal as &dyn Person);
+    if args.all && staging::stage_all_and_report(repo, asking, For::Split)? == Staged::Quit {
         return Ok(None);
     }
-    staging::report_hidden_pointers(&staging::hidden_pointers(repo, false)?, true);
+    staging::report_hidden_pointers(&staging::hidden_pointers(repo, false)?, For::Split);
     let Some((scope, changes)) = repo.changes(&config.exclude)? else {
         ui::info("✨ No changes to split.");
         return Ok(None);

@@ -3,6 +3,7 @@
 mod untracked;
 
 use crate::git::{IndexEntry, Repo, names, shell_quote};
+use crate::review::Person;
 use crate::ui;
 use anyhow::{Context, Result, bail};
 use std::collections::HashSet;
@@ -40,28 +41,44 @@ fn listed(names_to_show: &[String]) -> String {
     lines.join("\n")
 }
 
+/// What `--all` stages for, which changes what its notes say.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum For {
+    Commit,
+    Split,
+}
+
+/// What `--all` did.
+#[derive(Debug, Clone, Copy, PartialEq)]
+#[must_use]
+pub enum Staged {
+    /// It staged everything it should.
+    All,
+    /// The user quit, and nothing was staged.
+    Quit,
+}
+
 /// Stages everything for a command's `--all`, after checking the untracked files for
 /// build output, dependencies, secrets and large files that a `.gitignore`
-/// should keep out. With `ask`, the user decides what happens to them;
-/// otherwise they are left out.
+/// should keep out. If git-agent may ask, the person `asking` names decides what happens to
+/// them; otherwise they are left out.
 ///
 /// A hidden submodule pointer the user staged stays exactly as they staged it, as does a
 /// staged removal of one, whatever the work tree holds now; those the work tree has moved on
-/// from get a note. `splitting` says whether the note is for a split. Returns `false`, having
-/// said so, if the user quit.
-pub fn stage_all_and_report(repo: &Repo, ask: bool, splitting: bool) -> Result<bool> {
-    let Some(kept) = stage_all(repo, ask)? else {
+/// from get a note, worded for what the staging is `for_`. Says so if the user quit.
+pub fn stage_all_and_report(repo: &Repo, asking: Option<&dyn Person>, for_: For) -> Result<Staged> {
+    let Some(kept) = stage_all(repo, asking)? else {
         ui::info("Nothing staged or committed.");
-        return Ok(false);
+        return Ok(Staged::Quit);
     };
-    report_kept(&kept, splitting);
-    Ok(true)
+    report_kept(&kept, for_);
+    Ok(Staged::All)
 }
 
 /// Stages everything as [`stage_all_and_report`] describes. Returns `None` if the user quit,
 /// and otherwise the pointers it kept that the work tree has moved on from.
-fn stage_all(repo: &Repo, ask: bool) -> Result<Option<Kept>> {
-    let Some(staged) = stage_all_but_findings(repo, ask)? else {
+fn stage_all(repo: &Repo, asking: Option<&dyn Person>) -> Result<Option<Kept>> {
+    let Some(staged) = stage_all_but_findings(repo, asking)? else {
         return Ok(None);
     };
     let kept: Vec<String> = staged.into_iter().map(|entry| entry.path).collect();
@@ -72,7 +89,10 @@ fn stage_all(repo: &Repo, ask: bool) -> Result<Option<Kept>> {
 /// Stages everything but the untracked files that should be ignored, as
 /// [`stage_all_and_report`] describes. Returns `None` if the user quit, and otherwise the hidden entries the user had
 /// staged, which it kept.
-fn stage_all_but_findings(repo: &Repo, ask: bool) -> Result<Option<Vec<IndexEntry>>> {
+fn stage_all_but_findings(
+    repo: &Repo,
+    asking: Option<&dyn Person>,
+) -> Result<Option<Vec<IndexEntry>>> {
     let top = repo.toplevel()?;
     let findings = untracked::check(&top, &repo.untracked_files()?);
     if findings.is_empty() {
@@ -80,15 +100,15 @@ fn stage_all_but_findings(repo: &Repo, ask: bool) -> Result<Option<Vec<IndexEntr
     }
     ui::warn("some untracked files look like they should be ignored rather than committed:");
     ui::info(untracked::list(&findings));
-    if !ask {
+    let Some(person) = asking else {
         let staged = add_all(repo, &untracked::exclude(&findings))?;
         ensure_left_out(repo, &findings)?;
         ui::info(ui::dim(
             "   git-agent left them out. Add them to .gitignore, or stage them yourself with git add.",
         ));
         return Ok(Some(staged));
-    }
-    let staged = match ask_untracked()? {
+    };
+    let staged = match ask_untracked(person)? {
         UntrackedChoice::Ignore => {
             let staged = ignore_and_stage_the_rest(repo, &top, &findings)?;
             ensure_left_out(repo, &findings)?;
@@ -102,7 +122,7 @@ fn stage_all_but_findings(repo: &Repo, ask: bool) -> Result<Option<Vec<IndexEntr
 
 /// What to do with untracked files that look like they should be ignored.
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub enum UntrackedChoice {
+enum UntrackedChoice {
     /// Add them to .gitignore.
     Ignore,
     /// Stage them with everything else.
@@ -110,23 +130,32 @@ pub enum UntrackedChoice {
     Quit,
 }
 
-/// Asks what to do with untracked files that look like they should be
-/// ignored. Enter means ignore them; end of input means quit.
-pub fn ask_untracked() -> Result<UntrackedChoice> {
+/// Asks `person` what to do with untracked files that look like they should be ignored,
+/// until they answer y, n or q. End of input means quit.
+fn ask_untracked(person: &dyn Person) -> Result<UntrackedChoice> {
+    let question = format!(
+        "Add them to .gitignore? {}",
+        ui::dim("[Y]es  [n]o, commit them too  [q]uit ›")
+    );
     loop {
-        let question = format!(
-            "Add them to .gitignore? {}",
-            ui::dim("[Y]es  [n]o, commit them too  [q]uit ›")
-        );
-        let Some(answer) = ui::read_line(&question)? else {
+        let Some(answer) = person.typed_at(&question)? else {
             return Ok(UntrackedChoice::Quit);
         };
-        match answer.to_lowercase().as_str() {
-            "" | "y" | "yes" => return Ok(UntrackedChoice::Ignore),
-            "n" | "no" => return Ok(UntrackedChoice::Commit),
-            "q" | "quit" => return Ok(UntrackedChoice::Quit),
-            _ => ui::info("Please answer y, n or q."),
+        match untracked_choice(&answer) {
+            Some(choice) => return Ok(choice),
+            None => ui::info("Please answer y, n or q."),
         }
+    }
+}
+
+/// The choice `answer` makes about the untracked files, in any case, or `None` if it's none
+/// of y, n and q. An empty answer takes the default and ignores them.
+fn untracked_choice(answer: &str) -> Option<UntrackedChoice> {
+    match answer.trim().to_lowercase().as_str() {
+        "" | "y" | "yes" => Some(UntrackedChoice::Ignore),
+        "n" | "no" => Some(UntrackedChoice::Commit),
+        "q" | "quit" => Some(UntrackedChoice::Quit),
+        _ => None,
     }
 }
 
@@ -191,9 +220,9 @@ fn kept_and_moved_on(repo: &Repo, kept: &[String]) -> Result<Kept> {
 /// Says which pointers `--all` kept where the user staged them though the work tree has moved
 /// on, as [`stage_all`] returns them. A commit holds the staged commit, and a split leaves the
 /// pointer staged.
-fn report_kept(kept: &Kept, splitting: bool) {
+fn report_kept(kept: &Kept, for_: For) {
     if !kept.moved_on.is_empty() {
-        ui::info(moved_on_note(&kept.moved_on, splitting));
+        ui::info(moved_on_note(&kept.moved_on, for_));
     }
     if !kept.replaced.is_empty() {
         ui::info(replaced_note(&kept.replaced));
@@ -299,9 +328,9 @@ pub fn hidden_pointers(repo: &Repo, commits_all: bool) -> Result<HiddenPointers>
 /// Says what happens to the [`hidden_pointers`]: `git agent` commits those the user
 /// staged, and leaves the others out. A split leaves them all out, since its commits only
 /// hold what its plan shows.
-pub fn report_hidden_pointers(hidden: &HiddenPointers, splitting: bool) {
+pub fn report_hidden_pointers(hidden: &HiddenPointers, for_: For) {
     if !hidden.staged.is_empty() {
-        ui::warn(hidden_staged_note(&hidden.staged, splitting));
+        ui::warn(hidden_staged_note(&hidden.staged, for_));
     }
     if !hidden.changed.is_empty() {
         ui::info(hidden_changed_note(&hidden.changed));
@@ -310,14 +339,13 @@ pub fn report_hidden_pointers(hidden: &HiddenPointers, splitting: bool) {
 
 const HIDDEN: &str = "a submodule whose `ignore` setting hides the change from the diff";
 
-fn hidden_staged_note(pointers: &[String], splitting: bool) -> String {
-    let what_happens = if splitting {
-        "The split's commits leave it out, and it stays staged.".to_owned()
-    } else {
-        format!(
+fn hidden_staged_note(pointers: &[String], for_: For) -> String {
+    let what_happens = match for_ {
+        For::Split => "The split's commits leave it out, and it stays staged.".to_owned(),
+        For::Commit => format!(
             "You staged it, so the commit includes it; `git restore --staged -- {}` takes it out.",
             quoted(pointers)
-        )
+        ),
     };
     format!(
         "{} is staged, in {HIDDEN}, so the model doesn't see it. {what_happens}",
@@ -349,18 +377,18 @@ fn replaced_note(pointers: &[String]) -> String {
     )
 }
 
-fn moved_on_note(pointers: &[String], splitting: bool) -> String {
+fn moved_on_note(pointers: &[String], for_: For) -> String {
     let kept = format!(
         "   --all kept {} at the commit you staged, though the submodule has moved on since.",
         joined_names(pointers)
     );
-    if splitting {
-        return kept;
+    match for_ {
+        For::Split => kept,
+        For::Commit => format!(
+            "{kept} To commit where it is now, stage it with `git add -- {}`.",
+            quoted(pointers)
+        ),
     }
-    format!(
-        "{kept} To commit where it is now, stage it with `git add -- {}`.",
-        quoted(pointers)
-    )
 }
 
 fn quoted(pointers: &[String]) -> String {
@@ -380,7 +408,79 @@ fn joined_names(pointers: &[String]) -> String {
 mod tests {
     use super::*;
     use crate::git::test_support::{isolated_repo, run};
+    use crate::review::test_support::ScriptedPerson;
     use std::fs;
+    use tempfile::TempDir;
+
+    #[test]
+    fn reads_y_n_and_q_in_any_case_and_takes_ignoring_as_the_default() {
+        for (answer, choice) in [
+            ("", Some(UntrackedChoice::Ignore)),
+            ("Y", Some(UntrackedChoice::Ignore)),
+            (" yes ", Some(UntrackedChoice::Ignore)),
+            ("n", Some(UntrackedChoice::Commit)),
+            ("NO", Some(UntrackedChoice::Commit)),
+            ("q", Some(UntrackedChoice::Quit)),
+            ("Quit", Some(UntrackedChoice::Quit)),
+            ("maybe", None),
+            ("ye", None),
+        ] {
+            assert_eq!(untracked_choice(answer), choice, "{answer:?}");
+        }
+    }
+
+    /// A repository with an untracked `.env`, which looks like it should be ignored, and an
+    /// untracked `other.txt`, which doesn't.
+    fn with_an_env_file() -> (TempDir, Repo) {
+        let (dir, repo) = isolated_repo();
+        fs::write(dir.path().join(".env"), "TOKEN=local\n").unwrap();
+        fs::write(dir.path().join("other.txt"), "text\n").unwrap();
+        (dir, repo)
+    }
+
+    /// What `--all` stages in [`with_an_env_file`] with `asking`, and the names it staged.
+    fn staged_with(asking: Option<&dyn Person>) -> (Staged, Vec<String>, TempDir) {
+        let (dir, repo) = with_an_env_file();
+        let staged = stage_all_and_report(&repo, asking, For::Commit).unwrap();
+        let names = run(dir.path(), &["diff", "--cached", "--name-only"]);
+        let names = names.lines().map(str::to_owned).collect();
+        (staged, names, dir)
+    }
+
+    #[test]
+    fn leaves_the_files_out_when_it_may_not_ask() {
+        let (staged, names, _dir) = staged_with(None);
+        assert_eq!((staged, names), (Staged::All, vec!["other.txt".to_owned()]));
+    }
+
+    #[test]
+    fn stages_them_too_when_the_person_says_no() {
+        let person = ScriptedPerson::typing(&["n"]);
+        let (staged, names, _dir) = staged_with(Some(&person));
+        assert_eq!(staged, Staged::All);
+        assert_eq!(names, [".env", "other.txt"]);
+    }
+
+    #[test]
+    fn stages_nothing_when_the_person_quits_or_input_ends() {
+        for lines in [&["q"][..], &[]] {
+            let person = ScriptedPerson::typing(lines);
+            let (staged, names, _dir) = staged_with(Some(&person));
+            assert_eq!(staged, Staged::Quit, "{lines:?}");
+            assert!(names.is_empty(), "{lines:?}: {names:?}");
+        }
+    }
+
+    #[test]
+    fn asks_again_until_the_answer_is_clear_then_ignores_them() {
+        let person = ScriptedPerson::typing(&["maybe", "y"]);
+        let (staged, names, dir) = staged_with(Some(&person));
+        assert_eq!(staged, Staged::All);
+        assert_eq!(names, [".gitignore", "other.txt"]);
+        let ignored = fs::read_to_string(dir.path().join(".gitignore")).unwrap();
+        assert!(ignored.contains(".env"), "{ignored:?}");
+        assert_eq!(person.lines_left(), 0);
+    }
 
     #[test]
     fn stages_everything_but_the_untracked_files_left_out() {
@@ -534,12 +634,12 @@ mod tests {
         run(dir.path(), &["config", "submodule.library.ignore", "all"]);
         crate::git::test_support::move_pointer(dir.path(), &moved);
         fs::write(dir.path().join("new.txt"), "new\n").unwrap();
-        assert!(stage_all(&repo, false).unwrap().is_some());
+        assert!(stage_all(&repo, None).unwrap().is_some());
         assert_eq!(repo.staged_paths().unwrap(), ["new.txt"]);
         assert_eq!(repo.hidden_changed_pointers().unwrap(), ["library"]);
 
         run(dir.path(), &["add", "library"]);
-        assert_eq!(stage_all(&repo, false).unwrap(), Some(Kept::default()));
+        assert_eq!(stage_all(&repo, None).unwrap(), Some(Kept::default()));
         assert_eq!(repo.hidden_staged_pointers().unwrap(), ["library"]);
     }
 
@@ -568,15 +668,17 @@ mod tests {
         fs::write(dir.path().join("f.txt"), "f\n").unwrap();
         let repo = Repo::open(dir.path()).unwrap();
 
-        assert!(stage_all(&repo, false).unwrap().is_some());
+        assert!(stage_all(&repo, None).unwrap().is_some());
         assert_eq!(repo.staged_paths().unwrap(), ["f.txt"]);
     }
 
     #[test]
     fn tells_a_split_that_it_leaves_a_staged_pointer_out() {
         let names = ["library".to_owned()];
-        assert!(hidden_staged_note(&names, true).contains("The split's commits leave it out"));
-        assert!(hidden_staged_note(&names, false).contains("so the commit includes it"));
+        assert!(
+            hidden_staged_note(&names, For::Split).contains("The split's commits leave it out")
+        );
+        assert!(hidden_staged_note(&names, For::Commit).contains("so the commit includes it"));
     }
 
     #[test]
@@ -598,10 +700,10 @@ mod tests {
         let odd = ["a\nb\u{1b}[2J".to_owned()];
         assert_eq!(listed(&odd), "   a\\nb\\033[2J");
         assert!(hidden_changed_note(&odd).starts_with("a\\nb\\033[2J changed"));
-        assert!(hidden_staged_note(&odd, false).starts_with("a\\nb\\033[2J is staged"));
+        assert!(hidden_staged_note(&odd, For::Commit).starts_with("a\\nb\\033[2J is staged"));
         assert!(left_out_by_all_note(&odd).contains("left out a\\nb\\033[2J,"));
-        assert!(moved_on_note(&odd, false).contains("kept a\\nb\\033[2J at the commit"));
-        assert!(moved_on_note(&odd, false).contains("git add -- 'a\\nb\\033[2J'"));
+        assert!(moved_on_note(&odd, For::Commit).contains("kept a\\nb\\033[2J at the commit"));
+        assert!(moved_on_note(&odd, For::Commit).contains("git add -- 'a\\nb\\033[2J'"));
         assert!(replaced_note(&odd).contains("kept a\\nb\\033[2J as you staged it"));
     }
 
@@ -634,7 +736,7 @@ mod tests {
         let lock = dir.path().join(".git/index.lock");
         fs::write(&lock, "").unwrap();
 
-        let error = format!("{:#}", stage_all(&repo, false).unwrap_err());
+        let error = format!("{:#}", stage_all(&repo, None).unwrap_err());
         fs::remove_file(&lock).unwrap();
         assert!(
             error.contains(&format!("--cacheinfo '160000,{moved},library'")),
@@ -646,8 +748,8 @@ mod tests {
     #[test]
     fn tells_a_commit_how_to_take_the_newer_checkout_and_a_split_only_what_it_kept() {
         let names = ["library".to_owned()];
-        assert!(moved_on_note(&names, false).contains("To commit where it is now"));
-        let split = moved_on_note(&names, true);
+        assert!(moved_on_note(&names, For::Commit).contains("To commit where it is now"));
+        let split = moved_on_note(&names, For::Split);
         assert!(split.ends_with("has moved on since."), "{split}");
         assert!(!split.contains("git add"), "{split}");
     }
@@ -720,7 +822,7 @@ mod tests {
             assert_eq!(staged, moved, "{setting}");
             fs::write(dir.path().join("new.txt"), "new\n").unwrap();
 
-            let kept = stage_all(&repo, false).unwrap().unwrap();
+            let kept = stage_all(&repo, None).unwrap().unwrap();
             assert_eq!(kept.moved_on, ["library"], "{setting}");
             assert!(kept.replaced.is_empty(), "{setting}");
             assert_eq!(staged_at(dir.path(), "library"), moved, "{setting}");
@@ -739,7 +841,7 @@ mod tests {
         fs::write(dir.path().join("sub/new.txt"), "new\n").unwrap();
         let repo = Repo::open(dir.path().join("sub")).unwrap();
 
-        assert!(stage_all(&repo, false).unwrap().is_some());
+        assert!(stage_all(&repo, None).unwrap().is_some());
         assert_eq!(staged_at(dir.path(), "library"), moved);
         assert!(
             repo.staged_paths()
@@ -761,7 +863,7 @@ mod tests {
         fs::write(dir.path().join("my libXæøå"), "a file a glob would match\n").unwrap();
         let repo = Repo::open(dir.path()).unwrap();
 
-        let kept = stage_all(&repo, false).unwrap().unwrap();
+        let kept = stage_all(&repo, None).unwrap().unwrap();
         assert_eq!(kept.moved_on.len(), names.len(), "{kept:?}");
         for (name, commit) in &staged {
             assert_eq!(&staged_at(dir.path(), name), commit, "{name:?}");
@@ -776,7 +878,7 @@ mod tests {
         fs::write(dir.path().join("id_rsa"), "key\n").unwrap();
         fs::write(dir.path().join("new.txt"), "new\n").unwrap();
 
-        assert!(stage_all(&repo, false).unwrap().is_some());
+        assert!(stage_all(&repo, None).unwrap().is_some());
         assert_eq!(staged_at(dir.path(), "library"), moved);
         let staged = repo.staged_paths().unwrap();
         assert!(staged.contains(&"new.txt".to_owned()), "{staged:?}");
@@ -791,7 +893,7 @@ mod tests {
         run(dir.path(), &["add", "library"]);
         fs::write(dir.path().join("library/loose.txt"), "dirty\n").unwrap();
 
-        assert_eq!(stage_all(&repo, false).unwrap(), Some(Kept::default()));
+        assert_eq!(stage_all(&repo, None).unwrap(), Some(Kept::default()));
         assert_eq!(staged_at(dir.path(), "library"), moved);
     }
 
@@ -803,7 +905,7 @@ mod tests {
         run(dir.path(), &["add", "library"]);
         fs::remove_dir_all(dir.path().join("library")).unwrap();
 
-        let kept = stage_all(&repo, false).unwrap().unwrap();
+        let kept = stage_all(&repo, None).unwrap().unwrap();
         assert!(kept.moved_on.is_empty());
         assert_eq!(kept.replaced, ["library"]);
         assert_eq!(staged_at(dir.path(), "library"), moved);
@@ -826,7 +928,7 @@ mod tests {
             fs::write(dir.path().join("library/vendored.rs"), "fn v() {}\n").unwrap();
 
             assert_eq!(
-                stage_all(&repo, false).unwrap(),
+                stage_all(&repo, None).unwrap(),
                 Some(Kept::default()),
                 "{setting}"
             );
@@ -847,7 +949,7 @@ mod tests {
             run(dir.path(), &["rm", "-q", "--cached", "library"]);
 
             assert_eq!(
-                stage_all(&repo, false).unwrap(),
+                stage_all(&repo, None).unwrap(),
                 Some(Kept::default()),
                 "{setting}"
             );

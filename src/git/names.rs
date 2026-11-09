@@ -9,8 +9,8 @@ use super::lossless;
 use crate::safe_text::{NAMED_ESCAPES, one_line};
 
 /// The readable name of the file a part of a diff is about: its new name if it
-/// was renamed or copied. `file` starts with the "diff --git" line, which is
-/// all it needs to hold.
+/// was renamed or copied. `file` starts with the "diff --git" line, or a merge's
+/// "diff --cc" line, which is all it needs to hold.
 pub fn of_diff(file: &str) -> String {
     let mut lines = file.lines();
     let header = lines.next().unwrap_or_default();
@@ -29,8 +29,15 @@ pub fn shown(name: &str) -> String {
     one_line(&lossless::readable(name))
 }
 
-/// The name in a "diff --git" line, whose two names may each be quoted.
+/// The name in a "diff --git" line, whose two names may each be quoted, or the one
+/// name of a merge's "diff --cc" line.
 fn from_header(header: &str) -> String {
+    if let Some(name) = header
+        .strip_prefix("diff --cc ")
+        .or_else(|| header.strip_prefix("diff --combined "))
+    {
+        return unquoted(name);
+    }
     let names = header.strip_prefix("diff --git ").unwrap_or(header);
     if !names.contains('"') {
         return target_of_plain_names(names).to_owned();
@@ -239,6 +246,16 @@ mod tests {
         let quoted = "diff --git a/old.txt \"b/ny\\303\\246\\t.txt\"\n\
                       rename from old.txt\nrename to \"ny\\303\\246\\t.txt\"\n";
         assert_eq!(of_diff(quoted), "nyæ\\t.txt");
+    }
+
+    #[test]
+    fn reads_the_one_name_of_a_combined_diff() {
+        assert_eq!(
+            of_diff("diff --cc src/a b.rs\nindex 1,2..3\n"),
+            "src/a b.rs"
+        );
+        assert_eq!(of_diff("diff --combined x.txt\n"), "x.txt");
+        assert_eq!(of_diff("diff --cc \"ny\\303\\246\\t.txt\"\n"), "nyæ\\t.txt");
     }
 
     #[test]

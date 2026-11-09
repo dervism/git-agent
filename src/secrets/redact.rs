@@ -223,32 +223,25 @@ pub fn diff(diff: &str) -> Redacted {
     let mut text = String::with_capacity(diff.len());
     let mut findings = Vec::new();
     let mut path = String::new();
-    let (mut old_line, mut new_line) = (0, 0);
-    let mut in_hunk = false;
+    let mut hunk: Option<Hunk> = None;
     for line in diff.split_inclusive('\n') {
-        if line.starts_with("diff --git ") {
+        if ["diff --git ", "diff --cc ", "diff --combined "]
+            .iter()
+            .any(|start| line.starts_with(start))
+        {
             path = names::of_diff(line);
-            in_hunk = false;
+            hunk = None;
             scanner = Scanner::default();
         } else if line.starts_with("@@") {
-            (old_line, new_line) = hunk_start(line);
-            in_hunk = true;
+            hunk = Some(Hunk::starting(line));
             scanner = Scanner::default();
-        } else if in_hunk && let Some(marker @ ('+' | '-' | ' ')) = line.chars().next() {
-            let (change, number) = match marker {
-                '+' => (Change::Added, new_line),
-                '-' => (Change::Removed, old_line),
-                _ => (Change::Unchanged, new_line),
-            };
-            if marker != '+' {
-                old_line += 1;
-            }
-            if marker != '-' {
-                new_line += 1;
-            }
+        } else if let Some(hunk) = &mut hunk
+            && let Some(markers) = hunk.markers(line)
+        {
+            let (change, number) = hunk.take(markers.as_bytes());
             let mut kinds = Vec::new();
-            if let Some(content) = scanner.scan(&line[1..], &mut kinds) {
-                text.push(marker);
+            if let Some(content) = scanner.scan(&line[markers.len()..], &mut kinds) {
+                text.push_str(markers);
                 text.push_str(&content);
             }
             findings.extend(kinds.into_iter().map(|kind| Finding {
@@ -262,6 +255,81 @@ pub fn diff(diff: &str) -> Redacted {
         text.push_str(line);
     }
     Redacted { text, findings }
+}
+
+/// Where a hunk has got to: the number of the next line in each parent and in the result. A
+/// plain diff has one parent, and a merge's combined diff one per parent, each with a column of
+/// markers: `-` for a line that parent has and the result doesn't, `+` for a line the result has
+/// and that parent doesn't, and a space for one both have, or neither in a removed line.
+struct Hunk {
+    parents: Vec<usize>,
+    result: usize,
+}
+
+impl Hunk {
+    /// The hunk a header such as `@@ -10,4 +10,5 @@`, or `@@@ -1,3 -1,3 +1,4 @@@` for a merge
+    /// of two, starts.
+    fn starting(header: &str) -> Self {
+        let signs = header.bytes().take_while(|byte| *byte == b'@').count();
+        let parents = signs.saturating_sub(1).max(1);
+        let mut words = header.split_whitespace().skip(1);
+        let start = |word: &str| -> usize {
+            word[1..]
+                .split(',')
+                .next()
+                .and_then(|number| number.parse().ok())
+                .unwrap_or(1)
+        };
+        let mut starts: Vec<usize> = words
+            .by_ref()
+            .take_while(|word| word.starts_with('-'))
+            .map(start)
+            .collect();
+        starts.resize(parents, 1);
+        let result = header
+            .split_whitespace()
+            .find(|word| word.starts_with('+'))
+            .map_or(1, start);
+        Self {
+            parents: starts,
+            result,
+        }
+    }
+
+    /// The marker columns that start `line`, if it's a line of this hunk.
+    fn markers<'a>(&self, line: &'a str) -> Option<&'a str> {
+        let markers = line.get(..self.parents.len())?;
+        markers
+            .bytes()
+            .all(|marker| matches!(marker, b'+' | b'-' | b' '))
+            .then_some(markers)
+    }
+
+    /// What the line with these `markers` does, and its number: in the result, or for a removed
+    /// line in the first parent that has it. Moves past the line.
+    fn take(&mut self, markers: &[u8]) -> (Change, usize) {
+        let in_result = !markers.contains(&b'-');
+        let (change, number) = if !in_result {
+            let parent = markers.iter().position(|marker| *marker == b'-');
+            (
+                Change::Removed,
+                parent.map_or(self.result, |parent| self.parents[parent]),
+            )
+        } else if markers.iter().all(|marker| *marker == b'+') {
+            (Change::Added, self.result)
+        } else {
+            (Change::Unchanged, self.result)
+        };
+        if in_result {
+            self.result = self.result.saturating_add(1);
+        }
+        for (marker, line) in markers.iter().zip(&mut self.parents) {
+            if *marker == b'-' || (*marker == b' ' && in_result) {
+                *line = line.saturating_add(1);
+            }
+        }
+        (change, number)
+    }
 }
 
 /// The secrets in a commit's message and patch. Findings name the commit.
@@ -298,23 +366,6 @@ pub fn text(text: &str, place: &str) -> Redacted {
         text: out,
         findings,
     }
-}
-
-/// The first old and new line numbers from a "@@ -a,b +c,d @@" hunk header.
-fn hunk_start(header: &str) -> (usize, usize) {
-    let number = |after: &str| -> usize {
-        header
-            .split_once(after)
-            .map(|(_, rest)| rest)
-            .and_then(|rest| {
-                let digits = rest
-                    .find(|c: char| !c.is_ascii_digit())
-                    .unwrap_or(rest.len());
-                rest[..digits].parse().ok()
-            })
-            .unwrap_or(1)
-    };
-    (number("@@ -"), number(" +"))
 }
 
 /// Remembers whether the lines being scanned are inside a private key block.
@@ -600,6 +651,8 @@ fn is_version(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::git::test_support::{isolated_repo, run};
+    use std::fs;
 
     #[test]
     fn finds_a_secret_split_by_an_invisible_character() {
@@ -1002,6 +1055,88 @@ mod tests {
         );
     }
 
+    /// The places, lines and changes of what `diff` finds.
+    fn found_in(diff: &str) -> Vec<(String, Option<usize>, Change)> {
+        super::diff(diff)
+            .findings
+            .into_iter()
+            .map(|finding| (finding.place, finding.line, finding.change))
+            .collect()
+    }
+
+    #[test]
+    fn reads_what_a_merge_adds_in_a_combined_diff() {
+        let diff = format!(
+            "diff --cc settings.env\nindex 1a2b3c4,5d6e7f8..9a0b1c2\n--- a/settings.env\n\
+             +++ b/settings.env\n@@@ -1,4 -1,3 +1,4 @@@\n  shared = 1\n\
+             - ours_password = {ours}\n -their_password = {theirs}\n- old_password = {old}\n\
+             ++db_password = {added}\n + kept_password = {kept}\n  last = 2\n",
+            ours = noise(16),
+            theirs = noise(17),
+            added = noise(18),
+            kept = noise(19),
+            old = noise(20),
+        );
+        let result = super::diff(&diff);
+        assert!(!result.text.contains(&noise(18)), "{}", result.text);
+        assert!(
+            result.text.contains("++db_password = [REDACTED]\n"),
+            "{}",
+            result.text
+        );
+        let place = "settings.env".to_owned();
+        assert_eq!(
+            found_in(&diff),
+            [
+                (place.clone(), Some(2), Change::Removed),
+                (place.clone(), Some(2), Change::Removed),
+                (place.clone(), Some(3), Change::Removed),
+                (place.clone(), Some(2), Change::Added),
+                (place, Some(3), Change::Unchanged),
+            ]
+        );
+    }
+
+    #[test]
+    fn reads_an_octopus_merge_with_a_column_per_parent() {
+        let diff = format!(
+            "diff --cc a.env\n@@@@ -1 -1 -1 +1,2 @@@@\n  +shared = 1\n+++db_password = {}\n",
+            noise(18)
+        );
+        assert_eq!(
+            found_in(&diff),
+            [("a.env".to_owned(), Some(2), Change::Added)]
+        );
+    }
+
+    #[test]
+    fn finds_a_secret_a_merge_adds_in_gits_own_output() {
+        let (dir, _repo) = isolated_repo();
+        let write = |text: &str| fs::write(dir.path().join("app.env"), text).unwrap();
+        write("mode = base\n");
+        run(dir.path(), &["add", "app.env"]);
+        run(dir.path(), &["commit", "-q", "-m", "base"]);
+        run(dir.path(), &["switch", "-q", "-c", "side"]);
+        write("mode = side\n");
+        run(dir.path(), &["commit", "-q", "-am", "side"]);
+        run(dir.path(), &["switch", "-q", "main"]);
+        write("mode = main\n");
+        run(dir.path(), &["commit", "-q", "-am", "main"]);
+        let _ = std::process::Command::new("git")
+            .current_dir(dir.path())
+            .args(["merge", "-q", "side"])
+            .output();
+        write(&format!("mode = both\ndb_password = {}\n", noise(18)));
+        run(dir.path(), &["commit", "-q", "-am", "merge side"]);
+
+        let patch = run(dir.path(), &["log", "-1", "--patch", "--cc", "--format="]);
+
+        assert_eq!(
+            found_in(&patch),
+            [("app.env".to_owned(), Some(2), Change::Added)]
+        );
+    }
+
     #[test]
     fn names_the_commit_in_its_findings() {
         let patch = format!(
@@ -1073,7 +1208,14 @@ mod tests {
 
     #[test]
     fn reads_hunk_headers() {
-        assert_eq!(hunk_start("@@ -10,3 +12,4 @@ fn main\n"), (10, 12));
-        assert_eq!(hunk_start("@@ -0,0 +1 @@\n"), (0, 1));
+        let start = |header: &str| {
+            let hunk = Hunk::starting(header);
+            (hunk.parents, hunk.result)
+        };
+        assert_eq!(start("@@ -10,3 +12,4 @@ fn main\n"), (vec![10], 12));
+        assert_eq!(start("@@ -0,0 +1 @@\n"), (vec![0], 1));
+        assert_eq!(start("@@@ -4,2 -7 +9,3 @@@ fn main\n"), (vec![4, 7], 9));
+        assert_eq!(start("@@@@ -1 -2 -3 +5 @@@@\n"), (vec![1, 2, 3], 5));
+        assert_eq!(start("@@\n"), (vec![1], 1));
     }
 }

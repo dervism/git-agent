@@ -15,11 +15,13 @@ use crate::conversation::{
 };
 use crate::git::worktree::TempWorktree;
 use crate::git::{Changes, Repo, Scope, names};
+use crate::review::{
+    Action, Choice, Review, ask_action, edit_message, edit_plan, review, show_proposal,
+};
 use crate::server::{Message, ModelServer};
-use crate::ui::{self, Action, Choice, Review};
+use crate::ui;
 use crate::{
-    check_outgoing, commit, prompt, push, redact, reject_added, report_secrets, review, split,
-    staging,
+    check_outgoing, commit, prompt, push, redact, reject_added, report_secrets, split, staging,
 };
 use anyhow::{Context, Result, bail};
 use std::fs;
@@ -433,7 +435,7 @@ impl<S: ModelServer> Splitter<'_, S> {
     ) -> Result<Option<(Plan, bool)>> {
         loop {
             ui::show_framed(PLAN_REVIEW.heading, &self.show(&plan));
-            let revised = match ui::ask_action(&PLAN_REVIEW)? {
+            let revised = match ask_action(&PLAN_REVIEW)? {
                 Action::Accept(review) => return Ok(Some((plan, review))),
                 Action::Quit => return Ok(None),
                 Action::Edit => self.edit_plan(&plan),
@@ -453,7 +455,7 @@ impl<S: ModelServer> Splitter<'_, S> {
     }
 
     fn edit_plan(&self, plan: &Plan) -> Result<Option<Plan>> {
-        let text = ui::edit_plan(
+        let text = edit_plan(
             self.repo,
             "GIT_AGENT_SPLIT_PLAN",
             &split::to_text(plan, &self.work.files, self.units),
@@ -625,7 +627,7 @@ impl<S: ModelServer> Splitter<'_, S> {
             self.server,
             self.model,
             conversation,
-            |message: &str| ui::edit_message(self.repo, message),
+            |message: &str| edit_message(self.repo, message),
             |message| separated(message).map(|message| kinds::with_type(&message, kind)),
         )
         .await?;
@@ -755,7 +757,7 @@ impl<S: ModelServer> Splitter<'_, S> {
         let kind = kinds::kind_of(planned, &self.work.files, self.units);
         let message = commit_message(self.server, self.model, &conversation).await?;
         let message = kinds::with_type(&message, kind);
-        ui::show_proposal(&SPLIT_COMMIT_REVIEW, &message);
+        show_proposal(&SPLIT_COMMIT_REVIEW, &message);
         Ok(Some((message, conversation)))
     }
 }
@@ -869,7 +871,7 @@ mod tests {
             ("all commits", false),
         ] {
             assert_eq!(
-                ui::accepted(&PLAN_REVIEW, typed),
+                crate::review::accepted(&PLAN_REVIEW, typed),
                 Some(reviews_messages),
                 "{typed:?}"
             );
@@ -878,15 +880,15 @@ mod tests {
 
     #[test]
     fn both_reviews_of_a_split_can_be_typed() {
-        ui::test_support::assert_typable(&PLAN_REVIEW);
-        ui::test_support::assert_typable(&SPLIT_COMMIT_REVIEW);
+        crate::review::test_support::assert_typable(&PLAN_REVIEW);
+        crate::review::test_support::assert_typable(&SPLIT_COMMIT_REVIEW);
     }
 
     #[test]
     fn yes_at_a_split_message_makes_the_commit() {
         for (typed, commits) in [("y", true), ("yes", true), ("c", true), ("s", false)] {
             assert_eq!(
-                ui::accepted(&SPLIT_COMMIT_REVIEW, typed),
+                crate::review::accepted(&SPLIT_COMMIT_REVIEW, typed),
                 Some(commits),
                 "{typed:?}"
             );

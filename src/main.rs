@@ -14,6 +14,7 @@ mod menu;
 mod prompt;
 mod providers;
 mod redact;
+mod review;
 mod safe_text;
 mod server;
 mod split;
@@ -32,19 +33,23 @@ use config::{Config, OnSecrets, Overrides};
 use conversation::models::{self, Model};
 use conversation::{
     commit_message, connect, discuss, generate_message, initial_messages, notes_bytes,
-    question_bytes, refine_messages, report_fit, report_model, separated, tokens_in,
+    question_bytes, report_fit, report_model, separated, tokens_in,
 };
 use git::{Changes, CommitPatch, Repo, Scope};
 use github::PullRequest;
 use prompt::Work;
 use redact::{Change, Finding};
+use review::{
+    Action, Choice, Review, ask_action, edit_message, edit_plan, edit_pull_request, review,
+    show_proposal,
+};
 use server::{Message, ModelServer, Server};
 use split::signals::Stopped;
 use std::fs;
 use std::io::{self, IsTerminal};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use ui::{Action, Choice, Review, thousands};
+use ui::thousands;
 
 /// Accepting a commit message: the value says whether to push afterwards.
 const COMMIT_REVIEW: Review<bool> = Review {
@@ -240,7 +245,7 @@ async fn generate(args: &GenerateArgs, overrides: &Overrides) -> Result<()> {
         ui::raw_out(&message);
         return Ok(());
     }
-    ui::show_proposal(&COMMIT_REVIEW, &message);
+    show_proposal(&COMMIT_REVIEW, &message);
     if args.commit {
         commit(&repo, &message, scope, &args.git_args, &leave_out)?;
         if args.push {
@@ -257,7 +262,7 @@ async fn generate(args: &GenerateArgs, overrides: &Overrides) -> Result<()> {
         return Ok(());
     }
 
-    let edit = |message: &str| ui::edit_message(&repo, message);
+    let edit = |message: &str| edit_message(&repo, message);
     let reviewed = review(
         &COMMIT_REVIEW,
         message,
@@ -404,7 +409,7 @@ async fn pull_request(args: &PrArgs, overrides: &Overrides) -> Result<()> {
         ui::raw_out(&text);
         return Ok(());
     }
-    ui::show_proposal(&PULL_REQUEST_REVIEW, &text);
+    show_proposal(&PULL_REQUEST_REVIEW, &text);
     let (draft, text) = if args.create {
         (false, text)
     } else if !io::stdin().is_terminal() {
@@ -414,7 +419,7 @@ async fn pull_request(args: &PrArgs, overrides: &Overrides) -> Result<()> {
         ));
         return Ok(());
     } else {
-        let edit = |text: &str| ui::edit_pull_request(&repo, text);
+        let edit = |text: &str| edit_pull_request(&repo, text);
         let reviewed = review(
             &PULL_REQUEST_REVIEW,
             text,
@@ -512,7 +517,7 @@ async fn new_branch(args: &BranchArgs, overrides: &Overrides) -> Result<()> {
         return Ok(());
     }
 
-    ui::show_proposal(&BRANCH_REVIEW, &name);
+    show_proposal(&BRANCH_REVIEW, &name);
     let exists = |name: &str| taken.iter().any(|known| known == name);
     if exists(&name) {
         ui::warn(format!("a branch named {name} already exists"));
@@ -785,10 +790,10 @@ impl Tidier<'_> {
     ) -> Result<Option<tidy::Plan>> {
         loop {
             ui::show_framed(TIDY_REVIEW.heading, &tidy::show(&plan, self.commits));
-            let revised = match ui::ask_action(&TIDY_REVIEW)? {
+            let revised = match ask_action(&TIDY_REVIEW)? {
                 Action::Accept(()) => return Ok(Some(plan)),
                 Action::Quit => return Ok(None),
-                Action::Edit => ui::edit_plan(
+                Action::Edit => edit_plan(
                     self.repo,
                     "GIT_AGENT_TIDY_PLAN",
                     &tidy::to_text(&plan, self.commits),
@@ -846,11 +851,11 @@ impl Tidier<'_> {
                 report_fit(self.model, &fit, "message", None);
             }
             let message = commit_message(self.server, self.model, &conversation).await?;
-            ui::show_proposal(&TIDY_MESSAGE_REVIEW, &message);
+            show_proposal(&TIDY_MESSAGE_REVIEW, &message);
             let (use_it, message) = if args.apply {
                 (true, message)
             } else {
-                let edit = |message: &str| ui::edit_message(self.repo, message);
+                let edit = |message: &str| edit_message(self.repo, message);
                 let reviewed = review(
                     &TIDY_MESSAGE_REVIEW,
                     message,
@@ -1144,48 +1149,6 @@ async fn explain_commits(args: &ExplainArgs, overrides: &Overrides) -> Result<()
     discuss(&server, &model, &subject.heading, conversation).await
 }
 
-/// Lets the user review `text` until they accept or quit it, revising it as
-/// they ask; `clean` checks and tidies each new reply from the model. Returns
-/// the accept choice and the final text, or `None` on quit.
-async fn review<T: Copy>(
-    review: &Review<T>,
-    mut text: String,
-    server: &impl ModelServer,
-    model: &Model,
-    conversation: &[Message],
-    edit: impl Fn(&str) -> Result<Option<String>>,
-    clean: impl Fn(String) -> Result<String>,
-) -> Result<Option<(T, String)>> {
-    loop {
-        let revised = match ui::ask_action(review)? {
-            Action::Accept(choice) => return Ok(Some((choice, text))),
-            Action::Quit => return Ok(None),
-            Action::Edit => edit(&text),
-            Action::Regenerate => generate_message(server, model, conversation)
-                .await
-                .and_then(&clean)
-                .map(Some),
-            Action::Refine(feedback) => {
-                let refined = refine_messages(conversation, &text, &feedback, review.what);
-                generate_message(server, model, &refined)
-                    .await
-                    .and_then(&clean)
-                    .map(Some)
-            }
-        };
-        // A failed edit or generation keeps the current text so the review can go on.
-        match revised {
-            Ok(Some(revised)) => text = revised,
-            Ok(None) => ui::warn(format!(
-                "the edited {} was empty; keeping the previous one",
-                review.noun
-            )),
-            Err(err) => ui::error(&err),
-        }
-        ui::show_proposal(review, &text);
-    }
-}
-
 /// Pushes the branch if GitHub lacks some of its commits, then creates the
 /// pull request. With `ask`, the user confirms a rebase before the push.
 fn create_pull_request(
@@ -1468,24 +1431,28 @@ mod tests {
     #[test]
     fn yes_picks_the_plain_acceptance() {
         for typed in ["y", "yes"] {
-            let push = ui::accepted(&COMMIT_REVIEW, typed);
+            let push = review::accepted(&COMMIT_REVIEW, typed);
             assert_eq!(push, Some(false), "{typed:?} commits without pushing");
-            let draft = ui::accepted(&PULL_REQUEST_REVIEW, typed);
+            let draft = review::accepted(&PULL_REQUEST_REVIEW, typed);
             assert_eq!(draft, Some(false), "{typed:?} creates no draft");
-            assert_eq!(ui::accepted(&TIDY_REVIEW, typed), Some(()), "{typed:?}");
-            let new_message = ui::accepted(&TIDY_MESSAGE_REVIEW, typed);
+            assert_eq!(review::accepted(&TIDY_REVIEW, typed), Some(()), "{typed:?}");
+            let new_message = review::accepted(&TIDY_MESSAGE_REVIEW, typed);
             assert_eq!(new_message, Some(true), "{typed:?} uses the new message");
-            assert_eq!(ui::accepted(&BRANCH_REVIEW, typed), Some(()), "{typed:?}");
+            assert_eq!(
+                review::accepted(&BRANCH_REVIEW, typed),
+                Some(()),
+                "{typed:?}"
+            );
         }
     }
 
     #[test]
     fn every_review_can_be_typed() {
-        ui::test_support::assert_typable(&COMMIT_REVIEW);
-        ui::test_support::assert_typable(&PULL_REQUEST_REVIEW);
-        ui::test_support::assert_typable(&TIDY_REVIEW);
-        ui::test_support::assert_typable(&TIDY_MESSAGE_REVIEW);
-        ui::test_support::assert_typable(&BRANCH_REVIEW);
+        review::test_support::assert_typable(&COMMIT_REVIEW);
+        review::test_support::assert_typable(&PULL_REQUEST_REVIEW);
+        review::test_support::assert_typable(&TIDY_REVIEW);
+        review::test_support::assert_typable(&TIDY_MESSAGE_REVIEW);
+        review::test_support::assert_typable(&BRANCH_REVIEW);
     }
 
     fn generate_args(arguments: &[&str]) -> GenerateArgs {

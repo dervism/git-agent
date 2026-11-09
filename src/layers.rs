@@ -44,6 +44,7 @@ const LAYERS: &[(&str, Layer)] = &[
     ("staging", Shared("staging")),
     ("untracked", Shared("staging")),
     ("redact", Shared("secrets")),
+    ("review", Shared("review")),
     ("conversation", Shared("conversation")),
     ("prompt", Shared("conversation")),
     ("api_keys", Core),

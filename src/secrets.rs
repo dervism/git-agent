@@ -63,17 +63,72 @@ pub fn report_secrets(findings: &[Finding], advice: &str) {
 }
 
 /// Checks every file of what a commit of `scope` will hold. `reported` holds the findings the
-/// flow lists itself, which a warning leaves out.
+/// flow lists itself, which a warning leaves out. Returns what it read, for the checks at the
+/// commit.
 pub fn check_changes(
     repo: &Repo,
     scope: Scope,
     on_secrets: OnSecrets,
     reported: &[Finding],
     wording: &Wording,
-) -> Result<()> {
+) -> Result<Scanned> {
     let scanned = found_in_changes(repo, scope)?;
     settle(unchecked_verdict(&scanned.unchecked))?;
-    settle(verdict(&scanned.findings, on_secrets, reported, wording))
+    settle(verdict(&scanned.findings, on_secrets, reported, wording))?;
+    Ok(scanned)
+}
+
+/// What the checks at a commit go by: the setting, and what an earlier check read, which they
+/// don't list again.
+#[derive(Clone, Copy)]
+pub struct AtCommit<'a> {
+    pub on_secrets: OnSecrets,
+    pub before: &'a Scanned,
+}
+
+/// Checks what a commit of `scope` will hold just before it's made, with what it adds besides,
+/// its message and arguments, as `(place, text)`: what changed or was staged since the check
+/// before the model, and the text the review settled on. Returns what it read, for the check of
+/// the commit once it's made.
+pub fn check_before_commit(
+    repo: &Repo,
+    scope: Scope,
+    texts: &[(&str, &str)],
+    at: AtCommit,
+    wording: &Wording,
+) -> Result<Scanned> {
+    let changes = found_in_changes(repo, scope)?;
+    let typed = texts
+        .iter()
+        .flat_map(|(place, text)| redact::text(text, place).findings);
+    let read = Scanned {
+        findings: changes.findings.into_iter().chain(typed).collect(),
+        unchecked: changes.unchecked,
+    };
+    decide_at_commit(&read, at, wording)?;
+    Ok(read)
+}
+
+/// Checks the commits `range` (`git log` arguments) that a commit just made, as hooks can change
+/// what's committed after the check before it. Fails under reject on a secret it adds.
+pub fn check_made_commit(
+    repo: &Repo,
+    range: &[&str],
+    at: AtCommit,
+    wording: &Wording,
+) -> Result<()> {
+    decide_at_commit(&found_in_commits(repo, range)?, at, wording)
+}
+
+/// Lists the binary files too large to check, and warns about or refuses the secrets, that
+/// `read` holds and the earlier check didn't.
+fn decide_at_commit(read: &Scanned, at: AtCommit, wording: &Wording) -> Result<()> {
+    settle(unchecked_verdict(&new_unchecked(
+        &read.unchecked,
+        &at.before.unchecked,
+    )))?;
+    let fresh = new_findings(&read.findings, &at.before.findings);
+    settle(verdict(&fresh, at.on_secrets, &[], wording))
 }
 
 /// Checks the messages and every file of the commits `range` (`git log` arguments) publishes.
@@ -215,16 +270,49 @@ fn warning(findings: &[Finding], reported: &[Finding], warned: &str) -> Option<S
 /// place. A finding in a commit is also held by one in its file, as a diff of several commits
 /// names it.
 fn covered(finding: &Finding, reported: &[Finding]) -> bool {
-    let file = finding
-        .place
-        .strip_prefix("commit ")
-        .and_then(|rest| rest.split_once(' '))
-        .map(|(_, file)| file);
     reported.iter().any(|shown| {
         shown.kind == finding.kind
             && shown.change == finding.change
-            && (shown.place == finding.place || Some(shown.place.as_str()) == file)
+            && same_place(&shown.place, &finding.place)
     })
+}
+
+/// Those of `findings` that `before` doesn't hold on the same line, so that a check at a commit
+/// lists only what's new since the check before it. A finding in the commit made is matched with
+/// one in its file, or in its message, before the commit was.
+fn new_findings(findings: &[Finding], before: &[Finding]) -> Vec<Finding> {
+    findings
+        .iter()
+        .filter(|finding| {
+            !before.iter().any(|old| {
+                old.kind == finding.kind
+                    && old.change == finding.change
+                    && old.line == finding.line
+                    && same_place(&old.place, &finding.place)
+            })
+        })
+        .cloned()
+        .collect()
+}
+
+/// Those of `unchecked` that `before` doesn't list, in the same place or the commit's file of
+/// that name.
+fn new_unchecked(unchecked: &[Unchecked], before: &[Unchecked]) -> Vec<Unchecked> {
+    unchecked
+        .iter()
+        .filter(|file| !before.iter().any(|old| same_place(&old.place, &file.place)))
+        .cloned()
+        .collect()
+}
+
+/// Whether `before`, a place as a check of changes names it, is `place`, or the same file or
+/// message of a commit (`commit <hash> <before>`).
+fn same_place(before: &str, place: &str) -> bool {
+    let in_commit = place
+        .strip_prefix("commit ")
+        .and_then(|rest| rest.split_once(' '))
+        .map(|(_, file)| file);
+    before == place || Some(before) == in_commit
 }
 
 /// Prints a warning, or fails with a refusal.
@@ -351,7 +439,7 @@ mod tests {
         format!("stopped:\n{}\nFix it. {ADVICE}", shown.join("\n"))
     }
 
-    fn check_staged(repo: &Repo, scope: Scope) -> Result<()> {
+    fn check_staged(repo: &Repo, scope: Scope) -> Result<Scanned> {
         check_changes(repo, scope, OnSecrets::Reject, &[], &WORDING)
     }
 
@@ -473,6 +561,53 @@ mod tests {
             &in_file,
             &[finding("b.rs", Some(1), Change::Added)]
         ));
+    }
+
+    /// A check at a commit lists what the check before it didn't find on the same line, in the
+    /// same file or message, also once the commit names them.
+    #[test]
+    fn lists_at_a_commit_only_what_the_check_before_it_did_not_find() {
+        let before = [
+            finding("a.env", Some(2), Change::Added),
+            finding("message", None, Change::Added),
+        ];
+        let found = [
+            finding("a.env", Some(2), Change::Added),
+            finding("a.env", Some(3), Change::Added),
+            finding("commit 1a2b3c4 a.env", Some(2), Change::Added),
+            finding("commit 1a2b3c4 message", None, Change::Added),
+            finding("b.env", Some(2), Change::Added),
+            finding("a.env", Some(2), Change::Unchanged),
+            Finding {
+                kind: "AWS access key".to_owned(),
+                ..finding("a.env", Some(2), Change::Added)
+            },
+        ];
+
+        let new = new_findings(&found, &before);
+
+        let kept = [&found[1], &found[4], &found[5], &found[6]];
+        assert_eq!(new, kept.map(Clone::clone));
+        assert_eq!(new_findings(&found, &[]), found);
+    }
+
+    /// A binary file too large to check is listed at a commit unless the check before it listed
+    /// it, in the same place or as the commit's file.
+    #[test]
+    fn lists_at_a_commit_only_the_binary_files_not_listed_before() {
+        let file = |place: &str| Unchecked {
+            place: place.to_owned(),
+            size: MOST_BINARY_BYTES + 1,
+        };
+        let before = [file("big.bin")];
+        let found = [
+            file("big.bin"),
+            file("commit 1a2b3c4 big.bin"),
+            file("other.bin"),
+        ];
+
+        assert_eq!(new_unchecked(&found, &before), [file("other.bin")]);
+        assert_eq!(new_unchecked(&found, &[]), found);
     }
 
     #[test]

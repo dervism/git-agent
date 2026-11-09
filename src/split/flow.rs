@@ -13,11 +13,12 @@ use crate::conversation::{
     commit_message, connect, generate_message, initial_messages, report_fit, report_model,
     separated, tokens_in,
 };
-use crate::delivery::{commit, push};
+use crate::delivery::{NewCommit, commit, push, refuse_unknown_commit_args};
 use crate::git::worktree::TempWorktree;
 use crate::git::{Changes, Repo, Scope, names};
 use crate::review::{self, Action, Choice, Person, Review, Revisions, Terminal};
-use crate::secrets::{Wording, check_changes, redact, report_secrets};
+use crate::secrets::contents::Scanned;
+use crate::secrets::{AtCommit, Wording, check_changes, redact, report_secrets};
 use crate::server::{Message, ModelServer};
 use crate::staging::{self, Purpose, Staged};
 use crate::ui;
@@ -120,6 +121,9 @@ struct Work {
     changes: Changes,
     files: Vec<FilePatch>,
     snapshot: Snapshot,
+    /// What the secret check before the model read in them, which the checks at each commit
+    /// don't list again.
+    found: Scanned,
 }
 
 /// Reads the changes, and checks everything that doesn't need the model.
@@ -128,6 +132,7 @@ fn changes_to_split(repo: &Repo, args: &SplitArgs, config: &Config) -> Result<Op
         bail!("{operation} is in progress; finish or abort it before splitting changes");
     }
     staging::refuse_unresolved_conflicts(repo, "splitting changes")?;
+    refuse_unknown_commit_args(&args.git_args)?;
     let may_ask = !args.commit && io::stdin().is_terminal();
     let asking = may_ask.then_some(&Terminal as &dyn Person);
     if args.all && staging::stage_all_and_report(repo, asking, Purpose::Split)? == Staged::Quit {
@@ -139,7 +144,7 @@ fn changes_to_split(repo: &Repo, args: &SplitArgs, config: &Config) -> Result<Op
         return Ok(None);
     };
     let redacted = redact::diff(&changes.diff);
-    check_changes(repo, scope, config.on_secrets, &redacted.findings, &SECRETS)?;
+    let found = check_changes(repo, scope, config.on_secrets, &redacted.findings, &SECRETS)?;
     report_secrets(
         &redacted.findings,
         "If they are real, take them out of the files before you commit.",
@@ -157,6 +162,7 @@ fn changes_to_split(repo: &Repo, args: &SplitArgs, config: &Config) -> Result<Op
         changes,
         files,
         snapshot,
+        found,
     }))
 }
 
@@ -738,7 +744,17 @@ impl<S: ModelServer> Splitter<'_, S> {
                 }
             };
             self.ensure_head_is(&parent)?;
-            commit(index, &message, Scope::Staged, &self.args.git_args, &[])?;
+            let new_commit = NewCommit {
+                message: &message,
+                scope: Scope::Staged,
+                git_args: &self.args.git_args,
+                leave_out: &[],
+            };
+            let at = AtCommit {
+                on_secrets: self.config.on_secrets,
+                before: &self.work.found,
+            };
+            commit(index, &new_commit, at)?;
             committed.record(&patch);
             outcome.made += 1;
             let made = self

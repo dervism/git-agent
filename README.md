@@ -151,6 +151,15 @@ When `git commit` fails, for example because a hook rejects it, git-agent saves 
 message to `.git/GIT_AGENT_MSG`. You can reuse it with
 `git commit --file .git/GIT_AGENT_MSG`.
 
+### Arguments for `git commit`
+
+Arguments after `--` go to `git commit`, but only these, spelled exactly so, since the
+commit should hold the changes git-agent checked and the message describes: `-s`,
+`--signoff`, `--no-signoff`, `-n`, `--no-verify`, `--verify`, `-S[<keyid>]`,
+`--gpg-sign[=<keyid>]`, `--no-gpg-sign`, `--author=…`, `--date=…`, `--trailer=…`,
+`--cleanup=…`, `-q`, `-v`, `--allow-empty` and `--no-post-rewrite`. git-agent refuses
+anything else, such as a path, `-a` or `--amend`, before it asks the model.
+
 ## Starting a branch
 
 `git agent branch` names a new branch after what it is for, creates it and switches
@@ -602,10 +611,17 @@ including lockfiles and the other files that `exclude` keeps out of the prompt, 
 what a merge commit adds itself. A file that git shows only as binary, or that
 `.gitattributes` marks `-diff`, is read whole: a text file line by line, and a binary
 file by the runs of printable characters in it, a byte to a character or in UTF-16,
-up to 16 MiB. git-agent lists a larger
-binary file as not checked, and carries on. Git LFS sends its content to the LFS
-server without passing it through git, and the inside of a compressed archive can't
-be read this way, so neither is checked.
+up to 16 MiB. git-agent lists a larger binary file as not checked, and carries on. Git
+LFS sends its content to the LFS server without passing it through git, and the inside
+of a compressed archive can't be read this way, so neither is checked.
+
+git-agent checks the changes again just before it commits them, with the message you
+accepted and the arguments you gave, since files can change while the model writes it.
+Then it checks what the commit git made adds, since a hook can add to it; a
+post-commit hook has run by then. Under reject, git-agent doesn't make a commit that
+adds secrets. If a hook made one so, git-agent undoes it when that moves nothing else,
+and says where its changes are. A merge, or a commit that HEAD has moved on from, stays
+where it is, and git-agent says to take the secrets out before you push it.
 
 Before every push, after any rebase onto the remote, git-agent checks each commit the
 push would send, including its message, because a secret that a later commit removes

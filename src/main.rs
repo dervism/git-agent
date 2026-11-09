@@ -35,14 +35,15 @@ use conversation::{
     commit_message, connect, discuss, generate_message, initial_messages, notes_bytes,
     question_bytes, report_fit, report_model, separated, tokens_in,
 };
-use delivery::{commit, push};
+use delivery::{NewCommit, commit, push, refuse_unknown_commit_args};
 use git::{Changes, CommitPatch, Repo, Scope, names};
 use github::PullRequest;
 use prompt::Work;
 use review::{Action, Choice, Person, Review, Revisions, Terminal};
 use secrets::redact::{self, Finding};
 use secrets::{
-    Wording, added, check_changes, check_commits, list_findings, report_secrets, warn_about_commits,
+    AtCommit, Wording, added, check_changes, check_commits, list_findings, report_secrets,
+    warn_about_commits,
 };
 use server::{Message, ModelServer, Server};
 use split::signals::Stopped;
@@ -249,6 +250,9 @@ async fn generate(args: &GenerateArgs, overrides: &Overrides) -> Result<()> {
 
     let config = Config::load(overrides)?.config;
     let repo = Repo::open(".")?;
+    if !args.raw {
+        refuse_unknown_commit_args(&args.git_args)?;
+    }
     let may_ask = !args.commit && !args.raw && io::stdin().is_terminal();
     let asking = may_ask.then_some(&Terminal as &dyn Person);
     let Some(ToCommit {
@@ -276,13 +280,23 @@ async fn generate(args: &GenerateArgs, overrides: &Overrides) -> Result<()> {
     }
     let redacted = redact::diff(&changes.diff);
     changes.diff = redacted.text;
-    check_changes(
+    let found = check_changes(
         &repo,
         scope,
         config.on_secrets,
         &redacted.findings,
         &COMMIT_SECRETS,
     )?;
+    let at = AtCommit {
+        on_secrets: config.on_secrets,
+        before: &found,
+    };
+    let new_commit = |message| NewCommit {
+        message,
+        scope,
+        git_args: &args.git_args,
+        leave_out: &leave_out,
+    };
     report_secrets(
         &redacted.findings,
         "If they are real, take them out of the files before you commit.",
@@ -311,7 +325,7 @@ async fn generate(args: &GenerateArgs, overrides: &Overrides) -> Result<()> {
     }
     review::show_proposal(&COMMIT_REVIEW, &message);
     if args.commit {
-        commit(&repo, &message, scope, &args.git_args, &leave_out)?;
+        commit(&repo, &new_commit(&message), at)?;
         if args.push {
             push(&repo, false, config.on_secrets).context(NOT_PUSHED)?;
         }
@@ -337,7 +351,7 @@ async fn generate(args: &GenerateArgs, overrides: &Overrides) -> Result<()> {
         ui::info("Nothing committed.");
         return Ok(());
     };
-    commit(&repo, &message, scope, &args.git_args, &leave_out)?;
+    commit(&repo, &new_commit(&message), at)?;
     if acceptance.pushes() || args.push {
         push(&repo, true, config.on_secrets).context(NOT_PUSHED)?;
     }
@@ -1376,6 +1390,7 @@ fn show_config(overrides: &Overrides) -> Result<()> {
 mod tests {
     use super::*;
     use crate::git::test_support::{isolated_repo, run};
+    use crate::secrets::contents::Scanned;
     use crate::server::test_support::FakeServer;
     use conversation::test_support::configured;
     use tempfile::TempDir;
@@ -1594,7 +1609,17 @@ mod tests {
             .unwrap();
 
         assert_eq!(message, "feat: add[2J a\n\nbodytext");
-        commit(&repo, &message, Scope::Staged, &[], &[]).unwrap();
+        let new_commit = NewCommit {
+            message: &message,
+            scope: Scope::Staged,
+            git_args: &[],
+            leave_out: &[],
+        };
+        let at = AtCommit {
+            on_secrets: config::OnSecrets::Reject,
+            before: &Scanned::default(),
+        };
+        commit(&repo, &new_commit, at).unwrap();
         assert_eq!(
             run(dir.path(), &["log", "-1", "--format=%B"]).trim_end(),
             message

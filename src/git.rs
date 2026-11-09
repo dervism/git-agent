@@ -1361,6 +1361,84 @@ impl Repo {
         Ok(())
     }
 
+    /// Undoes the commit `made`: moves `branch`, or a detached HEAD when it's `None`, back to
+    /// `before`, or deletes the branch when `before` is `None`, as it was before its first commit.
+    /// Moves nothing, and fails, unless it's still at `made`. The index is left as it is.
+    pub fn undo_commit(
+        &self,
+        made: &str,
+        before: Option<&str>,
+        branch: Option<&str>,
+    ) -> Result<()> {
+        const REASON: &str = "git-agent: undo a commit that adds what look like secrets";
+        match (branch, before) {
+            (Some(branch), Some(before)) => {
+                self.git(&["update-ref", "-m", REASON, branch, before, made])
+            }
+            (None, Some(before)) => self.git(&[
+                "update-ref",
+                "--no-deref",
+                "-m",
+                REASON,
+                "HEAD",
+                before,
+                made,
+            ]),
+            (Some(branch), None) => self.git(&["update-ref", "-m", REASON, "-d", branch, made]),
+            (None, None) => bail!("a first commit on a detached HEAD can't be undone"),
+        }
+        .map(drop)
+    }
+
+    /// The commit HEAD is at, or `None` on a branch without commits yet. Fails when git can't
+    /// tell which, rather than take the failure for a branch without commits.
+    pub fn head_commit(&self) -> Result<Option<String>> {
+        if let Some(hash) = self.resolve("HEAD")? {
+            return Ok(Some(hash));
+        }
+        let branch = self
+            .head_branch()?
+            .context("HEAD names neither a commit nor a branch")?;
+        let found = self
+            .command(&["show-ref", "--verify", "--quiet", &branch])
+            .status()
+            .context("failed to run git; is it installed?")?;
+        if found.success() {
+            bail!("git couldn't read the commit {branch} is at");
+        }
+        Ok(None)
+    }
+
+    /// The branch HEAD is on, such as `refs/heads/main`, or `None` when HEAD is detached.
+    pub fn head_branch(&self) -> Result<Option<String>> {
+        let output = self
+            .command(&["symbolic-ref", "--quiet", "HEAD"])
+            .output()
+            .context("failed to run git; is it installed?")?;
+        match output.status.code() {
+            Some(0) => Ok(Some(
+                String::from_utf8_lossy(&output.stdout).trim().to_owned(),
+            )),
+            Some(1) => Ok(None),
+            _ => bail!(
+                "`git symbolic-ref HEAD` failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ),
+        }
+    }
+
+    /// The parents of `commit` as git stores it, whatever a replacement or a graft says.
+    pub fn stored_parents(&self, commit: &str) -> Result<Vec<String>> {
+        let line = self.git_published(&["rev-list", "--parents", "--max-count=1", commit, "--"])?;
+        Ok(line.split_whitespace().skip(1).map(str::to_owned).collect())
+    }
+
+    /// Whether git reads and writes an index of git-agent's own here rather than the user's, as
+    /// a split's commits do.
+    pub fn uses_own_index(&self) -> bool {
+        self.index.is_some()
+    }
+
     /// Pushes the current branch. A branch without an upstream is pushed to the
     /// default remote and its upstream is set, like `git push --set-upstream`.
     pub fn push(&self) -> Result<()> {
@@ -3258,5 +3336,44 @@ mod tests {
         for path in ["open.env", "plain.rs", "lib.rs", "missing.txt"] {
             assert_eq!(repo.filter_of(path).unwrap(), None, "{path}");
         }
+    }
+
+    /// An undo moves a branch, or a detached HEAD, back only while it's still at the commit, and
+    /// deletes a branch whose first commit it was.
+    #[test]
+    fn undoes_a_commit_only_while_head_is_at_it() {
+        let (dir, repo) = setup();
+        let dir = dir.path();
+        let first = run(dir, &["rev-parse", "HEAD"]).trim().to_owned();
+        run(dir, &["commit", "-q", "--allow-empty", "-m", "second"]);
+        let second = run(dir, &["rev-parse", "HEAD"]).trim().to_owned();
+        let branch = Some("refs/heads/main");
+
+        assert!(repo.undo_commit(&first, Some(&first), branch).is_err());
+        assert_eq!(run(dir, &["rev-parse", "main"]).trim(), second);
+        repo.undo_commit(&second, Some(&first), branch).unwrap();
+        assert_eq!(run(dir, &["rev-parse", "main"]).trim(), first);
+
+        run(dir, &["checkout", "-q", "--detach"]);
+        run(dir, &["commit", "-q", "--allow-empty", "-m", "detached"]);
+        let detached = run(dir, &["rev-parse", "HEAD"]).trim().to_owned();
+        repo.undo_commit(&detached, Some(&first), None).unwrap();
+        assert_eq!(run(dir, &["rev-parse", "HEAD"]).trim(), first);
+        assert_eq!(repo.head_branch().unwrap(), None);
+
+        run(dir, &["checkout", "-q", "--orphan", "fresh"]);
+        run(dir, &["commit", "-q", "--allow-empty", "-m", "root"]);
+        let root = run(dir, &["rev-parse", "HEAD"]).trim().to_owned();
+        assert!(
+            repo.undo_commit(&first, None, Some("refs/heads/fresh"))
+                .is_err()
+        );
+        repo.undo_commit(&root, None, Some("refs/heads/fresh"))
+            .unwrap();
+        assert_eq!(repo.head_commit().unwrap(), None);
+        assert_eq!(
+            repo.head_branch().unwrap().as_deref(),
+            Some("refs/heads/fresh")
+        );
     }
 }

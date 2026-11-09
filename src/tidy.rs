@@ -8,6 +8,7 @@
 //! --autosquash` would do.
 
 use crate::conversation::fit;
+use crate::git::is_commit_hash;
 use crate::safe_text::{escaped, one_line};
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
@@ -375,7 +376,7 @@ pub fn todo(plan: &Plan, commits: &[Commit], messages: &[Option<PathBuf>]) -> Re
 /// them, before it goes into the todo.
 fn hash_of(commit: &Commit) -> Result<&str> {
     let hash = commit.short.as_str();
-    if (4..=64).contains(&hash.len()) && hash.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+    if is_commit_hash(hash) {
         Ok(hash)
     } else {
         bail!("git-agent read a commit whose hash isn't one, so it won't rewrite the commits")

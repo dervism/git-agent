@@ -68,8 +68,7 @@ pub fn check_changes(
     reported: &[Finding],
     wording: &Wording,
 ) -> Result<()> {
-    let findings = redact::diff_findings(&repo.changes_to_publish(scope)?);
-    settle(verdict(&findings, on_secrets, reported, wording))
+    settle(changes_verdict(repo, scope, on_secrets, reported, wording)?)
 }
 
 /// Checks the messages and every file of the commits `range` (`git log` arguments) publishes.
@@ -81,8 +80,7 @@ pub fn check_commits(
     reported: &[Finding],
     wording: &Wording,
 ) -> Result<()> {
-    let findings = scan_commits(&repo.published_commits(range)?);
-    settle(verdict(&findings, on_secrets, reported, wording))
+    settle(commits_verdict(repo, range, on_secrets, reported, wording)?)
 }
 
 /// Warns, whatever the setting, about the secrets the commits `range` publishes add, apart
@@ -93,13 +91,47 @@ pub fn warn_about_commits(
     reported: &[Finding],
     warned: &str,
 ) -> Result<()> {
-    let findings = scan_commits(&repo.published_commits(range)?);
-    settle(warning(&findings, reported, warned).map_or(Verdict::Clean, Verdict::Warn))
+    settle(commits_warning(repo, range, reported, warned)?)
 }
 
 /// Checks the commits a push of HEAD would send.
 pub fn check_outgoing(repo: &Repo, on_secrets: OnSecrets) -> Result<()> {
     check_commits(repo, &OUTGOING, on_secrets, &[], &PUSH)
+}
+
+/// What [`check_changes`] decides.
+fn changes_verdict(
+    repo: &Repo,
+    scope: Scope,
+    on_secrets: OnSecrets,
+    reported: &[Finding],
+    wording: &Wording,
+) -> Result<Verdict> {
+    let findings = redact::diff_findings(&repo.changes_to_publish(scope)?);
+    Ok(verdict(&findings, on_secrets, reported, wording))
+}
+
+/// What [`check_commits`] decides.
+fn commits_verdict(
+    repo: &Repo,
+    range: &[&str],
+    on_secrets: OnSecrets,
+    reported: &[Finding],
+    wording: &Wording,
+) -> Result<Verdict> {
+    let findings = scan_commits(&repo.published_commits(range)?);
+    Ok(verdict(&findings, on_secrets, reported, wording))
+}
+
+/// What [`warn_about_commits`] decides.
+fn commits_warning(
+    repo: &Repo,
+    range: &[&str],
+    reported: &[Finding],
+    warned: &str,
+) -> Result<Verdict> {
+    let findings = scan_commits(&repo.published_commits(range)?);
+    Ok(warning(&findings, reported, warned).map_or(Verdict::Clean, Verdict::Warn))
 }
 
 /// What to do about `findings`: a refusal lists every secret they add, and a warning those of
@@ -214,7 +246,7 @@ pub fn list_findings(findings: &[&Finding]) -> String {
 mod tests {
     use super::*;
     use crate::config::DEFAULT_EXCLUDE;
-    use crate::git::test_support::{isolated_repo, run};
+    use crate::git::test_support::{isolated_repo, move_pointer, run, with_submodule};
     use std::fs;
     use std::path::Path;
     use tempfile::TempDir;
@@ -455,7 +487,9 @@ mod tests {
             let refusal = refusal_of(check_staged(&repo, Scope::Staged));
 
             assert_eq!(refusal, refused(&[&format!("   {path}:1  AWS access key")]));
-            assert!(check_changes(&repo, Scope::Staged, OnSecrets::Warn, &[], &WORDING).is_ok());
+            let warned = changes_verdict(&repo, Scope::Staged, OnSecrets::Warn, &[], &WORDING);
+            let listed = format!("going on:\n   {path}:1  AWS access key");
+            assert_eq!(warned.unwrap(), Verdict::Warn(listed));
         }
     }
 
@@ -514,7 +548,7 @@ mod tests {
     }
 
     /// Sets what a user can set to hide lines from a plain `git diff` or `git log --patch`,
-    /// name files otherwise, or number lines otherwise.
+    /// name files otherwise, number lines otherwise, or write the log in another encoding.
     fn hide_from_plain_reads(dir: &Path) {
         fs::write(dir.join(".gitattributes"), "*.env diff=blank\n").unwrap();
         for [name, value] in [
@@ -525,6 +559,8 @@ mod tests {
             ["diff.context", "0"],
             ["color.ui", "always"],
             ["core.quotePath", "true"],
+            ["core.bigFileThreshold", "1"],
+            ["i18n.logOutputEncoding", "UTF-16"],
         ] {
             run(dir, &["config", name, value]);
         }
@@ -716,25 +752,100 @@ mod tests {
     #[test]
     fn only_warns_about_commits_whatever_the_setting() {
         let (dir, repo) = isolated_repo();
-        commit_file(
-            dir.path(),
-            &format!("aws {}\n", key()),
-            "add the deploy settings",
-        );
+        let hash = commit_file(dir.path(), &format!("aws {}\n", key()), "add the settings");
+        let shown = format!("going on:\n   commit {hash} deploy.env:1  AWS access key");
 
+        let warned = commits_warning(&repo, &["HEAD"], &[], "going on").unwrap();
+
+        assert_eq!(warned, Verdict::Warn(shown));
+        let in_file = finding("deploy.env", Some(1), Change::Added);
+        let reported = [Finding {
+            kind: "AWS access key".to_owned(),
+            ..in_file
+        }];
+        let warned = commits_warning(&repo, &["HEAD"], &reported, "going on").unwrap();
+        assert_eq!(warned, Verdict::Clean);
         assert!(warn_about_commits(&repo, &["HEAD"], &[], "going on").is_ok());
     }
 
     #[test]
     fn lets_the_push_through_when_set_to_warn() {
         let (dir, repo) = isolated_repo();
-        commit_file(
-            dir.path(),
-            &format!("aws {}\n", key()),
-            "add the deploy settings",
+        let hash = commit_file(dir.path(), &format!("aws {}\n", key()), "add the settings");
+        let shown = format!(
+            "pushing commits that add what look like secrets:\n   commit {hash} deploy.env:1  \
+             AWS access key"
         );
 
+        let warned = commits_verdict(&repo, &OUTGOING, OnSecrets::Warn, &[], &PUSH).unwrap();
+
+        assert_eq!(warned, Verdict::Warn(shown));
         assert!(check_outgoing(&repo, OnSecrets::Warn).is_ok());
+    }
+
+    /// A merge of commits that were checked or published adds nothing itself.
+    #[test]
+    fn lets_a_merge_of_published_commits_through() {
+        let (dir, repo) = isolated_repo();
+        let dir = dir.path();
+        run(dir, &["checkout", "-q", "-b", "side"]);
+        commit_file(dir, &format!("aws {}\n", key()), "add the deploy settings");
+        run(dir, &["update-ref", "refs/remotes/origin/side", "HEAD"]);
+        run(dir, &["checkout", "-q", "main"]);
+        commit_at(dir, "main.txt", "main\n", "work on main");
+        run(
+            dir,
+            &["merge", "-q", "--no-ff", "-m", "merge the side", "side"],
+        );
+
+        assert!(check_outgoing(&repo, OnSecrets::Reject).is_ok());
+    }
+
+    /// A submodule's own files aren't part of a commit or push of this repository, whatever
+    /// `diff.submodule` says.
+    #[test]
+    fn reads_a_submodule_as_the_commit_it_points_to() {
+        let (dir, repo, library, _) = with_submodule();
+        commit_at(
+            library.path(),
+            "k.env",
+            &format!("aws {}\n", key()),
+            "add a key",
+        );
+        let moved = run(library.path(), &["rev-parse", "HEAD"]);
+        move_pointer(dir.path(), moved.trim());
+        run(dir.path(), &["config", "diff.submodule", "diff"]);
+        run(dir.path(), &["add", "library"]);
+        assert!(run(dir.path(), &["diff", "--cached"]).contains("+aws"));
+
+        assert!(check_staged(&repo, Scope::Staged).is_ok());
+        run(dir.path(), &["commit", "-q", "-m", "move the library"]);
+        let range = ["HEAD~1..HEAD"];
+        assert!(check_commits(&repo, &range, OnSecrets::Reject, &[], &WORDING).is_ok());
+    }
+
+    /// A graft can make a commit look published, or change what a commit adds, but a push sends
+    /// the parents a commit has.
+    #[test]
+    fn reads_the_commits_a_push_sends_whatever_a_graft_says() {
+        let (dir, repo) = isolated_repo();
+        let dir = dir.path();
+        let first = run(dir, &["rev-parse", "HEAD"]);
+        let hash = commit_file(dir, &format!("aws {}\n", key()), "add the deploy settings");
+        let second = run(dir, &["rev-parse", "HEAD"]);
+        run(
+            dir,
+            &["update-ref", "refs/remotes/origin/main", first.trim()],
+        );
+        let grafts = format!("{} {}\n", first.trim(), second.trim());
+        fs::write(dir.join(".git/info/grafts"), grafts).unwrap();
+        let grafted = run(dir, &["log", "--format=%h", "HEAD", "--not", "--remotes"]);
+        assert!(grafted.is_empty(), "{grafted}");
+
+        let error = check_outgoing(&repo, OnSecrets::Reject).unwrap_err();
+
+        let shown = format!("commit {hash} deploy.env:1  AWS access key");
+        assert!(error.to_string().contains(&shown), "{error}");
     }
 
     #[test]

@@ -138,6 +138,36 @@ const QUOTED_NAMES: [&str; 2] = ["-c", "core.quotePath=true"];
 /// and not to `git commit`, because `-c` values reach the user's hooks.
 const WHOLE_TREE: [&str; 2] = ["-c", "diff.relative=false"];
 
+/// Makes `git log` and its kin write messages in UTF-8, whatever `i18n.logOutputEncoding`
+/// says: an encoding such as UTF-16 would split the marks that [`MarkedLog`] reads records by.
+const UTF8_LOGS: [&str; 2] = ["-c", "i18n.logOutputEncoding=UTF-8"];
+
+/// Settings in the environment that change what a pathspec means. git-agent writes its
+/// pathspecs for git's default meaning, with magic such as `:(top,exclude)`, which
+/// `GIT_LITERAL_PATHSPECS` would turn into plain names.
+const PATHSPEC_SETTINGS: [&str; 4] = [
+    "GIT_LITERAL_PATHSPECS",
+    "GIT_GLOB_PATHSPECS",
+    "GIT_NOGLOB_PATHSPECS",
+    "GIT_ICASE_PATHSPECS",
+];
+
+/// What the reads for the secret checks add to a readable read: the objects as they are,
+/// rather than as `git replace` shows them, a blank context line as git prints it by default,
+/// so that line numbers come out right, and git's default size above which a file counts as
+/// binary.
+const PUBLISHED_SETTINGS: [&str; 5] = [
+    "--no-replace-objects",
+    "-c",
+    "diff.suppressBlankEmpty=false",
+    "-c",
+    "core.bigFileThreshold=512m",
+];
+
+/// A graft file that can't exist, since `/dev/null` is no folder. Grafts change the parents
+/// git's reads see, but not what a push sends.
+const NO_GRAFTS: &str = "/dev/null/no-grafts";
+
 pub struct Repo {
     /// Directory git commands run in.
     workdir: PathBuf,
@@ -253,6 +283,9 @@ impl Repo {
                 .arg(format!("core.attributesFile={}", attributes.display()));
         }
         command.args(args);
+        for name in PATHSPEC_SETTINGS {
+            command.env_remove(name);
+        }
         if let Some(index) = &self.index {
             command.env("GIT_INDEX_FILE", index);
         }
@@ -267,18 +300,7 @@ impl Repo {
 
     /// Runs git and returns its stdout as it is, failing with its stderr.
     fn git_bytes(&self, args: &[&str]) -> Result<Vec<u8>> {
-        let output = self
-            .command(args)
-            .output()
-            .context("failed to run git; is it installed?")?;
-        if !output.status.success() {
-            bail!(
-                "`git {}` failed: {}",
-                args.join(" "),
-                String::from_utf8_lossy(&output.stderr).trim()
-            );
-        }
-        Ok(output.stdout)
+        stdout_of(self.command(args), args)
     }
 
     /// Runs git for a `-z` list, whose names are in the form [`lossless`] describes, so
@@ -390,7 +412,16 @@ impl Repo {
 
     /// Runs git like [`Repo::git`], for output that names files to people or models.
     fn git_readable(&self, args: &[&str]) -> Result<String> {
-        self.git(&[&READABLE_NAMES[..], &WHOLE_TREE, args].concat())
+        self.git(&readable(args))
+    }
+
+    /// Runs a read for the secret checks: a readable read, with [`PUBLISHED_SETTINGS`] and
+    /// without grafts.
+    fn git_published(&self, args: &[&str]) -> Result<String> {
+        let args = readable(&[&PUBLISHED_SETTINGS[..], args].concat());
+        let mut command = self.command(&args);
+        command.env("GIT_GRAFT_FILE", NO_GRAFTS);
+        Ok(String::from_utf8_lossy(&stdout_of(command, &args)?).into_owned())
     }
 
     fn has_diff(&self, args: &[&str]) -> Result<bool> {
@@ -747,13 +778,12 @@ impl Repo {
             text: self.git_readable(&args)?,
             marks,
         };
-        Ok(log.patches())
+        log.patches()
     }
 
     /// What a commit in `scope` will hold, read for the secret checks rather than for the
     /// model: every file, whatever `exclude` says, with git's settings that change a diff
-    /// pinned, and HEAD as it is rather than as a replacement (`git replace`) shows it. The
-    /// Tracked scope reads from HEAD, so what's staged meanwhile is read too.
+    /// pinned. The Tracked scope reads from HEAD, so what's staged meanwhile is read too.
     pub fn changes_to_publish(&self, scope: Scope) -> Result<String> {
         let base = match scope {
             Scope::Staged => "--cached".to_owned(),
@@ -762,28 +792,19 @@ impl Repo {
                 None => self.empty_tree()?,
             },
         };
-        let mut args = vec![
-            "--no-replace-objects",
-            "-c",
-            "diff.suppressBlankEmpty=false",
-            "diff",
-            &base,
-        ];
+        let mut args = vec!["diff", &base];
         args.extend(PUBLISHED_DIFF);
         args.extend(["--", ":/"]);
-        self.git_readable(&args)
+        self.git_published(&args)
     }
 
     /// The commits `range` (`git log` arguments) publishes, with their patches, read for the
     /// secret checks: every commit and every file, what a merge adds itself, and the root
-    /// commit's diff, whatever the user's settings say.
+    /// commit's diff, whatever the user's settings, replacements and grafts say.
     pub fn published_commits(&self, range: &[&str]) -> Result<Vec<CommitPatch>> {
         let marks = LogMarks::new();
         let format = marks.patch_format();
         let mut args = vec![
-            "--no-replace-objects",
-            "-c",
-            "diff.suppressBlankEmpty=false",
             "log",
             "--patch",
             "--cc",
@@ -795,10 +816,10 @@ impl Repo {
         args.extend_from_slice(range);
         args.push("--");
         let log = MarkedLog {
-            text: self.git_readable(&args)?,
+            text: self.git_published(&args)?,
             marks,
         };
-        Ok(log.patches())
+        log.patches()
     }
 
     /// The commits on HEAD that `base` lacks, oldest first, without merges.
@@ -815,7 +836,7 @@ impl Repo {
         args.extend_from_slice(revisions);
         args.push("--");
         let log = MarkedLog {
-            text: self.git(&args)?,
+            text: self.git_readable(&args)?,
             marks,
         };
         let commits = log.records(1).into_iter().filter_map(|parts| {
@@ -853,7 +874,7 @@ impl Repo {
             return Ok(None);
         }
         let output = self
-            .command(&["rev-parse", "--verify", "--quiet"])
+            .command(&["--no-replace-objects", "rev-parse", "--verify", "--quiet"])
             .arg(format!("{revision}^{{commit}}"))
             .output()
             .context("failed to run git; is it installed?")?;
@@ -1521,18 +1542,28 @@ impl MarkedLog {
             .collect()
     }
 
-    /// The commits of output in [`LogMarks::patch_format`], with their patches.
-    fn patches(&self) -> Vec<CommitPatch> {
-        let commits = self.records(3).into_iter().filter_map(|parts| {
-            let mut parts = parts.into_iter();
-            let hash = parts.next()?.trim();
-            (!hash.is_empty()).then(|| CommitPatch {
-                hash: hash.to_owned(),
-                message: parts.next().unwrap_or_default().trim().to_owned(),
-                patch: parts.next().unwrap_or_default().to_owned(),
+    /// The commits of output in [`LogMarks::patch_format`], with their patches. Fails on a
+    /// record that doesn't start with a commit's hash, as when the marks didn't come out as
+    /// written, rather than read a commit as none.
+    fn patches(&self) -> Result<Vec<CommitPatch>> {
+        self.records(3)
+            .into_iter()
+            .filter(|parts| parts.iter().any(|part| !part.trim().is_empty()))
+            .map(|parts| {
+                let mut parts = parts.into_iter();
+                let hash = parts.next().unwrap_or_default().trim();
+                if !is_commit_hash(hash) {
+                    bail!(
+                        "git-agent couldn't read git's list of commits: a commit in it has no hash"
+                    );
+                }
+                Ok(CommitPatch {
+                    hash: hash.to_owned(),
+                    message: parts.next().unwrap_or_default().trim().to_owned(),
+                    patch: parts.next().unwrap_or_default().to_owned(),
+                })
             })
-        });
-        commits.collect()
+            .collect()
     }
 
     /// The output as git wrote it.
@@ -1597,9 +1628,10 @@ fn random_hex() -> String {
     format!("{:016x}{:016x}", half(0), half(1))
 }
 
-/// The options of a diff read for the secret checks: no textconv, and the settings that change
+/// The options of a diff read for the secret checks: no textconv, a submodule as the commit it
+/// points to, and the settings that change
 /// what a diff shows pinned to git's defaults.
-const PUBLISHED_DIFF: [&str; 9] = [
+const PUBLISHED_DIFF: [&str; 10] = [
     "--no-color",
     "--no-ext-diff",
     "--no-textconv",
@@ -1609,7 +1641,33 @@ const PUBLISHED_DIFF: [&str; 9] = [
     "--full-index",
     "--src-prefix=a/",
     "--dst-prefix=b/",
+    "--submodule=short",
 ];
+
+/// `args` with the settings of a read whose output names files to people or models.
+fn readable<'a>(args: &[&'a str]) -> Vec<&'a str> {
+    [&READABLE_NAMES[..], &WHOLE_TREE, &UTF8_LOGS, args].concat()
+}
+
+/// Runs `command`, git with `args`, and returns its stdout as it is, failing with its stderr.
+fn stdout_of(mut command: Command, args: &[&str]) -> Result<Vec<u8>> {
+    let output = command
+        .output()
+        .context("failed to run git; is it installed?")?;
+    if !output.status.success() {
+        bail!(
+            "`git {}` failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(output.stdout)
+}
+
+/// Whether `text` is a commit's hash, short or full: 4 to 64 hex digits.
+pub fn is_commit_hash(text: &str) -> bool {
+    (4..=64).contains(&text.len()) && text.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
 
 /// Pathspecs that leave `patterns` out of a diff, matched from the repository root.
 fn exclude_pathspecs(patterns: &[String]) -> Vec<String> {
@@ -2830,5 +2888,70 @@ mod tests {
         run(dir.path(), &["add", "--all"]);
         run(dir.path(), &["commit", "-q", "-m", "move the library"]);
         assert_eq!(repo.changed_between("HEAD~", "HEAD").unwrap(), ["library"]);
+    }
+
+    /// Every pathspec git-agent writes means what it does by git's default, whatever the
+    /// environment says.
+    #[test]
+    fn runs_git_without_the_settings_that_change_what_a_pathspec_means() {
+        let (_dir, repo) = setup();
+        let command = repo.command(&["status"]);
+        let mut removed: Vec<&std::ffi::OsStr> = command
+            .get_envs()
+            .filter(|(_, value)| value.is_none())
+            .map(|(name, _)| name)
+            .collect();
+        removed.sort();
+        let mut expected = PATHSPEC_SETTINGS.map(std::ffi::OsStr::new);
+        expected.sort();
+        assert_eq!(removed, expected);
+    }
+
+    /// Output whose marks didn't come out as written, as with a log encoding such as UTF-16,
+    /// fails rather than read as no commits.
+    #[test]
+    fn refuses_a_list_of_commits_with_a_record_that_has_no_hash() {
+        let patches = |text: &str| MarkedLog::plain(text).patches();
+        let read = patches("\u{1e}1a2b3c4\u{1f}subject\n\u{1f}diff --git a/x b/x\n").unwrap();
+        assert_eq!(read.len(), 1);
+        assert_eq!(
+            (read[0].hash.as_str(), read[0].message.as_str()),
+            ("1a2b3c4", "subject")
+        );
+        assert!(patches("").unwrap().is_empty());
+        assert!(patches("\n").unwrap().is_empty());
+        for broken in [
+            "1a2b3c4 subject diff --git a/x b/x",
+            "\u{1e}not a hash\u{1f}subject\u{1f}",
+            "\u{1e}\u{1f}subject\u{1f}diff --git a/x b/x",
+            "\u{1e}1a2\u{1f}subject\u{1f}",
+        ] {
+            assert!(patches(broken).is_err(), "{broken:?}");
+        }
+    }
+
+    /// `git replace` can swap HEAD for a tag of another commit, but a commit's parent, and what
+    /// a push sends, is HEAD as it is.
+    #[test]
+    fn resolves_a_commit_as_it_is_whatever_a_replacement_says() {
+        let (dir, repo) = setup();
+        let dir = dir.path();
+        let head = run(dir, &["rev-parse", "HEAD"]);
+        let other = run(dir, &["commit-tree", "-m", "other", "HEAD^{tree}"]);
+        let tag = [
+            "-c",
+            "tag.gpgSign=false",
+            "tag",
+            "-a",
+            "-m",
+            "other",
+            "other",
+        ];
+        run(dir, &[&tag[..], &[other.trim()]].concat());
+        let tag = run(dir, &["rev-parse", "other"]);
+        run(dir, &["replace", "-f", head.trim(), tag.trim()]);
+        assert_eq!(run(dir, &["rev-parse", "HEAD^{commit}"]), other);
+
+        assert_eq!(repo.resolve("HEAD").unwrap().as_deref(), Some(head.trim()));
     }
 }

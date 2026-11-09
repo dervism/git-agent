@@ -39,7 +39,7 @@ use git::{Changes, CommitPatch, Repo, Scope};
 use github::PullRequest;
 use prompt::Work;
 use redact::{Change, Finding};
-use review::{Action, Choice, Review};
+use review::{Action, Choice, Person, Review, Revisions, Terminal};
 use server::{Message, ModelServer, Server};
 use split::signals::Stopped;
 use std::fs;
@@ -304,17 +304,14 @@ async fn generate(args: &GenerateArgs, overrides: &Overrides) -> Result<()> {
         return Ok(());
     }
 
-    let edit = |message: &str| review::edit_message(&repo, message);
-    let reviewed = review::revise(
-        &COMMIT_REVIEW,
-        message,
-        &server,
-        &model,
-        &conversation,
-        edit,
-        separated,
-    )
-    .await?;
+    let revisions = Revisions {
+        server: &server,
+        model: &model,
+        conversation: &conversation,
+        edit: |message: &str| review::edit_message(&repo, message),
+        clean: separated,
+    };
+    let reviewed = review::revise(&COMMIT_REVIEW, message, revisions, &Terminal).await?;
     let Some((acceptance, message)) = reviewed else {
         ui::info("Nothing committed.");
         return Ok(());
@@ -461,17 +458,14 @@ async fn pull_request(args: &PrArgs, overrides: &Overrides) -> Result<()> {
         ));
         return Ok(());
     } else {
-        let edit = |text: &str| review::edit_pull_request(&repo, text);
-        let reviewed = review::revise(
-            &PULL_REQUEST_REVIEW,
-            text,
-            &server,
-            &model,
-            &conversation,
-            edit,
-            Ok,
-        )
-        .await?;
+        let revisions = Revisions {
+            server: &server,
+            model: &model,
+            conversation: &conversation,
+            edit: |text: &str| review::edit_pull_request(&repo, text),
+            clean: Ok,
+        };
+        let reviewed = review::revise(&PULL_REQUEST_REVIEW, text, revisions, &Terminal).await?;
         let Some(reviewed) = reviewed else {
             ui::info("No pull request created.");
             return Ok(());
@@ -582,16 +576,14 @@ async fn new_branch(args: &BranchArgs, overrides: &Overrides) -> Result<()> {
             edited.map(|edited| branch_name(&repo, &edited)).transpose()
         };
         name = loop {
-            let reviewed = review::revise(
-                &BRANCH_REVIEW,
-                name,
-                &server,
-                &model,
-                &conversation,
-                &edit,
-                &clean,
-            )
-            .await?;
+            let revisions = Revisions {
+                server: &server,
+                model: &model,
+                conversation: &conversation,
+                edit: &edit,
+                clean: &clean,
+            };
+            let reviewed = review::revise(&BRANCH_REVIEW, name, revisions, &Terminal).await?;
             let Some(((), reviewed)) = reviewed else {
                 ui::info("No branch created.");
                 return Ok(());
@@ -720,6 +712,7 @@ async fn tidy_commits(args: &TidyArgs, overrides: &Overrides) -> Result<()> {
         server: &server,
         model: &model,
         commits: &commits,
+        person: &Terminal,
     };
     let mut plan = tidier.ask_for_plan(&conversation, true).await?;
     if args.apply || !io::stdin().is_terminal() {
@@ -796,6 +789,7 @@ struct Tidier<'a> {
     server: &'a Server,
     model: &'a Model,
     commits: &'a [tidy::Commit],
+    person: &'a dyn Person,
 }
 
 impl Tidier<'_> {
@@ -832,7 +826,7 @@ impl Tidier<'_> {
     ) -> Result<Option<tidy::Plan>> {
         loop {
             ui::show_framed(TIDY_REVIEW.heading, &tidy::show(&plan, self.commits));
-            let revised = match review::ask_action(&TIDY_REVIEW)? {
+            let revised = match review::ask_action(&TIDY_REVIEW, self.person)? {
                 Action::Accept(()) => return Ok(Some(plan)),
                 Action::Quit => return Ok(None),
                 Action::Edit => review::edit_plan(
@@ -897,17 +891,15 @@ impl Tidier<'_> {
             let (acceptance, message) = if args.apply {
                 (TidyMessageAcceptance::UseNew, message)
             } else {
-                let edit = |message: &str| review::edit_message(self.repo, message);
-                let reviewed = review::revise(
-                    &TIDY_MESSAGE_REVIEW,
-                    message,
-                    self.server,
-                    self.model,
-                    &conversation,
-                    edit,
-                    separated,
-                )
-                .await?;
+                let revisions = Revisions {
+                    server: self.server,
+                    model: self.model,
+                    conversation: &conversation,
+                    edit: |message: &str| review::edit_message(self.repo, message),
+                    clean: separated,
+                };
+                let reviewed =
+                    review::revise(&TIDY_MESSAGE_REVIEW, message, revisions, self.person).await?;
                 match reviewed {
                     Some(reviewed) => reviewed,
                     None => return Ok(false),
@@ -1062,6 +1054,7 @@ async fn explain_lines(args: &WhyArgs, overrides: &Overrides) -> Result<()> {
         &model,
         &format!("Why {}", target.label()),
         conversation,
+        &Terminal,
     )
     .await
 }
@@ -1188,7 +1181,7 @@ async fn explain_commits(args: &ExplainArgs, overrides: &Overrides) -> Result<()
     );
     let smaller = (!subject.single).then_some("explain fewer commits at a time");
     report_fit(&model, &fit, "explanation", smaller);
-    discuss(&server, &model, &subject.heading, conversation).await
+    discuss(&server, &model, &subject.heading, conversation, &Terminal).await
 }
 
 /// Pushes the branch if GitHub lacks some of its commits, then creates the

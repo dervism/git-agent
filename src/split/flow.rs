@@ -15,7 +15,7 @@ use crate::conversation::{
 };
 use crate::git::worktree::TempWorktree;
 use crate::git::{Changes, Repo, Scope, names};
-use crate::review::{self, Action, Choice, Review};
+use crate::review::{self, Action, Choice, Person, Review, Revisions, Terminal};
 use crate::server::{Message, ModelServer};
 use crate::ui;
 use crate::{
@@ -103,7 +103,7 @@ pub async fn run(args: &SplitArgs, overrides: &Overrides) -> Result<()> {
         return Ok(());
     };
     let (server, model) = connect(&config).await?;
-    split_changes(&repo, args, &config, &work, &server, &model).await
+    split_changes(&repo, args, &config, &work, &server, &model, &Terminal).await
 }
 
 /// The changes to split, as they were before the model was asked anything.
@@ -164,6 +164,7 @@ async fn split_changes<S: ModelServer>(
     work: &Work,
     server: &S,
     model: &Model,
+    person: &dyn Person,
 ) -> Result<()> {
     let room = model.budget().user_message_bytes(prompt::SPLIT_PROMPT);
     let described = split::describe(&work.files, room)?;
@@ -187,6 +188,7 @@ async fn split_changes<S: ModelServer>(
         units: &described.units,
         server,
         model,
+        person,
     };
     let Some((plan, acceptance)) = splitter.accepted_plan(&conversation).await? else {
         return Ok(());
@@ -320,6 +322,7 @@ struct Splitter<'a, S> {
     units: &'a [Unit],
     server: &'a S,
     model: &'a Model,
+    person: &'a dyn Person,
 }
 
 /// What happens to one commit once its message is written.
@@ -454,7 +457,7 @@ impl<S: ModelServer> Splitter<'_, S> {
     ) -> Result<Option<(Plan, PlanAcceptance)>> {
         loop {
             ui::show_framed(PLAN_REVIEW.heading, &self.show(&plan));
-            let revised = match review::ask_action(&PLAN_REVIEW)? {
+            let revised = match review::ask_action(&PLAN_REVIEW, self.person)? {
                 Action::Accept(acceptance) => return Ok(Some((plan, acceptance))),
                 Action::Quit => return Ok(None),
                 Action::Edit => self.edit_plan(&plan),
@@ -644,16 +647,15 @@ impl<S: ModelServer> Splitter<'_, S> {
         conversation: &[Message],
         kind: Option<Kind>,
     ) -> Result<Decision> {
-        let reviewed = review::revise(
-            &SPLIT_COMMIT_REVIEW,
-            message,
-            self.server,
-            self.model,
+        let revisions = Revisions {
+            server: self.server,
+            model: self.model,
             conversation,
-            |message: &str| review::edit_message(self.repo, message),
-            |message| separated(message).map(|message| kinds::with_type(&message, kind)),
-        )
-        .await?;
+            edit: |message: &str| review::edit_message(self.repo, message),
+            clean: |message| separated(message).map(|message| kinds::with_type(&message, kind)),
+        };
+        let reviewed =
+            review::revise(&SPLIT_COMMIT_REVIEW, message, revisions, self.person).await?;
         Ok(match reviewed {
             Some((SplitCommitAcceptance::Commit, message)) => Decision::Commit(message),
             Some((SplitCommitAcceptance::Skip, _)) => Decision::Skip,
@@ -822,7 +824,7 @@ fn report_merged(merged: &[String], why: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::conversation::test_support::configured;
+    use crate::conversation::test_support::{ScriptedPerson, configured};
     use crate::git::test_support::{isolated_repo, numbered_lines, run, with_submodule};
     use crate::server::test_support::FakeServer;
     use std::cell::{Cell, RefCell};
@@ -866,7 +868,7 @@ mod tests {
 
         /// A server that answers as this model.
         fn server(self) -> FakeServer<'a> {
-            FakeServer::answering(move |messages| self.reply(messages))
+            FakeServer::answering(move |messages| Ok(self.reply(messages)))
         }
 
         fn reply(&self, conversation: &[Message]) -> String {
@@ -944,7 +946,17 @@ mod tests {
     async fn split(repo: &Repo, args: &SplitArgs, server: &FakeServer<'_>) -> Result<()> {
         let config = Config::default();
         let work = changes_to_split(repo, args, &config)?.expect("changes to split");
-        split_changes(repo, args, &config, &work, server, &configured(100_000)).await
+        let person = ScriptedPerson::away();
+        split_changes(
+            repo,
+            args,
+            &config,
+            &work,
+            server,
+            &configured(100_000),
+            &person,
+        )
+        .await
     }
 
     fn write(dir: &Path, name: &str, text: &str) {
@@ -1241,6 +1253,7 @@ mod tests {
             units: &units,
             server: &server,
             model: &model,
+            person: &ScriptedPerson::away(),
         };
         let titles =
             |plan: &Plan| -> Vec<String> { plan.commits.iter().map(|c| c.title.clone()).collect() };
@@ -1434,6 +1447,7 @@ mod tests {
             units: &units,
             server,
             model: &model,
+            person: &ScriptedPerson::away(),
         };
         let conversation = [Message::system(prompt::SPLIT_PROMPT)];
         let plan = splitter.new_plan(&conversation).await?;

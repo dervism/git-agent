@@ -1,5 +1,5 @@
 //! Sending the conversation to the model and reading its reply: connecting, generating a
-//! message, and a discussion with follow-up questions.
+//! message, and a discussion with follow-up questions with the person it's for.
 
 use super::messages::follow_up;
 use super::models::{self, Model};
@@ -8,7 +8,20 @@ use crate::config::Config;
 use crate::server::{Message, ModelServer, Request, Server};
 use crate::{safe_text, ui};
 use anyhow::{Result, bail};
-use std::io::{self, IsTerminal};
+
+/// The person a discussion with the model is for.
+pub trait Discussant {
+    /// Whether the person can ask follow-up questions: they type at a terminal and read the
+    /// answers on one.
+    fn is_interactive(&self) -> bool;
+
+    /// Shows the person the model's answer, under `heading`.
+    fn show_answer(&self, heading: &str, answer: &str);
+
+    /// The follow-up question the person types, or `None` at end of input. An empty one
+    /// ends the discussion too.
+    fn ask_follow_up(&self) -> Result<Option<String>>;
+}
 
 /// Connects to the configured server and picks the model to use.
 pub async fn connect(config: &Config) -> Result<(Server, Model)> {
@@ -68,20 +81,24 @@ pub async fn commit_message(
         .and_then(separated)
 }
 
-/// Shows the model's answer to `conversation` under `heading`, then answers
-/// follow-up questions until the user is done or the context is full.
+/// Shows `discussant` the model's answer to `conversation` under `heading`, then answers
+/// their follow-up questions until they are done or the context is full.
 pub async fn discuss(
     server: &impl ModelServer,
     model: &Model,
     heading: &str,
     mut conversation: Vec<Message>,
+    discussant: &dyn Discussant,
 ) -> Result<()> {
     let mut answer = generate_message(server, model, &conversation).await?;
-    ui::show_answer(heading, &answer);
-    if !io::stdin().is_terminal() || !ui::stdout_is_terminal() {
+    discussant.show_answer(heading, &answer);
+    if !discussant.is_interactive() {
         return Ok(());
     }
-    while let Some(question) = ui::ask_follow_up()? {
+    while let Some(question) = discussant
+        .ask_follow_up()?
+        .filter(|question| !question.is_empty())
+    {
         let next = follow_up(&conversation, &answer, &question);
         if !model.budget().has_room_for_a_reply(&next) {
             ui::info(ui::dim(
@@ -95,7 +112,7 @@ pub async fn discuss(
             Ok(reply) => {
                 conversation = next;
                 answer = reply;
-                ui::show_answer(heading, &answer);
+                discussant.show_answer(heading, &answer);
             }
             Err(err) => ui::error(&err),
         }
@@ -103,11 +120,181 @@ pub async fn discuss(
     Ok(())
 }
 
+/// A person for tests.
+#[cfg(test)]
+pub mod test_support {
+    use super::Discussant;
+    use anyhow::Result;
+    use std::cell::RefCell;
+    use std::collections::VecDeque;
+
+    /// A person who types the given lines in turn, trimmed as the terminal trims them, and
+    /// keeps every answer they were shown.
+    pub struct ScriptedPerson {
+        interactive: bool,
+        lines: RefCell<VecDeque<String>>,
+        pub shown: RefCell<Vec<String>>,
+    }
+
+    impl ScriptedPerson {
+        /// At a terminal, typing `lines`, and then nothing more.
+        pub fn typing(lines: &[&str]) -> Self {
+            Self {
+                interactive: true,
+                lines: RefCell::new(lines.iter().map(|&line| line.to_owned()).collect()),
+                shown: RefCell::new(Vec::new()),
+            }
+        }
+
+        /// Not at a terminal, with input from a pipe that holds `lines`.
+        pub fn piping(lines: &[&str]) -> Self {
+            Self {
+                interactive: false,
+                ..Self::typing(lines)
+            }
+        }
+
+        /// Not at a terminal, and with nothing to read.
+        pub fn away() -> Self {
+            Self::piping(&[])
+        }
+
+        /// The next line the person types, or `None` once the lines run out.
+        pub fn next_line(&self) -> Option<String> {
+            let line = self.lines.borrow_mut().pop_front();
+            line.map(|line| line.trim().to_owned())
+        }
+
+        /// The lines not typed yet.
+        pub fn lines_left(&self) -> usize {
+            self.lines.borrow().len()
+        }
+    }
+
+    impl Discussant for ScriptedPerson {
+        fn is_interactive(&self) -> bool {
+            self.interactive
+        }
+
+        fn show_answer(&self, _heading: &str, answer: &str) {
+            self.shown.borrow_mut().push(answer.to_owned());
+        }
+
+        fn ask_follow_up(&self) -> Result<Option<String>> {
+            Ok(self.next_line())
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use super::test_support::ScriptedPerson;
     use super::*;
     use crate::conversation::test_support::configured;
+    use crate::server::Role;
     use crate::server::test_support::FakeServer;
+    use anyhow::anyhow;
+    use std::cell::Cell;
+
+    /// A model that answers each question with its number, and fails at the `failing`th.
+    fn numbering(failing: usize) -> impl Fn(&[Message]) -> Result<String> {
+        let asked = Cell::new(0);
+        move |_| {
+            asked.set(asked.get() + 1);
+            match asked.get() {
+                n if n == failing => Err(anyhow!("the server went away")),
+                n => Ok(format!("answer {n}")),
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn answers_follow_up_questions_until_an_empty_one() {
+        let server = FakeServer::answering(numbering(0));
+        let person = ScriptedPerson::typing(&["Why?", "  And then?  ", "", "never asked"]);
+        let conversation = vec![Message::user("explain")];
+
+        discuss(&server, &configured(100_000), "H", conversation, &person)
+            .await
+            .unwrap();
+
+        assert_eq!(*person.shown.borrow(), ["answer 1", "answer 2", "answer 3"]);
+        assert_eq!(person.lines_left(), 1);
+        let last = server.received.borrow()[2].clone();
+        let turns: Vec<(Role, &str)> = last
+            .iter()
+            .map(|message| (message.role, message.content.as_str()))
+            .collect();
+        assert_eq!(
+            turns,
+            [
+                (Role::User, "explain"),
+                (Role::Assistant, "answer 1"),
+                (Role::User, "Why?"),
+                (Role::Assistant, "answer 2"),
+                (Role::User, "And then?"),
+            ]
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn asks_nothing_of_a_person_away_from_the_terminal() {
+        let server = FakeServer::replying("the answer");
+        let person = ScriptedPerson::piping(&["never asked"]);
+
+        discuss(&server, &configured(100_000), "H", vec![], &person)
+            .await
+            .unwrap();
+
+        assert_eq!(*person.shown.borrow(), ["the answer"]);
+        assert_eq!(server.received.borrow().len(), 1);
+        assert_eq!(person.lines_left(), 1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn forgets_a_question_whose_answer_failed_and_takes_the_next() {
+        let server = FakeServer::answering(numbering(2));
+        let person = ScriptedPerson::typing(&["lost", "kept"]);
+
+        discuss(&server, &configured(100_000), "H", vec![], &person)
+            .await
+            .unwrap();
+
+        assert_eq!(*person.shown.borrow(), ["answer 1", "answer 3"]);
+        let sent = server.received.borrow();
+        let last_question = |turn: usize| sent[turn].last().unwrap().content.clone();
+        assert_eq!(last_question(1), "lost");
+        assert_eq!(last_question(2), "kept");
+        assert!(sent[2].iter().all(|message| message.content != "lost"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn stops_when_the_next_question_no_longer_fits() {
+        let server = FakeServer::replying("the answer");
+        let long = "word ".repeat(3000);
+        let person = ScriptedPerson::typing(&[&long, "never asked"]);
+
+        discuss(&server, &configured(4096), "H", vec![], &person)
+            .await
+            .unwrap();
+
+        assert_eq!(*person.shown.borrow(), ["the answer"]);
+        assert_eq!(server.received.borrow().len(), 1);
+        assert_eq!(person.lines_left(), 1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn fails_when_the_first_answer_fails() {
+        let server = FakeServer::answering(numbering(1));
+        let person = ScriptedPerson::typing(&["never asked"]);
+
+        let error = discuss(&server, &configured(100_000), "H", vec![], &person)
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.to_string(), "the server went away");
+        assert!(person.shown.borrow().is_empty());
+    }
 
     #[tokio::test(flavor = "current_thread")]
     async fn sends_the_model_escaped_text_with_letters_and_line_endings_intact() {

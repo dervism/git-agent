@@ -130,7 +130,7 @@ pub mod test_support {
     use std::cell::RefCell;
 
     /// How a fake model answers a conversation.
-    type Answer<'a> = Box<dyn Fn(&[Message]) -> String + 'a>;
+    type Answer<'a> = Box<dyn Fn(&[Message]) -> Result<String> + 'a>;
 
     /// A model server for tests. It answers each conversation from the conversation as
     /// sent, keeps every conversation it was sent, and lists its models if it was given
@@ -144,11 +144,12 @@ pub mod test_support {
     impl<'a> FakeServer<'a> {
         /// A model that gives the same reply to everything.
         pub fn replying(reply: &'a str) -> Self {
-            Self::answering(move |_| reply.to_owned())
+            Self::answering(move |_| Ok(reply.to_owned()))
         }
 
-        /// A model that answers with what `answer` makes of the conversation.
-        pub fn answering(answer: impl Fn(&[Message]) -> String + 'a) -> Self {
+        /// A model that answers with what `answer` makes of the conversation, or fails as
+        /// it says.
+        pub fn answering(answer: impl Fn(&[Message]) -> Result<String> + 'a) -> Self {
             Self {
                 models: None,
                 answer: Box::new(answer),
@@ -179,7 +180,7 @@ pub mod test_support {
 
         async fn complete(&self, request: &Request<'_>) -> Result<Reply> {
             self.received.borrow_mut().push(request.messages().to_vec());
-            Ok(Reply::new((self.answer)(request.messages())))
+            (self.answer)(request.messages()).map(Reply::new)
         }
     }
 }

@@ -1,15 +1,25 @@
 //! The review of a proposal: what it shows, the choices that accept it and the keys that pick
-//! them, editing it, and the loop that revises it with the model until the user accepts it or
-//! quits.
+//! them, the person who reviews it, editing it, and the loop that revises it with the model
+//! until the person accepts it or quits.
 
 mod editor;
 mod revise;
+mod terminal;
 
+use crate::conversation::Discussant;
 use crate::ui;
 use anyhow::Result;
 
 pub use editor::{edit_message, edit_plan, edit_pull_request};
-pub use revise::{revise, show_proposal};
+pub use revise::{Revisions, revise, show_proposal};
+pub use terminal::Terminal;
+
+/// The person who reviews a proposal. As a [`Discussant`], they also read the model's answers
+/// and ask follow-up questions.
+pub trait Person: Discussant {
+    /// The line the person types at `prompt`, or `None` at end of input.
+    fn typed_at(&self, prompt: &str) -> Result<Option<String>>;
+}
 
 /// What a review shows, and the choices that accept the proposal besides
 /// editing, regenerating, feedback and quitting.
@@ -144,17 +154,19 @@ pub fn parse<T: Copy>(review: &Review<T>, line: &str) -> Typed<T> {
     }
 }
 
-/// Asks what to do with the proposal. End of input counts as quitting.
-pub fn ask_action<T: Copy>(review: &Review<T>) -> Result<Action<T>> {
+/// Asks `person` what to do with the proposal. End of input counts as quitting.
+pub fn ask_action<T: Copy>(review: &Review<T>, person: &dyn Person) -> Result<Action<T>> {
     let menu = menu(review);
     loop {
-        let Some(line) = ui::read_line(&menu)? else {
+        let Some(line) = person.typed_at(&menu)? else {
             return Ok(Action::Quit);
         };
         match parse(review, &line) {
             Typed::Action(action) => return Ok(action),
             Typed::FeedbackToFollow => {
-                let feedback = ui::read_line("What should change? ›")?.unwrap_or_default();
+                let feedback = person
+                    .typed_at("What should change? ›")?
+                    .unwrap_or_default();
                 if !feedback.is_empty() {
                     return Ok(Action::Refine(feedback));
                 }
@@ -188,13 +200,18 @@ pub fn accepted<T: Copy>(review: &Review<T>, choice: &str) -> Option<T> {
 
 /// The choices and keys a review offers, each with its letter in bold.
 fn menu<T>(review: &Review<T>) -> String {
-    let words = review.accept.iter().map(|choice| choice.word);
-    let mut items: Vec<String> = words
-        .chain(Key::SHOWN.map(Key::word))
+    let mut items: Vec<String> = menu_words(review)
+        .into_iter()
         .map(|word| format!("{}{}", ui::bold(&format!("[{}]", &word[..1])), &word[1..]))
         .collect();
     items.push(ui::dim(&format!("[{HELP_ALIAS}]")));
     format!("{} ›", items.join("  "))
+}
+
+/// The words of the menu: the review's accept choices, then the keys it shows.
+fn menu_words<T>(review: &Review<T>) -> Vec<&'static str> {
+    let choices = review.accept.iter().map(|choice| choice.word);
+    choices.chain(Key::SHOWN.map(Key::word)).collect()
 }
 
 fn help<T>(review: &Review<T>) -> String {
@@ -220,7 +237,37 @@ fn help<T>(review: &Review<T>) -> String {
 /// What the tests of the reviews share.
 #[cfg(test)]
 pub mod test_support {
-    use super::{Key, Review};
+    use super::{Choice, Key, Person, Review};
+    use crate::conversation::test_support::ScriptedPerson;
+    use anyhow::Result;
+
+    impl Person for ScriptedPerson {
+        fn typed_at(&self, _prompt: &str) -> Result<Option<String>> {
+            Ok(self.next_line())
+        }
+    }
+
+    /// A review to test with: `c` creates (1), and `d` makes a draft (2).
+    pub const REVIEW: Review<u8> = Review {
+        heading: "Proposed thing",
+        first_line: "title",
+        noun: "thing",
+        what: "thing",
+        edit: "edit the thing in your editor",
+        accept: &[
+            Choice {
+                word: "create",
+                help: "create it",
+                value: 1,
+            },
+            Choice {
+                word: "draft",
+                help: "create a draft",
+                value: 2,
+            },
+        ],
+        quit: "quit without creating it",
+    };
 
     /// Checks that `review` has a choice for `y`, and that each accept choice can be typed
     /// as its first letter: a lower-case ASCII letter that no other choice and no other key
@@ -251,28 +298,45 @@ pub mod test_support {
 
 #[cfg(test)]
 mod tests {
+    use super::test_support::REVIEW;
     use super::*;
+    use crate::conversation::test_support::ScriptedPerson;
 
-    const REVIEW: Review<u8> = Review {
-        heading: "Proposed thing",
-        first_line: "title",
-        noun: "thing",
-        what: "thing",
-        edit: "edit the thing in your editor",
-        accept: &[
-            Choice {
-                word: "create",
-                help: "create it",
-                value: 1,
-            },
-            Choice {
-                word: "draft",
-                help: "create a draft",
-                value: 2,
-            },
-        ],
-        quit: "quit without creating it",
-    };
+    fn asked(lines: &[&str]) -> (Action<u8>, usize) {
+        let person = ScriptedPerson::typing(lines);
+        let action = ask_action(&REVIEW, &person).unwrap();
+        (action, person.lines_left())
+    }
+
+    #[test]
+    fn keeps_asking_after_an_empty_line_help_or_an_unknown_word() {
+        assert_eq!(asked(&["", "?", "zap", "d", "c"]), (Action::Accept(2), 1));
+    }
+
+    #[test]
+    fn asks_for_feedback_on_the_next_line_and_goes_back_on_an_empty_one() {
+        let refined = Action::Refine("shorter".to_owned());
+        assert_eq!(asked(&["f", "", "f", " shorter "]), (refined, 0));
+    }
+
+    #[test]
+    fn quits_at_the_end_of_input() {
+        assert_eq!(asked(&[]), (Action::Quit, 0));
+        assert_eq!(asked(&["f"]), (Action::Quit, 0));
+    }
+
+    #[test]
+    fn offers_the_choices_then_the_keys_and_help() {
+        assert_eq!(
+            menu_words(&REVIEW),
+            ["create", "draft", "edit", "regenerate", "feedback", "quit"]
+        );
+        let menu = menu(&REVIEW);
+        for item in ["[c]", "reate", "[d]", "raft", "[q]", "uit", "[?]"] {
+            assert!(menu.contains(item), "{item:?} in {menu:?}");
+        }
+        assert!(menu.ends_with(" ›"), "{menu:?}");
+    }
 
     #[test]
     fn accepts_choices_by_letter_or_word() {

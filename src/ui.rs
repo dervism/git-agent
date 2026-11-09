@@ -204,13 +204,13 @@ pub fn show_answer(heading: &str, text: &str) {
     }
 }
 
-/// Asks for a follow-up question. `None` when the user is done.
+/// Asks for a follow-up question, trimmed, or `None` at end of input. An empty one means the
+/// user is done, which [`crate::conversation::discuss`] decides.
 pub fn ask_follow_up() -> Result<Option<String>> {
-    let question = read_line(&format!(
+    read_line(&format!(
         "Follow-up question {} ›",
         dim("(Enter to finish)")
-    ))?;
-    Ok(question.filter(|question| !question.is_empty()))
+    ))
 }
 
 /// Shows an animated progress line on stderr until dropped.

@@ -13,6 +13,7 @@ use crate::conversation::{
     commit_message, connect, generate_message, initial_messages, report_fit, report_model,
     separated, tokens_in,
 };
+use crate::delivery::{commit, push};
 use crate::git::worktree::TempWorktree;
 use crate::git::{Changes, Repo, Scope, names};
 use crate::review::{self, Action, Choice, Person, Review, Revisions, Terminal};
@@ -20,7 +21,7 @@ use crate::secrets::{check_outgoing, redact, reject_added, report_secrets};
 use crate::server::{Message, ModelServer};
 use crate::staging::{self, Purpose, Staged};
 use crate::ui;
-use crate::{commit, prompt, push, split};
+use crate::{prompt, split};
 use anyhow::{Context, Result, bail};
 use std::fs;
 use std::io::{self, IsTerminal};

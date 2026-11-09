@@ -42,6 +42,7 @@ const LAYERS: &[(&str, Layer)] = &[
     ("tidy", Feature),
     ("why", Feature),
     ("staging", Shared("staging")),
+    ("delivery", Shared("delivery")),
     ("secrets", Shared("secrets")),
     ("review", Shared("review")),
     ("conversation", Shared("conversation")),
@@ -71,8 +72,6 @@ const KNOWN: &[(&str, &str)] = &[
     // Step 4: each feature owns its arguments.
     ("explain", "cli"),
     ("split", "cli"),
-    // Step 3: the shared steps leave `main`.
-    ("split", "main"),
     // Step 5: why's parsers of git's output move to `git/blame.rs`, and git's tests build their
     // line ranges themselves instead of with `why::Target` and `why::head_line`.
     ("git", "why"),
@@ -477,11 +476,20 @@ mod tests {
     }
 
     #[test]
+    fn one_place_commits() {
+        let sources = sources();
+        assert_eq!(
+            occurrences(&sources, ".commit("),
+            BTreeMap::from([("delivery".to_owned(), 1)])
+        );
+    }
+
+    #[test]
     fn one_place_pushes() {
         let sources = sources();
         assert_eq!(
             occurrences(&sources, ".push()"),
-            BTreeMap::from([("main".to_owned(), 1)])
+            BTreeMap::from([("delivery".to_owned(), 1)])
         );
         assert!(modules_with(&sources, &["Repo::push"]).is_empty());
     }

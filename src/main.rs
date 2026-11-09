@@ -5,6 +5,7 @@ mod branch;
 mod cli;
 mod config;
 mod conversation;
+mod delivery;
 mod explain;
 mod git;
 mod github;
@@ -34,6 +35,7 @@ use conversation::{
     commit_message, connect, discuss, generate_message, initial_messages, notes_bytes,
     question_bytes, report_fit, report_model, separated, tokens_in,
 };
+use delivery::{commit, push};
 use git::{Changes, Repo, Scope};
 use github::PullRequest;
 use prompt::Work;
@@ -1222,48 +1224,6 @@ fn create_pull_request(
     }
     ui::info(ui::green("✅ Pull request created."));
     Ok(())
-}
-
-fn commit(
-    repo: &Repo,
-    message: &str,
-    scope: Scope,
-    git_args: &[String],
-    leave_out: &[String],
-) -> Result<()> {
-    repo.commit(message, scope, git_args, leave_out)?;
-    ui::info(ui::green("✅ Committed."));
-    Ok(())
-}
-
-/// Pushes, first rebasing onto commits that reached the remote from elsewhere
-/// (e.g. edits made on GitHub). With `ask`, the user confirms the rebase.
-/// Returns whether it pushed: the user may decline the rebase.
-fn push(repo: &Repo, ask: bool) -> Result<bool> {
-    const SHOWN: usize = 5;
-
-    let incoming = repo.incoming_commits()?;
-    if !incoming.is_empty() {
-        ui::info(format!(
-            "The remote has {} commit(s) you don't have yet:",
-            incoming.len()
-        ));
-        for commit in incoming.iter().take(SHOWN) {
-            ui::info(format!("   {commit}"));
-        }
-        if incoming.len() > SHOWN {
-            ui::info(format!("   … and {} more", incoming.len() - SHOWN));
-        }
-        if ask && !ui::confirm("Rebase your commits on top of them and push?")? {
-            ui::info("Not pushed. When you're ready, run `git pull --rebase` and `git push`.");
-            return Ok(false);
-        }
-        repo.rebase_onto_upstream()?;
-        ui::info("🔀 Rebased onto the remote commits.");
-    }
-    repo.push()?;
-    ui::info(ui::green("✅ Pushed."));
-    Ok(true)
 }
 
 async fn list_models(overrides: &Overrides) -> Result<()> {

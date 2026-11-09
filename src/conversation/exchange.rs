@@ -1,8 +1,10 @@
 //! Sending the conversation to the model and reading its reply: connecting, generating a
 //! message, and a discussion with follow-up questions.
 
+use super::budget::{has_room, outgrew_context};
+use super::messages::follow_up;
 use super::models::{self, Model};
-use super::{clean_reply, estimate_tokens, follow_up, has_room, outgrew_context, separate_subject};
+use super::reply::{clean_reply, separated};
 use crate::config::Config;
 use crate::server::{Message, ModelServer, Request, Server};
 use crate::{safe_text, ui};
@@ -26,7 +28,7 @@ pub async fn generate_message(
     model: &Model,
     conversation: &[Message],
 ) -> Result<String> {
-    let request = Request::new(&model.id, conversation);
+    let request = Request::escaped(&model.id, conversation);
     if outgrew_context(
         conversation,
         request.messages(),
@@ -69,17 +71,11 @@ pub async fn commit_message(
         .and_then(separated)
 }
 
-/// A review's way of tidying a new commit message (see [`commit_message`]).
-pub fn separated(message: String) -> Result<String> {
-    Ok(separate_subject(&message))
-}
-
 /// Shows the model's answer to `conversation` under `heading`, then answers
 /// follow-up questions until the user is done or the context is full.
 pub async fn discuss(
     server: &impl ModelServer,
     model: &Model,
-    config: &Config,
     heading: &str,
     mut conversation: Vec<Message>,
 ) -> Result<()> {
@@ -90,7 +86,7 @@ pub async fn discuss(
     }
     while let Some(question) = ui::ask_follow_up()? {
         let next = follow_up(&conversation, &answer, &question);
-        if !has_room(&next, model.context_length, config.max_output_tokens) {
+        if !has_room(&next, model.context_length, model.max_output_tokens) {
             ui::info(ui::dim(
                 "The conversation no longer fits in the model's context; ask your question in a \
                  new run.",
@@ -108,13 +104,6 @@ pub async fn discuss(
         }
     }
     Ok(())
-}
-
-pub fn conversation_tokens(conversation: &[Message]) -> usize {
-    conversation
-        .iter()
-        .map(|message| estimate_tokens(&message.content))
-        .sum()
 }
 
 #[cfg(test)]

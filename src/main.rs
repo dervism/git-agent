@@ -31,8 +31,8 @@ use cli::{
 use config::{Config, OnSecrets, Overrides};
 use conversation::models::{self, Model};
 use conversation::{
-    commit_message, connect, conversation_tokens, discuss, generate_message, report_fit,
-    report_model, separated,
+    commit_message, connect, discuss, generate_message, initial_messages, notes_bytes,
+    question_bytes, refine_messages, report_fit, report_model, room, separated, tokens_in,
 };
 use git::{Changes, CommitPatch, Repo, Scope};
 use github::PullRequest;
@@ -220,7 +220,7 @@ async fn generate(args: &GenerateArgs, overrides: &Overrides) -> Result<()> {
     );
 
     let (server, model) = connect(&config).await?;
-    let (conversation, fit) = conversation::initial_messages(
+    let (conversation, fit) = initial_messages(
         &config.system_prompt,
         &changes,
         args.hint.as_deref(),
@@ -511,7 +511,7 @@ async fn new_branch(args: &BranchArgs, overrides: &Overrides) -> Result<()> {
         model.context_length,
         config.max_output_tokens,
     );
-    report_model(&model, conversation_tokens(&conversation));
+    report_model(&model, tokens_in(&conversation));
     let clean = |reply: String| {
         let name = branch_name(&repo, &reply)?;
         branch_name(&repo, &branch::drop_unknown_references(&name, &mentioned))
@@ -671,15 +671,15 @@ async fn tidy_commits(args: &TidyArgs, overrides: &Overrides) -> Result<()> {
     }
 
     let (server, model) = connect(&config).await?;
-    let room = conversation::room(
+    let room = room(
         prompt::TIDY_PROMPT,
         model.context_length,
         config.max_output_tokens,
     )
-    .saturating_sub(conversation::notes_bytes(args.hint.as_deref()));
+    .saturating_sub(notes_bytes(args.hint.as_deref()));
     let text = redact::text(&tidy::describe(&commits, room), "commits").text;
     let conversation = prompt::tidy_messages(&text, args.hint.as_deref());
-    report_model(&model, conversation_tokens(&conversation));
+    report_model(&model, tokens_in(&conversation));
     let tidier = Tidier {
         repo: &repo,
         server: &server,
@@ -848,7 +848,7 @@ impl Tidier<'_> {
             if let Some(extra) = &args.hint {
                 hint = format!("{hint}\n{extra}");
             }
-            let (conversation, fit) = conversation::initial_messages(
+            let (conversation, fit) = initial_messages(
                 &config.system_prompt,
                 &changes,
                 Some(&hint),
@@ -1002,16 +1002,16 @@ async fn explain_lines(args: &WhyArgs, overrides: &Overrides) -> Result<()> {
     );
 
     let (server, model) = connect(&config).await?;
-    let room = conversation::room(
+    let room = room(
         prompt::WHY_PROMPT,
         model.context_length,
         config.max_output_tokens,
     )
-    .saturating_sub(conversation::question_bytes(args.question.as_deref()));
+    .saturating_sub(question_bytes(args.question.as_deref()));
     let intro = why::intro(&target, lines, &uncommitted, &excerpt.text, &blame.text);
     let described = why::describe(&intro, &history, complete, room);
     let conversation = prompt::why_messages(&described.text, args.question.as_deref());
-    report_model(&model, conversation_tokens(&conversation));
+    report_model(&model, tokens_in(&conversation));
     if described.left_out > 0 || described.cut > 0 {
         let mut parts = Vec::new();
         if described.left_out > 0 {
@@ -1028,7 +1028,6 @@ async fn explain_lines(args: &WhyArgs, overrides: &Overrides) -> Result<()> {
     discuss(
         &server,
         &model,
-        &config,
         &format!("Why {}", target.label()),
         conversation,
     )
@@ -1158,7 +1157,7 @@ async fn explain_commits(args: &ExplainArgs, overrides: &Overrides) -> Result<()
     );
     let smaller = (!subject.single).then_some("explain fewer commits at a time");
     report_fit(&model, &fit, "explanation", smaller);
-    discuss(&server, &model, &config, &subject.heading, conversation).await
+    discuss(&server, &model, &subject.heading, conversation).await
 }
 
 /// Lets the user review `text` until they accept or quit it, revising it as
@@ -1183,8 +1182,7 @@ async fn review<T: Copy>(
                 .and_then(&clean)
                 .map(Some),
             Action::Refine(feedback) => {
-                let refined =
-                    conversation::refine_messages(conversation, &text, &feedback, review.what);
+                let refined = refine_messages(conversation, &text, &feedback, review.what);
                 generate_message(server, model, &refined)
                     .await
                     .and_then(&clean)

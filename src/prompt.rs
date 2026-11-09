@@ -1,7 +1,7 @@
 //! The prompts of each command, until each moves into its feature.
 
 use crate::conversation::fit;
-use crate::conversation::messages::{Fit, asks, describe_changes, notes, room, with_commits};
+use crate::conversation::{Fit, asks, describe_changes, notes, room, with_commits};
 use crate::git::Changes;
 use crate::github::Issue;
 use crate::server::Message;
@@ -303,8 +303,7 @@ pub fn split_title(text: &str) -> (String, String) {
 mod tests {
     use super::*;
     use crate::config::DEFAULT_MAX_OUTPUT_TOKENS as REPLY;
-    use crate::conversation::messages::test_support::{changes, diff};
-    use crate::conversation::{follow_up, has_room, notes_bytes, question_bytes};
+    use crate::conversation::test_support::{changes, diff};
 
     #[test]
     fn pull_request_message_lists_commits_before_the_changes() {
@@ -365,24 +364,12 @@ mod tests {
     }
 
     #[test]
-    fn asks_why_and_follows_up_while_there_is_room() {
+    fn asks_why_with_the_question_first() {
         let messages = why_messages("Explain line 3 of a.rs.\n", None);
         assert_eq!(messages[0].content, WHY_PROMPT);
         assert_eq!(messages[1].content, "Explain line 3 of a.rs.\n");
-        assert_eq!(question_bytes(Some("  ")), 0);
         let asked = why_messages("history\n", Some("why 3?"));
         assert_eq!(asked[1].content, "The developer asks:\nwhy 3?\n\nhistory\n");
-        assert_eq!(
-            question_bytes(Some("why 3?")),
-            "The developer asks:\nwhy 3?\n\n".len()
-        );
-
-        let next = follow_up(&messages, "Because.", "And line 4?");
-        assert_eq!(next.len(), 4);
-        assert_eq!(next[3].content, "And line 4?");
-        assert!(has_room(&next, 4096, REPLY));
-        let long = follow_up(&messages, &"word ".repeat(3000), "more?");
-        assert!(!has_room(&long, 4096, REPLY));
     }
 
     #[test]
@@ -459,7 +446,6 @@ mod tests {
             tidy[1].content,
             "Notes from the author:\nfixes #3\n\nCommits, oldest first:\nCommit 1 (a1b2c3d):\n    wip\n"
         );
-        assert_eq!(notes_bytes(None), 0);
     }
 
     #[test]

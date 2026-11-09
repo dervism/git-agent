@@ -1,6 +1,7 @@
 //! Cleaning up a model's reply, so that what's shown is what gets committed.
 
 use crate::safe_text::{self, Cleaned, without_hidden};
+use anyhow::Result;
 
 /// A model's reply, without the reasoning and code fences that models sometimes wrap
 /// around it, and without hidden characters, so that what's shown is what gets committed.
@@ -30,9 +31,15 @@ fn strip_code_fence(text: &str) -> &str {
     body.trim_end().strip_suffix("```").unwrap_or(body)
 }
 
+/// A new commit message with its subject apart from its body (see [`separate_subject`]),
+/// in the form a review's `and_then` takes.
+pub fn separated(message: String) -> Result<String> {
+    Ok(separate_subject(&message))
+}
+
 /// `message` with a blank line between its subject and its body, which git
 /// needs to tell them apart. Models sometimes leave it out.
-pub fn separate_subject(message: &str) -> String {
+fn separate_subject(message: &str) -> String {
     match message.split_once('\n') {
         Some((subject, body)) if !body.starts_with('\n') && !body.trim().is_empty() => {
             format!("{subject}\n\n{body}")

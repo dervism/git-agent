@@ -77,12 +77,7 @@ impl ModelServer for OpenAiCompatible {
 
     async fn complete(&self, request: &Request<'_>) -> Result<Reply> {
         let url = format!("{}/chat/completions", self.base_url);
-        let body = ChatRequest {
-            model: request.model(),
-            messages: request.messages(),
-            temperature: self.temperature,
-            stream: false,
-        };
+        let body = ChatRequest::new(request, self.temperature);
         let response: ChatResponse = self.send(self.http.post(&url).json(&body), &url).await?;
         let text = response
             .choices
@@ -90,7 +85,7 @@ impl ModelServer for OpenAiCompatible {
             .next()
             .and_then(|choice| choice.message.content)
             .ok_or_else(|| anyhow!("the model returned no message"))?;
-        Ok(Reply { text })
+        Ok(Reply::new(text))
     }
 }
 
@@ -101,6 +96,17 @@ struct ChatRequest<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     temperature: Option<f32>,
     stream: bool,
+}
+
+impl<'a> ChatRequest<'a> {
+    fn new(request: &'a Request<'_>, temperature: Option<f32>) -> Self {
+        Self {
+            model: request.model(),
+            messages: request.messages(),
+            temperature,
+            stream: false,
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -250,18 +256,23 @@ mod tests {
     }
 
     #[test]
-    fn sends_temperature_only_when_set() {
-        let request = |temperature| {
-            let body = ChatRequest {
-                model: "m",
-                messages: &[],
-                temperature,
-                stream: false,
-            };
-            serde_json::to_string(&body).unwrap()
-        };
-        assert!(!request(None).contains("temperature"));
-        assert!(request(Some(0.4)).contains("\"temperature\":0.4"));
+    fn sends_the_conversation_escaped_and_temperature_only_when_set() {
+        let conversation = [Message::system("rules"), Message::user("+ a\u{1b}[2J")];
+        let request = Request::escaped("m", &conversation);
+        let body =
+            |temperature| serde_json::to_string(&ChatRequest::new(&request, temperature)).unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&body(None)).unwrap(),
+            serde_json::json!({
+                "model": "m",
+                "messages": [
+                    {"role": "system", "content": "rules"},
+                    {"role": "user", "content": "+ a\\033[2J"},
+                ],
+                "stream": false,
+            })
+        );
+        assert!(body(Some(0.4)).contains("\"temperature\":0.4,"));
     }
 
     #[test]

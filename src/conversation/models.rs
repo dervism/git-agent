@@ -105,28 +105,12 @@ pub fn choose(models: Vec<ModelInfo>) -> Result<ModelInfo> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::server::{Reply, Request};
+    use crate::server::test_support::FakeServer;
 
     fn info(id: &str, loaded: Option<bool>) -> ModelInfo {
         ModelInfo {
             loaded,
             ..ModelInfo::named(id)
-        }
-    }
-
-    /// A server that lists `models`, or fails to if there are none.
-    struct FakeServer(Vec<ModelInfo>);
-
-    impl ModelServer for FakeServer {
-        async fn models(&self) -> Result<Vec<ModelInfo>> {
-            match self.0.as_slice() {
-                [] => bail!("no model list"),
-                models => Ok(models.to_vec()),
-            }
-        }
-
-        async fn complete(&self, _request: &Request<'_>) -> Result<Reply> {
-            unreachable!("choosing a model sends no conversation")
         }
     }
 
@@ -150,7 +134,7 @@ mod tests {
 
     #[tokio::test]
     async fn takes_the_context_from_the_config_then_the_server() {
-        let server = FakeServer(vec![ModelInfo {
+        let server = FakeServer::listing(vec![ModelInfo {
             context_length: Some(32768),
             ..info("gemma", Some(true))
         }]);
@@ -178,12 +162,12 @@ mod tests {
             model: Some("unlisted".into()),
             ..Config::default()
         };
-        let model = resolve(&FakeServer(Vec::new()), &config).await.unwrap();
+        let model = resolve(&FakeServer::unlisted(), &config).await.unwrap();
         assert_eq!(model.context_length, config::FALLBACK_CONTEXT_LENGTH);
         assert_eq!(model.context_source, ContextSource::Assumed);
         // Without a configured model, a server that can't list its models is an error.
         assert!(
-            resolve(&FakeServer(Vec::new()), &Config::default())
+            resolve(&FakeServer::unlisted(), &Config::default())
                 .await
                 .is_err()
         );

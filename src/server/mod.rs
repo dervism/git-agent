@@ -3,17 +3,20 @@
 //! [`ModelServer`] is the interface. `OpenAiCompatible` implements it for the
 //! OpenAI-compatible API that local servers and most cloud providers offer, and
 //! `Anthropic` for Anthropic's Messages API. [`Server`] connects to the one a
-//! config points at. Both share one HTTP transport (`http.rs`).
+//! config points at. Both take a [`Request`] and give back a [`Reply`], and share one
+//! HTTP transport (`http.rs`).
 
 mod anthropic;
 mod http;
 mod openai;
+mod request;
 
 use crate::config::Config;
-use crate::{providers, safe_text};
+use crate::providers;
 use anthropic::Anthropic;
 use anyhow::Result;
 use openai::OpenAiCompatible;
+pub use request::{Reply, Request};
 use serde::Serialize;
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize)]
@@ -24,7 +27,7 @@ pub enum Role {
     Assistant,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Message {
     pub role: Role,
     pub content: String,
@@ -72,42 +75,6 @@ impl ModelInfo {
             context_length: None,
         }
     }
-}
-
-/// What goes to a model: which model, and the conversation, with its control and invisible
-/// characters escaped so that a file can't hide instructions from the person reviewing its
-/// diff. [`Request::new`] is the only way to make one, so nothing reaches a model unescaped.
-/// Patches aren't made from this text, so commits are unchanged.
-pub struct Request<'a> {
-    model: &'a str,
-    messages: Vec<Message>,
-}
-
-impl<'a> Request<'a> {
-    pub fn new(model: &'a str, conversation: &[Message]) -> Self {
-        let messages = conversation
-            .iter()
-            .map(|message| Message {
-                role: message.role,
-                content: safe_text::escaped(&message.content),
-            })
-            .collect();
-        Self { model, messages }
-    }
-
-    pub fn model(&self) -> &str {
-        self.model
-    }
-
-    /// The conversation as it goes to the model, escaped.
-    pub fn messages(&self) -> &[Message] {
-        &self.messages
-    }
-}
-
-/// A model's reply, as the server gave it.
-pub struct Reply {
-    pub text: String,
 }
 
 /// What git-agent needs from a model server.
@@ -159,57 +126,60 @@ impl ModelServer for Server {
 #[cfg(test)]
 pub mod test_support {
     use super::{Message, ModelInfo, ModelServer, Reply, Request};
-    use anyhow::Result;
+    use anyhow::{Result, anyhow};
     use std::cell::RefCell;
 
-    /// A model that always gives the same reply, and keeps each conversation it was sent.
+    /// How a fake model answers a conversation.
+    type Answer<'a> = Box<dyn Fn(&[Message]) -> String + 'a>;
+
+    /// A model server for tests. It answers each conversation from the conversation as
+    /// sent, keeps every conversation it was sent, and lists its models if it was given
+    /// some.
     pub struct FakeServer<'a> {
-        reply: &'a str,
+        models: Option<Vec<ModelInfo>>,
+        answer: Answer<'a>,
         pub received: RefCell<Vec<Vec<Message>>>,
     }
 
     impl<'a> FakeServer<'a> {
+        /// A model that gives the same reply to everything.
         pub fn replying(reply: &'a str) -> Self {
+            Self::answering(move |_| reply.to_owned())
+        }
+
+        /// A model that answers with what `answer` makes of the conversation.
+        pub fn answering(answer: impl Fn(&[Message]) -> String + 'a) -> Self {
             Self {
-                reply,
+                models: None,
+                answer: Box::new(answer),
                 received: RefCell::new(Vec::new()),
             }
+        }
+
+        /// A server that lists `models`, and is sent no conversation.
+        pub fn listing(models: Vec<ModelInfo>) -> Self {
+            Self {
+                models: Some(models),
+                ..Self::unlisted()
+            }
+        }
+
+        /// A server that can't list its models, and is sent no conversation.
+        pub fn unlisted() -> Self {
+            Self::answering(|_| unreachable!("this server is only asked for its models"))
         }
     }
 
     impl ModelServer for FakeServer<'_> {
         async fn models(&self) -> Result<Vec<ModelInfo>> {
-            Ok(Vec::new())
+            self.models
+                .clone()
+                .ok_or_else(|| anyhow!("the server can't list its models"))
         }
 
         async fn complete(&self, request: &Request<'_>) -> Result<Reply> {
             self.received.borrow_mut().push(request.messages().to_vec());
-            Ok(Reply {
-                text: self.reply.to_owned(),
-            })
+            Ok(Reply::new((self.answer)(request.messages())))
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn escapes_what_goes_to_the_model_and_keeps_the_rest() {
-        let conversation = [
-            Message::system("rules"),
-            Message::user("+ blåbær\u{e0041}\r\n+ \u{1b}[2J Kjøre.txt\u{202e}"),
-        ];
-        let request = Request::new("m", &conversation);
-        assert_eq!(request.model(), "m");
-        let sent = request.messages();
-        assert_eq!(sent[0].role, conversation[0].role);
-        assert_eq!(sent[1].role, conversation[1].role);
-        assert_eq!(sent[0].content, "rules");
-        assert_eq!(
-            sent[1].content,
-            "+ blåbær\\363\\240\\201\\201\r\n+ \\033[2J Kjøre.txt\\342\\200\\256"
-        );
     }
 }

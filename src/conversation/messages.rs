@@ -1,16 +1,10 @@
-//! Building the conversation for the model, and sizing it to fit the model's context.
+//! Building the conversation for the model, in the room its context leaves.
 
+use super::budget::{framed_tokens, room, tokens_in};
 use super::fit::{self, FileFit};
 use crate::git::Changes;
 use crate::server::Message;
 use std::fmt::Write;
-
-/// Rough number of bytes per token. Common tokenizers average 3 to 4 bytes per
-/// token for code and English, and about 3 for most other scripts.
-const BYTES_PER_TOKEN: usize = 3;
-
-/// Room for the headings around the changes and the chat template's markup.
-const FRAMING_BYTES: usize = 256;
 
 /// How the changes were fitted into the model's context.
 pub struct Fit {
@@ -37,25 +31,6 @@ impl Fit {
             && self.commits_left_out == 0
             && self.files.iter().all(FileFit::is_whole)
     }
-}
-
-pub fn estimate_tokens(text: &str) -> usize {
-    text.len().div_ceil(BYTES_PER_TOKEN)
-}
-
-/// Tokens kept free for the reply, including any reasoning, and for a round of
-/// feedback: up to the output limit, but at most a quarter of the context, so a
-/// small context still has room for the changes.
-fn reply_reserve(context_length: usize, max_output_tokens: usize) -> usize {
-    (context_length / 4).min(max_output_tokens).max(1024)
-}
-
-/// Bytes the user message may take in a context of `context_length` tokens,
-/// with room for a reply of up to `max_output_tokens`.
-pub fn room(system_prompt: &str, context_length: usize, max_output_tokens: usize) -> usize {
-    let reserve = reply_reserve(context_length, max_output_tokens);
-    let budget = context_length.saturating_sub(reserve) * BYTES_PER_TOKEN;
-    budget.saturating_sub(system_prompt.trim().len() + FRAMING_BYTES)
 }
 
 /// The system prompt plus a user message describing `changes`, shortened to
@@ -107,16 +82,6 @@ pub fn follow_up(base: &[Message], answer: &str, question: &str) -> Vec<Message>
     messages.push(Message::assistant(answer));
     messages.push(Message::user(question));
     messages
-}
-
-/// Whether `messages` leave room in the context for another reply.
-pub fn has_room(messages: &[Message], context_length: usize, max_output_tokens: usize) -> bool {
-    let used: usize = messages
-        .iter()
-        .map(|message| estimate_tokens(&message.content))
-        .sum();
-    let reply = (reply_reserve(context_length, max_output_tokens) / 2).max(1024);
-    used + reply <= context_length
 }
 
 /// The developer's question, if there is one.
@@ -189,10 +154,10 @@ fn build(
 ) -> (Vec<Message>, Fit) {
     let system_prompt = system_prompt.trim();
     let (user, mut fit) = describe_changes(intro, changes, room);
-    fit.prompt_tokens = estimate_tokens(system_prompt) + estimate_tokens(&user);
     let everything = system_prompt.len() + intro_bytes + changes.stat.len() + changes.diff.len();
-    fit.full_tokens = (everything + FRAMING_BYTES).div_ceil(BYTES_PER_TOKEN);
     let messages = vec![Message::system(system_prompt), Message::user(user)];
+    fit.prompt_tokens = tokens_in(&messages);
+    fit.full_tokens = framed_tokens(everything);
     (messages, fit)
 }
 
@@ -269,26 +234,6 @@ pub fn describe_changes(intro: String, changes: &Changes, room: usize) -> (Strin
     (out, fit)
 }
 
-/// Whether escaping made `conversation` too large for the model's context, with room left
-/// for its reply. What's sent is sized before it's escaped, so only text full of such
-/// characters can get here.
-pub fn outgrew_context(
-    conversation: &[Message],
-    outgoing: &[Message],
-    context_length: usize,
-    max_output_tokens: usize,
-) -> bool {
-    let tokens = |messages: &[Message]| -> usize {
-        messages
-            .iter()
-            .map(|message| estimate_tokens(&message.content))
-            .sum()
-    };
-    let (before, after) = (tokens(conversation), tokens(outgoing));
-    let room = context_length.saturating_sub(reply_reserve(context_length, max_output_tokens));
-    before <= room && after > room
-}
-
 /// Bytes the author's notes take in the user message.
 pub fn notes_bytes(hint: Option<&str>) -> usize {
     notes(hint).len()
@@ -317,25 +262,7 @@ mod tests {
     use super::test_support::{changes, diff};
     use super::*;
     use crate::config::DEFAULT_MAX_OUTPUT_TOKENS as REPLY;
-    use crate::server::Request;
-
-    #[test]
-    fn notices_only_escaping_that_outgrows_the_context() {
-        let escaped =
-            |conversation: &[Message]| Request::new("m", conversation).messages().to_vec();
-        let plain = [Message::user("x".repeat(4000))];
-        assert!(!outgrew_context(&plain, &escaped(&plain), 10, REPLY));
-
-        let hidden = [Message::user("\u{1b}".repeat(4000))];
-        let outgoing = escaped(&hidden);
-        assert!(outgrew_context(&hidden, &outgoing, 3000, REPLY));
-        assert!(!outgrew_context(&hidden, &outgoing, 100_000, REPLY));
-        // 4,000 tokens fit in 5,000, but not with 1,250 kept for the reply.
-        assert!(outgrew_context(&hidden, &outgoing, 5000, REPLY));
-        // A conversation over the room already is the server's to judge.
-        let long = [Message::user(format!("{}\u{1b}", "x".repeat(40_000)))];
-        assert!(!outgrew_context(&long, &escaped(&long), 5000, REPLY));
-    }
+    use crate::server::Role;
 
     #[test]
     fn user_message_contains_hint_stat_and_diff() {
@@ -398,6 +325,63 @@ mod tests {
         assert_eq!(messages[2].content, "feat: x");
         assert!(messages[3].content.contains("shorter"));
         assert!(messages[3].content.contains("revised commit message only"));
+    }
+
+    #[test]
+    fn writes_the_question_and_the_notes_only_when_there_is_one() {
+        assert_eq!(asks(None), "");
+        assert_eq!(asks(Some(" \n ")), "");
+        assert_eq!(asks(Some(" why 3? \n")), "The developer asks:\nwhy 3?\n\n");
+        assert_eq!(notes(None), "");
+        assert_eq!(notes(Some("\t")), "");
+        assert_eq!(
+            notes(Some(" fixes #3 ")),
+            "Notes from the author:\nfixes #3\n\n"
+        );
+    }
+
+    #[test]
+    fn measures_the_question_and_the_notes_as_they_are_written() {
+        assert_eq!(question_bytes(None), 0);
+        assert_eq!(question_bytes(Some("  ")), 0);
+        assert_eq!(
+            question_bytes(Some("why 3?")),
+            "The developer asks:\nwhy 3?\n\n".len()
+        );
+        assert_eq!(notes_bytes(None), 0);
+        assert_eq!(notes_bytes(Some(" ")), 0);
+        assert_eq!(
+            notes_bytes(Some("blåbær")),
+            "Notes from the author:\nblåbær\n\n".len()
+        );
+    }
+
+    #[test]
+    fn follows_up_with_the_answer_then_the_question() {
+        let (base, _) = initial_messages("s", &changes("+x\n"), None, 4096, REPLY);
+        let next = follow_up(&base, "Because.", "And line 4?");
+        assert_eq!(next.len(), 4);
+        assert_eq!(next[..2], base[..]);
+        assert_eq!(
+            (next[2].role, next[2].content.as_str()),
+            (Role::Assistant, "Because.")
+        );
+        assert_eq!(
+            (next[3].role, next[3].content.as_str()),
+            (Role::User, "And line 4?")
+        );
+    }
+
+    #[test]
+    fn counts_the_prompt_as_sent_and_the_changes_in_full() {
+        let changes = changes(&diff(1));
+        let (messages, fit) = initial_messages("  system  ", &changes, None, 4096, REPLY);
+        assert_eq!(messages[0].content, "system");
+        assert_eq!(fit.prompt_tokens, tokens_in(&messages));
+        assert_eq!(
+            fit.full_tokens,
+            framed_tokens("system".len() + changes.stat.len() + changes.diff.len())
+        );
     }
 
     #[test]

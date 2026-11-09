@@ -53,10 +53,10 @@ impl ModelServer for Anthropic {
 
     async fn complete(&self, request: &Request<'_>) -> Result<Reply> {
         let url = format!("{}/messages", self.base_url);
-        let body = MessagesRequest::new(request.model(), request.messages(), self.max_tokens);
+        let body = MessagesRequest::new(request, self.max_tokens);
         let response: MessagesResponse = self.send(self.http.post(&url).json(&body), &url).await?;
         let text = response.into_text(self.max_tokens)?;
-        Ok(Reply { text })
+        Ok(Reply::new(text))
     }
 }
 
@@ -71,8 +71,9 @@ struct MessagesRequest<'a> {
 }
 
 impl<'a> MessagesRequest<'a> {
-    fn new(model: &'a str, messages: &'a [Message], max_tokens: usize) -> Self {
-        let (system, turns): (Vec<&Message>, Vec<&Message>) = messages
+    fn new(request: &'a Request<'_>, max_tokens: usize) -> Self {
+        let (system, turns): (Vec<&Message>, Vec<&Message>) = request
+            .messages()
             .iter()
             .partition(|message| message.role == Role::System);
         let system: Vec<&str> = system
@@ -80,7 +81,7 @@ impl<'a> MessagesRequest<'a> {
             .map(|message| message.content.as_str())
             .collect();
         Self {
-            model,
+            model: request.model(),
             max_tokens,
             system: system.join("\n\n"),
             messages: turns,
@@ -162,14 +163,15 @@ mod tests {
     }
 
     #[test]
-    fn sends_the_system_prompt_apart_and_no_temperature() {
+    fn sends_the_system_prompt_apart_escaped_and_no_temperature() {
         let messages = [
             Message::system("write commit messages"),
-            Message::user("the diff"),
+            Message::user("the diff\u{1b}[2J"),
             Message::assistant("feat: x"),
             Message::user("shorter"),
         ];
-        let body = serde_json::to_value(MessagesRequest::new("claude", &messages, 2000)).unwrap();
+        let request = Request::escaped("claude", &messages);
+        let body = serde_json::to_value(MessagesRequest::new(&request, 2000)).unwrap();
         assert_eq!(
             body,
             json!({
@@ -177,7 +179,7 @@ mod tests {
                 "max_tokens": 2000,
                 "system": "write commit messages",
                 "messages": [
-                    {"role": "user", "content": "the diff"},
+                    {"role": "user", "content": "the diff\\033[2J"},
                     {"role": "assistant", "content": "feat: x"},
                     {"role": "user", "content": "shorter"},
                 ],

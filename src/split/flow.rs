@@ -10,8 +10,8 @@ use crate::cli::SplitArgs;
 use crate::config::{Config, OnSecrets, Overrides};
 use crate::conversation::models::Model;
 use crate::conversation::{
-    self, commit_message, connect, conversation_tokens, generate_message, report_fit, report_model,
-    separated,
+    commit_message, connect, generate_message, initial_messages, report_fit, report_model, room,
+    separated, tokens_in,
 };
 use crate::git::worktree::TempWorktree;
 use crate::git::{Changes, Repo, Scope, names};
@@ -144,7 +144,7 @@ async fn split_changes<S: ModelServer>(
     server: &S,
     model: &Model,
 ) -> Result<()> {
-    let room = conversation::room(
+    let room = room(
         prompt::SPLIT_PROMPT,
         model.context_length,
         config.max_output_tokens,
@@ -160,7 +160,7 @@ async fn split_changes<S: ModelServer>(
     report_what_is_split(work, described.by_file);
     let text = redact::text(&described.text, "changes").text;
     let conversation = prompt::split_messages(&text, args.hint.as_deref());
-    report_model(model, conversation_tokens(&conversation));
+    report_model(model, tokens_in(&conversation));
 
     let splitter = Splitter {
         repo,
@@ -747,7 +747,7 @@ impl<S: ModelServer> Splitter<'_, S> {
         };
         changes.diff = redact::diff(&changes.diff).text;
         let hint = prompt::split_commit_hint(&planned.title, self.args.hint.as_deref());
-        let (conversation, fit) = conversation::initial_messages(
+        let (conversation, fit) = initial_messages(
             &self.config.system_prompt,
             &changes,
             Some(&hint),
@@ -804,78 +804,68 @@ mod tests {
     use super::*;
     use crate::conversation::models::ContextSource;
     use crate::git::test_support::{isolated_repo, numbered_lines, run, with_submodule};
-    use crate::server::{ModelInfo, Reply, Request};
+    use crate::server::test_support::FakeServer;
     use std::cell::{Cell, RefCell};
+    use std::path::Path;
+    use tempfile::TempDir;
 
     /// A model for splits: it answers a plan with the plans in line, the last one again once
-    /// they run out, and every message with `message`. It keeps what it was sent, and can do
-    /// something while the user waits for a plan or a message.
-    struct FakeServer<'a> {
+    /// they run out, and every message with `message`. It can do something while the user
+    /// waits for a plan or a message.
+    struct ScriptedModel<'a> {
         plans: RefCell<Vec<&'a str>>,
         message: &'a str,
-        message_requests: Cell<usize>,
-        received: RefCell<Vec<Vec<Message>>>,
-        during_plan: RefCell<Option<Box<dyn FnOnce() + 'a>>>,
-        during_message: RefCell<Option<Box<dyn FnOnce() + 'a>>>,
+        during_plan: Cell<Option<Box<dyn FnOnce() + 'a>>>,
+        during_message: Cell<Option<Box<dyn FnOnce() + 'a>>>,
     }
 
-    impl<'a> FakeServer<'a> {
+    impl<'a> ScriptedModel<'a> {
         fn new(plan: &'a str, message: &'a str) -> Self {
             Self {
                 plans: RefCell::new(vec![plan]),
                 message,
-                message_requests: Cell::new(0),
-                received: RefCell::new(Vec::new()),
-                during_plan: RefCell::new(None),
-                during_message: RefCell::new(None),
+                during_plan: Cell::new(None),
+                during_message: Cell::new(None),
             }
         }
 
         fn during_plan(self, action: impl FnOnce() + 'a) -> Self {
-            *self.during_plan.borrow_mut() = Some(Box::new(action));
+            self.during_plan.set(Some(Box::new(action)));
             self
         }
 
         fn during_message(self, action: impl FnOnce() + 'a) -> Self {
-            *self.during_message.borrow_mut() = Some(Box::new(action));
+            self.during_message.set(Some(Box::new(action)));
             self
         }
 
+        /// A server that answers as this model.
+        fn server(self) -> FakeServer<'a> {
+            FakeServer::answering(move |messages| self.reply(messages))
+        }
+
         fn reply(&self, messages: &[Message]) -> String {
-            if messages[0].content == prompt::SPLIT_PROMPT {
-                if let Some(action) = self.during_plan.borrow_mut().take() {
-                    action();
-                }
-                let mut plans = self.plans.borrow_mut();
-                return if plans.len() > 1 {
-                    plans.remove(0)
-                } else {
-                    plans[0]
-                }
-                .to_owned();
-            }
-            self.message_requests.set(self.message_requests.get() + 1);
-            if let Some(action) = self.during_message.borrow_mut().take() {
+            let asks_for_a_plan = messages[0].content == prompt::SPLIT_PROMPT;
+            let waiting = if asks_for_a_plan {
+                &self.during_plan
+            } else {
+                &self.during_message
+            };
+            if let Some(action) = waiting.take() {
                 action();
             }
-            self.message.to_owned()
+            if !asks_for_a_plan {
+                return self.message.to_owned();
+            }
+            let mut plans = self.plans.borrow_mut();
+            if plans.len() > 1 {
+                plans.remove(0)
+            } else {
+                plans[0]
+            }
+            .to_owned()
         }
     }
-
-    impl ModelServer for FakeServer<'_> {
-        async fn models(&self) -> Result<Vec<ModelInfo>> {
-            Ok(Vec::new())
-        }
-
-        async fn complete(&self, request: &Request<'_>) -> Result<Reply> {
-            self.received.borrow_mut().push(request.messages().to_vec());
-            Ok(Reply {
-                text: self.reply(request.messages()),
-            })
-        }
-    }
-    use std::path::Path;
-    use tempfile::TempDir;
 
     #[test]
     fn yes_at_the_plan_keeps_the_review_of_each_message() {
@@ -988,7 +978,7 @@ mod tests {
     #[tokio::test]
     async fn makes_the_commits_with_documentation_last_and_of_the_right_type() {
         let (dir, repo) = staged_three_parts();
-        let server = FakeServer::new(DOCS_USES_DEFS, "feat: change something");
+        let server = ScriptedModel::new(DOCS_USES_DEFS, "feat: change something").server();
         split(&repo, &args(true, None), &server).await.unwrap();
         assert_eq!(
             subjects(dir.path(), 3),
@@ -1007,7 +997,7 @@ mod tests {
     #[tokio::test]
     async fn merges_a_commit_that_fails_the_check_and_every_commit_then_passes() {
         let (dir, repo) = staged_three_parts();
-        let server = FakeServer::new(DOCS_USES_DEFS, "feat: change something");
+        let server = ScriptedModel::new(DOCS_USES_DEFS, "feat: change something").server();
         split(&repo, &args(true, Some(NEEDS_DEFS)), &server)
             .await
             .unwrap();
@@ -1031,7 +1021,7 @@ mod tests {
         run(dir.path(), &["add", "--all"]);
         let plan = r#"{"commits":[{"title":"Readme","units":[1]},{"title":"Uses","units":[2]}]}"#;
         let head = run(dir.path(), &["rev-parse", "HEAD"]);
-        let server = FakeServer::new(plan, "feat: change something");
+        let server = ScriptedModel::new(plan, "feat: change something").server();
         let error = split(&repo, &args(true, Some(NEEDS_DEFS)), &server)
             .await
             .err()
@@ -1056,8 +1046,9 @@ mod tests {
             run(path, &["add", "elsewhere.txt"]);
             run(path, &["commit", "-q", "-m", "made elsewhere"]);
         };
-        let server =
-            FakeServer::new(DOCS_USES_DEFS, "feat: change something").during_message(elsewhere);
+        let server = ScriptedModel::new(DOCS_USES_DEFS, "feat: change something")
+            .during_message(elsewhere)
+            .server();
         let error = split(&repo, &args(true, None), &server)
             .await
             .err()
@@ -1080,7 +1071,9 @@ mod tests {
                 &["commit", "-q", "--allow-empty", "-m", "made elsewhere"],
             );
         };
-        let server = FakeServer::new(DOCS_USES_DEFS, "feat: x").during_plan(elsewhere);
+        let server = ScriptedModel::new(DOCS_USES_DEFS, "feat: x")
+            .during_plan(elsewhere)
+            .server();
         let error = split(&repo, &args(true, None), &server)
             .await
             .err()
@@ -1090,11 +1083,13 @@ mod tests {
             run(path, &["log", "-1", "--format=%s"]).trim(),
             "made elsewhere"
         );
-        assert_eq!(
-            server.message_requests.get(),
-            0,
-            "it stopped before the wait"
-        );
+        let messages_asked = server
+            .received
+            .borrow()
+            .iter()
+            .filter(|sent| sent[0].content != prompt::SPLIT_PROMPT)
+            .count();
+        assert_eq!(messages_asked, 0, "it stopped before the wait");
     }
 
     /// A tracked file with two changes, not staged, for a two-commit plan.
@@ -1121,7 +1116,9 @@ mod tests {
             let text = fs::read_to_string(path.join("lib.txt")).unwrap();
             write(path, "lib.txt", &format!("{text}saved while waiting\n"));
         };
-        let server = FakeServer::new(TWO_COMMITS, "feat: change").during_plan(save);
+        let server = ScriptedModel::new(TWO_COMMITS, "feat: change")
+            .during_plan(save)
+            .server();
         split(&repo, &args(true, None), &server).await.unwrap();
         let committed = run(path, &["show", "HEAD:lib.txt"]);
         assert!(committed.contains("two\n") && committed.contains("thirty-seven\n"));
@@ -1143,7 +1140,9 @@ mod tests {
             write(path, "lib.rs", "fn staged_later() {}\n");
             run(path, &["add", "lib.rs"]);
         };
-        let server = FakeServer::new(TWO_COMMITS, "feat: change").during_plan(stage);
+        let server = ScriptedModel::new(TWO_COMMITS, "feat: change")
+            .during_plan(stage)
+            .server();
         split(&repo, &args(true, None), &server).await.unwrap();
         assert!(!run(path, &["show", "HEAD:lib.rs"]).contains("staged_later"));
         assert!(run(path, &["diff", "--cached", "--name-only"]).contains("lib.rs"));
@@ -1173,7 +1172,7 @@ mod tests {
             } else {
                 TWO_COMMITS
             };
-            let server = FakeServer::new(plan, "feat: change");
+            let server = ScriptedModel::new(plan, "feat: change").server();
             split(&repo, &args(true, None), &server)
                 .await
                 .unwrap_or_else(|error| panic!("{flag}: {error:#}"));
@@ -1202,7 +1201,7 @@ mod tests {
         let (dir, _) = staged_three_parts();
         fs::create_dir(dir.path().join("sub")).unwrap();
         let repo = Repo::open_at_top(dir.path().join("sub")).unwrap();
-        let server = FakeServer::new(DOCS_USES_DEFS, "feat: change something");
+        let server = ScriptedModel::new(DOCS_USES_DEFS, "feat: change something").server();
         split(&repo, &args(true, Some(NEEDS_DEFS)), &server)
             .await
             .unwrap();
@@ -1216,7 +1215,7 @@ mod tests {
         let config = Config::default();
         let work = changes_to_split(&repo, &args, &config).unwrap().unwrap();
         let units = split::describe(&work.files, 100_000).unwrap().units;
-        let server = FakeServer::new(DOCS_USES_DEFS, "feat: x");
+        let server = ScriptedModel::new(DOCS_USES_DEFS, "feat: x").server();
         let model = model();
         let splitter = Splitter {
             repo: &repo,
@@ -1245,7 +1244,7 @@ mod tests {
     #[tokio::test]
     async fn leaves_the_index_at_head_after_a_split_of_tracked_changes() {
         let (dir, repo) = tracked_two_places();
-        let server = FakeServer::new(TWO_COMMITS, "feat: change");
+        let server = ScriptedModel::new(TWO_COMMITS, "feat: change").server();
         split(&repo, &args(true, None), &server).await.unwrap();
         assert!(run(dir.path(), &["diff", "--cached", "--name-only"]).is_empty());
         assert!(run(dir.path(), &["status", "--porcelain"]).is_empty());
@@ -1272,7 +1271,7 @@ mod tests {
         for check in [None, Some("true")] {
             let (dir, repo) = staged_three_parts();
             hook_that_rewrites(dir.path());
-            let server = FakeServer::new(DOCS_USES_DEFS, "feat: change");
+            let server = ScriptedModel::new(DOCS_USES_DEFS, "feat: change").server();
             split(&repo, &args(true, check), &server)
                 .await
                 .unwrap_or_else(|error| panic!("{check:?}: {error:#}"));
@@ -1291,7 +1290,7 @@ mod tests {
         args: &SplitArgs,
         decisions: Vec<Decision>,
     ) -> Result<Outcome> {
-        let server = FakeServer::new(TWO_COMMITS, "feat: change");
+        let server = ScriptedModel::new(TWO_COMMITS, "feat: change").server();
         commit_with_server(repo, args, decisions, &server).await
     }
 
@@ -1451,12 +1450,13 @@ mod tests {
                 write(dir.path(), "other.txt", "other\n");
                 run(dir.path(), &["add", "other.txt"]);
             };
-            let server = FakeServer::new(TWO_COMMITS, "feat: change");
+            let scripted = ScriptedModel::new(TWO_COMMITS, "feat: change");
             let server = if during_plan {
-                server.during_plan(stage)
+                scripted.during_plan(stage)
             } else {
-                server.during_message(stage)
-            };
+                scripted.during_message(stage)
+            }
+            .server();
             split(&repo, &args(true, None), &server).await.unwrap();
             assert_eq!(staged(dir.path()), ["other.txt"], "plan: {during_plan}");
             let in_head = run(dir.path(), &["show", "HEAD:lib.txt"]);
@@ -1479,7 +1479,9 @@ mod tests {
             run(dir.path(), &["add", "notes.txt"]);
             write(dir.path(), "notes.txt", "one\nstaged\nnot staged\n");
         };
-        let server = FakeServer::new(TWO_COMMITS, "feat: change").during_plan(stage);
+        let server = ScriptedModel::new(TWO_COMMITS, "feat: change")
+            .during_plan(stage)
+            .server();
         split(&repo, &args(true, None), &server).await.unwrap();
         assert_eq!(run(dir.path(), &["show", ":notes.txt"]), "one\nstaged\n");
         assert_eq!(
@@ -1498,7 +1500,9 @@ mod tests {
             run(dir.path(), &["add", "lib.txt"]);
             write(dir.path(), "lib.txt", &in_work_tree);
         };
-        let server = FakeServer::new(TWO_COMMITS, "feat: change").during_plan(stage);
+        let server = ScriptedModel::new(TWO_COMMITS, "feat: change")
+            .during_plan(stage)
+            .server();
         let outcome = commit_with_server(&repo, &args(true, None), commit_all(), &server)
             .await
             .unwrap();
@@ -1522,7 +1526,9 @@ mod tests {
         let stage = || {
             run(dir.path(), &["add", "a.txt"]);
         };
-        let server = FakeServer::new(TWO_COMMITS, "feat: change").during_plan(stage);
+        let server = ScriptedModel::new(TWO_COMMITS, "feat: change")
+            .during_plan(stage)
+            .server();
         let outcome = commit_with_server(&repo, &args(true, None), commit_all(), &server)
             .await
             .unwrap();
@@ -1542,7 +1548,9 @@ mod tests {
             run(dir.path(), &["add", "-N", "new.txt"]);
             run(dir.path(), &["mv", "old.txt", "moved.txt"]);
         };
-        let server = FakeServer::new(TWO_COMMITS, "feat: change").during_plan(stage);
+        let server = ScriptedModel::new(TWO_COMMITS, "feat: change")
+            .during_plan(stage)
+            .server();
         split(&repo, &args(true, None), &server).await.unwrap();
         let status = run(dir.path(), &["status", "--porcelain"]);
         assert!(status.contains(" A new.txt"), "{status}");
@@ -1557,7 +1565,7 @@ mod tests {
         run(dir.path(), &["commit", "-q", "-m", "add old"]);
         fs::rename(dir.path().join("old.txt"), dir.path().join("moved.txt")).unwrap();
         run(dir.path(), &["add", "-N", "moved.txt"]);
-        let server = FakeServer::new(TWO_COMMITS, "feat: change");
+        let server = ScriptedModel::new(TWO_COMMITS, "feat: change").server();
         split(&repo, &args(true, None), &server).await.unwrap();
         assert_eq!(run(dir.path(), &["status", "--porcelain"]), "");
         assert_eq!(
@@ -1583,7 +1591,9 @@ mod tests {
             write(dir.path(), "a1.txt", "two\n");
             run(dir.path(), &["add", "a1.txt"]);
         };
-        let server = FakeServer::new(TWO_COMMITS, "feat: change").during_plan(stage);
+        let server = ScriptedModel::new(TWO_COMMITS, "feat: change")
+            .during_plan(stage)
+            .server();
         split(&repo, &args(true, None), &server).await.unwrap();
         assert_eq!(staged(dir.path()), ["a1.txt"]);
         for name in names {
@@ -1615,7 +1625,9 @@ mod tests {
             write(dir.path(), "other.txt", "other\n");
             run(dir.path(), &["add", "other.txt"]);
         };
-        let server = FakeServer::new(TWO_COMMITS, "feat: change").during_plan(stage);
+        let server = ScriptedModel::new(TWO_COMMITS, "feat: change")
+            .during_plan(stage)
+            .server();
         let error = commit_with_server(&repo, &args(true, None), commit_all(), &server)
             .await
             .map(|_| ())
@@ -1638,7 +1650,9 @@ mod tests {
                 &["commit", "-q", "--allow-empty", "-m", "elsewhere", "--only"],
             );
         };
-        let server = FakeServer::new(TWO_COMMITS, "feat: change").during_message(during);
+        let server = ScriptedModel::new(TWO_COMMITS, "feat: change")
+            .during_message(during)
+            .server();
         let error = commit_with_server(&repo, &args(true, None), commit_all(), &server)
             .await
             .map(|_| ())
@@ -1659,7 +1673,9 @@ mod tests {
                 write(dir.path(), "other.txt", "other\n");
                 run(dir.path(), &["add", "other.txt"]);
             };
-            let server = FakeServer::new(TWO_COMMITS, "feat: change").during_plan(stage);
+            let server = ScriptedModel::new(TWO_COMMITS, "feat: change")
+                .during_plan(stage)
+                .server();
             commit_with_server(&repo, &args(true, None), decisions, &server)
                 .await
                 .unwrap();
@@ -1671,13 +1687,13 @@ mod tests {
     async fn a_later_commit_doesnt_undo_what_a_hook_did() {
         let (dir, repo) = staged_three_parts();
         hook_that_rewrites(dir.path());
-        let server = FakeServer::new(DOCS_USES_DEFS, "feat: change");
+        let server = ScriptedModel::new(DOCS_USES_DEFS, "feat: change").server();
         split(&repo, &args(true, None), &server).await.unwrap();
         assert_eq!(staged(dir.path()), Vec::<String>::new());
 
         let (dir, repo) = tracked_two_places();
         hook_that_rewrites(dir.path());
-        let server = FakeServer::new(TWO_COMMITS, "feat: change");
+        let server = ScriptedModel::new(TWO_COMMITS, "feat: change").server();
         split(&repo, &args(true, None), &server).await.unwrap();
         assert_eq!(staged(dir.path()), Vec::<String>::new());
         assert_eq!(
@@ -1690,7 +1706,7 @@ mod tests {
     async fn keeps_the_rest_of_staged_changes_staged_when_a_hook_changes_a_commit() {
         let (dir, repo) = staged_three_parts();
         hook_that_rewrites(dir.path());
-        let server = FakeServer::new(DOCS_USES_DEFS, "feat: change");
+        let server = ScriptedModel::new(DOCS_USES_DEFS, "feat: change").server();
         let decisions = vec![Decision::Commit("feat: first".to_owned()), Decision::Stop];
         commit_with_server(&repo, &args(true, None), decisions, &server)
             .await
@@ -1721,7 +1737,7 @@ mod tests {
         let (dir, repo) = tracked_two_places();
         run(dir.path(), &["add", "--all"]);
         hook_that_formats_once(dir.path());
-        let server = FakeServer::new(TWO_COMMITS, "feat: change");
+        let server = ScriptedModel::new(TWO_COMMITS, "feat: change").server();
         let outcome = commit_with_server(&repo, &args(true, None), commit_all(), &server)
             .await
             .unwrap();

@@ -1478,7 +1478,7 @@ mod tests {
     use super::*;
     use crate::git::test_support::{isolated_repo, run};
     use crate::server::test_support::FakeServer;
-    use conversation::models::ContextSource;
+    use conversation::models::test_support::configured;
     use tempfile::TempDir;
 
     #[test]
@@ -1502,16 +1502,6 @@ mod tests {
         ui::test_support::assert_typable(&TIDY_REVIEW);
         ui::test_support::assert_typable(&TIDY_MESSAGE_REVIEW);
         ui::test_support::assert_typable(&BRANCH_REVIEW);
-    }
-
-    fn model(context_length: usize) -> Model {
-        Model {
-            id: "fake".to_owned(),
-            picked: None,
-            context_length,
-            context_source: ContextSource::Config,
-            max_output_tokens: config::DEFAULT_MAX_OUTPUT_TOKENS,
-        }
     }
 
     fn generate_args(arguments: &[&str]) -> GenerateArgs {
@@ -1644,7 +1634,7 @@ mod tests {
         let server = FakeServer::replying("feat: add\u{1b}[2J a\u{202e}\n\nbody\rtext\u{9b}");
         let conversation = [Message::user("write a message")];
 
-        let message = commit_message(&server, &model(100_000), &conversation)
+        let message = commit_message(&server, &configured(100_000), &conversation)
             .await
             .unwrap();
 

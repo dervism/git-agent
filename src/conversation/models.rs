@@ -103,6 +103,23 @@ pub fn choose(models: Vec<ModelInfo>) -> Result<ModelInfo> {
 }
 
 #[cfg(test)]
+pub mod test_support {
+    use super::{ContextSource, Model};
+    use crate::config;
+
+    /// A configured model, "fake", with a context of `context_length` tokens.
+    pub fn configured(context_length: usize) -> Model {
+        Model {
+            id: "fake".to_owned(),
+            picked: None,
+            context_length,
+            context_source: ContextSource::Config,
+            max_output_tokens: config::DEFAULT_MAX_OUTPUT_TOKENS,
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::server::test_support::FakeServer;

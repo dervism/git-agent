@@ -9,17 +9,52 @@ use crate::ui::{self, thousands};
 const CONTEXT_TRIMMED: &str = "   To fit, git-agent left out the unchanged lines around the \
                                changes; every changed line was sent.";
 
+/// What git-agent says about how the changes fit, after it names the model.
+#[derive(Debug, PartialEq)]
+enum FitReport {
+    /// All of the changes were sent, with the unchanged lines around them.
+    Whole,
+    /// Every changed line was sent, without the unchanged lines around them.
+    WithoutContext,
+    /// Part of the changes was sent.
+    Shortened {
+        warning: String,
+        left_out: Vec<String>,
+        to_send_more: String,
+    },
+}
+
 /// Says which model gets the changes and, if they didn't fit its context, what
 /// was left out. `noun` names what the model writes; `smaller` says how to
 /// send less at a time, if there is a way.
 pub fn report_fit(model: &Model, fit: &Fit, noun: &str, smaller: Option<&str>) {
     report_model(model, fit.prompt_tokens);
+    match fit_report(model, fit, noun, smaller) {
+        FitReport::Whole => {}
+        FitReport::WithoutContext => ui::info(ui::dim(CONTEXT_TRIMMED)),
+        FitReport::Shortened {
+            warning,
+            left_out,
+            to_send_more,
+        } => {
+            ui::warn(warning);
+            left_out.into_iter().for_each(ui::info);
+            ui::info(ui::dim(&to_send_more));
+        }
+    }
+}
+
+fn fit_report(model: &Model, fit: &Fit, noun: &str, smaller: Option<&str>) -> FitReport {
     if !fit.is_complete() {
-        ui::warn(shortened(fit));
-        left_out(fit).into_iter().for_each(ui::info);
-        ui::info(ui::dim(&how_to_send_more(model, noun, smaller)));
+        FitReport::Shortened {
+            warning: shortened(fit),
+            left_out: left_out(fit),
+            to_send_more: how_to_send_more(model, noun, smaller),
+        }
     } else if fit.context_trimmed {
-        ui::info(ui::dim(CONTEXT_TRIMMED));
+        FitReport::WithoutContext
+    } else {
+        FitReport::Whole
     }
 }
 
@@ -156,16 +191,15 @@ fn first_few(items: &[String]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::DEFAULT_MAX_OUTPUT_TOKENS;
     use crate::conversation::fit::FileFit;
+    use crate::conversation::models::test_support::configured;
 
     fn model(picked: Option<Pick>, context_source: ContextSource) -> Model {
         Model {
             id: "qwen\u{1b}[2J".to_owned(),
             picked,
-            context_length: 32_768,
             context_source,
-            max_output_tokens: DEFAULT_MAX_OUTPUT_TOKENS,
+            ..configured(32_768)
         }
     }
 
@@ -178,12 +212,12 @@ mod tests {
         }
     }
 
-    fn fit(files: Vec<FileFit>) -> Fit {
+    fn fit(files: Vec<FileFit>, context_trimmed: bool) -> Fit {
         Fit {
             prompt_tokens: 1000,
             full_tokens: 123_456,
             files,
-            context_trimmed: true,
+            context_trimmed,
             list_lines_left_out: 0,
             commit_bodies_left_out: false,
             commits_left_out: 0,
@@ -193,6 +227,9 @@ mod tests {
     fn texts(items: &[&str]) -> Vec<String> {
         items.iter().map(|&item| item.to_owned()).collect()
     }
+
+    const WARNING: &str = "the changes need about 123,456 tokens, more than fit in the context, \
+                           so git-agent sent part of them:";
 
     #[test]
     fn names_the_model_escaped_and_why_it_was_picked() {
@@ -216,23 +253,24 @@ mod tests {
     fn notes_an_assumed_context_only() {
         assert_eq!(assumed_context(&model(None, ContextSource::Server)), None);
         assert_eq!(assumed_context(&model(None, ContextSource::Config)), None);
-        let note = assumed_context(&model(None, ContextSource::Assumed)).unwrap();
-        assert!(note.contains("assumes 32,768 tokens."), "{note}");
-        assert!(note.ends_with("or pass --context-length."), "{note}");
+        assert_eq!(
+            assumed_context(&model(None, ContextSource::Assumed)).as_deref(),
+            Some(
+                "   The server didn't report the model's context length, so git-agent assumes \
+                 32,768 tokens.\n   If the model has more, set `context_length` in the config \
+                 file or pass --context-length."
+            )
+        );
     }
 
     #[test]
-    fn says_only_how_many_files_went_in_full_when_nothing_else_was_left_out() {
-        let fit = fit(vec![file("a.rs", Kept::Whole, 40)]);
-        assert_eq!(
-            left_out(&fit),
-            ["   1 of 1 files in full, without the unchanged lines around the changes"]
-        );
-        assert_eq!(
-            shortened(&fit),
-            "the changes need about 123,456 tokens, more than fit in the context, so git-agent \
-             sent part of them:"
-        );
+    fn says_nothing_more_when_every_line_was_sent() {
+        let report = |trimmed| {
+            let fit = fit(vec![file("a.rs", Kept::Whole, 40)], trimmed);
+            fit_report(&model(None, ContextSource::Server), &fit, "message", None)
+        };
+        assert_eq!(report(false), FitReport::Whole);
+        assert_eq!(report(true), FitReport::WithoutContext);
     }
 
     #[test]
@@ -241,21 +279,50 @@ mod tests {
             list_lines_left_out: 1,
             commit_bodies_left_out: true,
             commits_left_out: 1,
-            ..fit(vec![
-                file("whole.rs", Kept::Whole, 40),
-                file("a.rs", Kept::Start, 10),
-                file("c.rs", Kept::Nothing, 0),
-            ])
+            ..fit(
+                vec![
+                    file("whole.rs", Kept::Whole, 40),
+                    file("a.rs", Kept::Start, 10),
+                    file("c.rs", Kept::Nothing, 0),
+                ],
+                true,
+            )
         };
         assert_eq!(
-            left_out(&fit),
+            fit_report(&model(None, ContextSource::Server), &fit, "message", None),
+            FitReport::Shortened {
+                warning: WARNING.to_owned(),
+                left_out: texts(&[
+                    "   1 of 3 files in full, without the unchanged lines around the changes",
+                    "   1 cut short: a.rs (10 of 40 changed lines)",
+                    "   1 by name only: c.rs",
+                    "   1 files left out of the file list too",
+                    "   the commits by their subjects only, without the rest of their messages",
+                    "   1 commits left out of the commit list",
+                ]),
+                to_send_more: "   The message may miss details from these files. To send more, \
+                               load the model with a larger context length."
+                    .to_owned(),
+            }
+        );
+    }
+
+    #[test]
+    fn reports_commits_by_their_subjects_alone_as_shortened() {
+        let fit = Fit {
+            commit_bodies_left_out: true,
+            ..fit(vec![file("a.rs", Kept::Whole, 40)], false)
+        };
+        let FitReport::Shortened { left_out, .. } =
+            fit_report(&model(None, ContextSource::Server), &fit, "message", None)
+        else {
+            panic!("the fit is shortened");
+        };
+        assert_eq!(
+            left_out,
             [
-                "   1 of 3 files in full, without the unchanged lines around the changes",
-                "   1 cut short: a.rs (10 of 40 changed lines)",
-                "   1 by name only: c.rs",
-                "   1 files left out of the file list too",
+                "   1 of 1 files in full, without the unchanged lines around the changes",
                 "   the commits by their subjects only, without the rest of their messages",
-                "   1 commits left out of the commit list",
             ]
         );
     }
@@ -263,19 +330,18 @@ mod tests {
     #[test]
     fn suggests_a_larger_context_the_way_it_was_set() {
         let ways = |source, smaller| how_to_send_more(&model(None, source), "message", smaller);
+        const MISSES: &str = "   The message may miss details from these files. To send more,";
         assert_eq!(
             ways(ContextSource::Server, None),
-            "   The message may miss details from these files. To send more, load the model \
-             with a larger context length."
+            format!("{MISSES} load the model with a larger context length.")
         );
-        assert!(
-            ways(ContextSource::Config, None)
-                .ends_with("To send more, raise `context_length` if the model allows more.")
+        assert_eq!(
+            ways(ContextSource::Config, None),
+            format!("{MISSES} raise `context_length` if the model allows more.")
         );
-        assert!(
-            ways(ContextSource::Assumed, Some("stage fewer files")).ends_with(
-                "To send more, stage fewer files, or set `context_length` if the model has more."
-            )
+        assert_eq!(
+            ways(ContextSource::Assumed, Some("stage fewer files")),
+            format!("{MISSES} stage fewer files, or set `context_length` if the model has more.")
         );
     }
 

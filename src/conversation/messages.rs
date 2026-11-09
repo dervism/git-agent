@@ -103,6 +103,11 @@ pub fn notes(hint: Option<&str>) -> String {
     }
 }
 
+/// Bytes the author's notes take in the user message.
+pub fn notes_bytes(hint: Option<&str>) -> usize {
+    notes(hint).len()
+}
+
 struct Listed {
     text: String,
     bodies_left_out: bool,
@@ -232,11 +237,6 @@ pub fn describe_changes(intro: String, changes: &Changes, room: usize) -> (Strin
     fit.files = fitted.files;
     fit.context_trimmed = fitted.context_trimmed;
     (out, fit)
-}
-
-/// Bytes the author's notes take in the user message.
-pub fn notes_bytes(hint: Option<&str>) -> usize {
-    notes(hint).len()
 }
 
 #[cfg(test)]

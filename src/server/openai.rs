@@ -259,10 +259,12 @@ mod tests {
     fn sends_the_conversation_escaped_and_temperature_only_when_set() {
         let conversation = [Message::system("rules"), Message::user("+ a\u{1b}[2J")];
         let request = Request::escaped("m", &conversation);
-        let body =
-            |temperature| serde_json::to_string(&ChatRequest::new(&request, temperature)).unwrap();
+        let sent = |temperature| -> serde_json::Value {
+            let body = serde_json::to_string(&ChatRequest::new(&request, temperature)).unwrap();
+            serde_json::from_str(&body).unwrap()
+        };
         assert_eq!(
-            serde_json::from_str::<serde_json::Value>(&body(None)).unwrap(),
+            sent(None),
             serde_json::json!({
                 "model": "m",
                 "messages": [
@@ -272,7 +274,7 @@ mod tests {
                 "stream": false,
             })
         );
-        assert!(body(Some(0.4)).contains("\"temperature\":0.4,"));
+        assert_eq!(sent(Some(0.4))["temperature"], 0.4);
     }
 
     #[test]

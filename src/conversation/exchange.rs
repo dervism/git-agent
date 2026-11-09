@@ -109,26 +109,15 @@ pub async fn discuss(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config;
-    use crate::conversation::models::ContextSource;
+    use crate::conversation::models::test_support::configured;
     use crate::server::test_support::FakeServer;
-
-    fn model(context_length: usize) -> Model {
-        Model {
-            id: "fake".to_owned(),
-            picked: None,
-            context_length,
-            context_source: ContextSource::Config,
-            max_output_tokens: config::DEFAULT_MAX_OUTPUT_TOKENS,
-        }
-    }
 
     #[tokio::test(flavor = "current_thread")]
     async fn sends_the_model_escaped_text_with_letters_and_line_endings_intact() {
         let server = FakeServer::replying("feat: x");
         let conversation = [Message::user("+ blåbær\r\n+ \u{e0041}\u{1b}[2J")];
 
-        generate_message(&server, &model(100_000), &conversation)
+        generate_message(&server, &configured(100_000), &conversation)
             .await
             .unwrap();
 
@@ -142,7 +131,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn refuses_a_reply_of_only_hidden_characters() {
         let server = FakeServer::replying("\u{1b}\u{202e}");
-        let error = generate_message(&server, &model(100_000), &[Message::user("x")])
+        let error = generate_message(&server, &configured(100_000), &[Message::user("x")])
             .await
             .unwrap_err();
         assert_eq!(error.to_string(), "the model returned an empty message");
@@ -152,7 +141,7 @@ mod tests {
     async fn says_why_when_escaping_overfills_the_context() {
         let server = FakeServer::replying("feat: x");
         let conversation = [Message::user("\u{1b}".repeat(4000))];
-        let error = generate_message(&server, &model(3000), &conversation)
+        let error = generate_message(&server, &configured(3000), &conversation)
             .await
             .unwrap_err();
         assert!(error.to_string().contains("no longer fit"), "{error}");

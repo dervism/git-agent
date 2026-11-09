@@ -802,18 +802,23 @@ fn report_merged(merged: &[String], why: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::conversation::models::ContextSource;
+    use crate::conversation::models::test_support::configured;
     use crate::git::test_support::{isolated_repo, numbered_lines, run, with_submodule};
     use crate::server::test_support::FakeServer;
     use std::cell::{Cell, RefCell};
     use std::path::Path;
     use tempfile::TempDir;
 
-    /// A model for splits: it answers a plan with the plans in line, the last one again once
-    /// they run out, and every message with `message`. It can do something while the user
-    /// waits for a plan or a message.
+    /// Whether `conversation` asks the model for a plan rather than a commit message.
+    fn asks_for_a_plan(conversation: &[Message]) -> bool {
+        conversation[0].content == prompt::SPLIT_PROMPT
+    }
+
+    /// A model for splits: it answers every request for a plan with `plan`, and every
+    /// request for a message with `message`. It can do something while the user waits for a
+    /// plan or a message.
     struct ScriptedModel<'a> {
-        plans: RefCell<Vec<&'a str>>,
+        plan: &'a str,
         message: &'a str,
         during_plan: Cell<Option<Box<dyn FnOnce() + 'a>>>,
         during_message: Cell<Option<Box<dyn FnOnce() + 'a>>>,
@@ -822,7 +827,7 @@ mod tests {
     impl<'a> ScriptedModel<'a> {
         fn new(plan: &'a str, message: &'a str) -> Self {
             Self {
-                plans: RefCell::new(vec![plan]),
+                plan,
                 message,
                 during_plan: Cell::new(None),
                 during_message: Cell::new(None),
@@ -844,26 +849,16 @@ mod tests {
             FakeServer::answering(move |messages| self.reply(messages))
         }
 
-        fn reply(&self, messages: &[Message]) -> String {
-            let asks_for_a_plan = messages[0].content == prompt::SPLIT_PROMPT;
-            let waiting = if asks_for_a_plan {
-                &self.during_plan
+        fn reply(&self, conversation: &[Message]) -> String {
+            let (waiting, reply) = if asks_for_a_plan(conversation) {
+                (&self.during_plan, self.plan)
             } else {
-                &self.during_message
+                (&self.during_message, self.message)
             };
             if let Some(action) = waiting.take() {
                 action();
             }
-            if !asks_for_a_plan {
-                return self.message.to_owned();
-            }
-            let mut plans = self.plans.borrow_mut();
-            if plans.len() > 1 {
-                plans.remove(0)
-            } else {
-                plans[0]
-            }
-            .to_owned()
+            reply.to_owned()
         }
     }
 
@@ -903,16 +898,6 @@ mod tests {
         }
     }
 
-    fn model() -> Model {
-        Model {
-            id: "fake".to_owned(),
-            picked: None,
-            context_length: 100_000,
-            context_source: ContextSource::Config,
-            max_output_tokens: crate::config::DEFAULT_MAX_OUTPUT_TOKENS,
-        }
-    }
-
     fn args(commit: bool, check: Option<&str>) -> SplitArgs {
         SplitArgs {
             all: false,
@@ -928,7 +913,7 @@ mod tests {
     async fn split(repo: &Repo, args: &SplitArgs, server: &FakeServer<'_>) -> Result<()> {
         let config = Config::default();
         let work = changes_to_split(repo, args, &config)?.expect("changes to split");
-        split_changes(repo, args, &config, &work, server, &model()).await
+        split_changes(repo, args, &config, &work, server, &configured(100_000)).await
     }
 
     fn write(dir: &Path, name: &str, text: &str) {
@@ -1087,7 +1072,7 @@ mod tests {
             .received
             .borrow()
             .iter()
-            .filter(|sent| sent[0].content != prompt::SPLIT_PROMPT)
+            .filter(|sent| !asks_for_a_plan(sent))
             .count();
         assert_eq!(messages_asked, 0, "it stopped before the wait");
     }
@@ -1216,7 +1201,7 @@ mod tests {
         let work = changes_to_split(&repo, &args, &config).unwrap().unwrap();
         let units = split::describe(&work.files, 100_000).unwrap().units;
         let server = ScriptedModel::new(DOCS_USES_DEFS, "feat: x").server();
-        let model = model();
+        let model = configured(100_000);
         let splitter = Splitter {
             repo: &repo,
             config: &config,
@@ -1409,7 +1394,7 @@ mod tests {
         let config = Config::default();
         let work = changes_to_split(repo, args, &config)?.expect("changes to split");
         let units = split::describe(&work.files, 100_000)?.units;
-        let model = model();
+        let model = configured(100_000);
         let splitter = Splitter {
             repo,
             config: &config,

@@ -43,7 +43,8 @@ pub fn room(system_prompt: &str, context_length: usize, max_output_tokens: usize
     budget.saturating_sub(system_prompt.trim().len() + FRAMING_BYTES)
 }
 
-/// Whether `messages` leave room in the context for another reply.
+/// Whether `messages` leave room in the context for another reply: half of
+/// [`reply_reserve`], and at least 1,024 tokens.
 pub fn has_room(messages: &[Message], context_length: usize, max_output_tokens: usize) -> bool {
     let reply = (reply_reserve(context_length, max_output_tokens) / 2).max(1024);
     tokens_in(messages) + reply <= context_length
@@ -86,6 +87,7 @@ mod tests {
     #[test]
     fn keeps_a_quarter_of_the_context_for_the_reply_within_its_limits() {
         assert_eq!(reply_reserve(4096, REPLY), 1024);
+        assert_eq!(reply_reserve(32_768, REPLY), 8192);
         assert_eq!(reply_reserve(100_000, REPLY), REPLY);
         assert_eq!(reply_reserve(100_000, 2000), 2000);
         assert_eq!(reply_reserve(1000, REPLY), 1024);
@@ -99,6 +101,7 @@ mod tests {
             room(" \n rules \n", 4096, REPLY),
             (4096 - 1024) * 3 - 256 - 5
         );
+        assert_eq!(room("", 32_768, REPLY), (32_768 - 8192) * 3 - 256);
         assert_eq!(room("", 1_000_000, 4096), (1_000_000 - 4096) * 3 - 256);
         // A context smaller than the reply's reserve leaves no room at all.
         assert_eq!(room("", 1000, REPLY), 0);
@@ -131,8 +134,11 @@ mod tests {
         let outgoing = escaped(&hidden);
         assert!(outgrew_context(&hidden, &outgoing, 3000, REPLY));
         assert!(!outgrew_context(&hidden, &outgoing, 100_000, REPLY));
-        // 4,000 tokens fit in 5,000, but not with 1,250 kept for the reply.
-        assert!(outgrew_context(&hidden, &outgoing, 5000, REPLY));
+        // 1,000 tokens become 4,000 escaped: they fit in 5,000, but not with 1,250 kept for
+        // the reply.
+        let fewer = [Message::user("\u{1b}".repeat(3000))];
+        assert!(outgrew_context(&fewer, &escaped(&fewer), 5000, REPLY));
+        assert!(!outgrew_context(&fewer, &escaped(&fewer), 5400, REPLY));
         // A conversation over the room already is the server's to judge.
         let long = [Message::user(format!("{}\u{1b}", "x".repeat(40_000)))];
         assert!(!outgrew_context(&long, &escaped(&long), 5000, REPLY));

@@ -1,5 +1,6 @@
-//! Talking to the model: choosing it and the context to fit into, fitting the changes in,
-//! building the conversation, sending it, and cleaning up the reply.
+//! Talking to the model: choosing it and the context to fit into, keeping room in that
+//! context for the reply, fitting the changes in, building the conversation, sending it,
+//! cleaning up the reply, and telling the user what was sent.
 
 mod budget;
 mod exchange;

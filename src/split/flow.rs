@@ -15,9 +15,7 @@ use crate::conversation::{
 };
 use crate::git::worktree::TempWorktree;
 use crate::git::{Changes, Repo, Scope, names};
-use crate::review::{
-    Action, Choice, Review, ask_action, edit_message, edit_plan, review, show_proposal,
-};
+use crate::review::{self, Action, Choice, Review};
 use crate::server::{Message, ModelServer};
 use crate::ui;
 use crate::{
@@ -28,9 +26,24 @@ use std::fs;
 use std::io::{self, IsTerminal};
 use std::time::Duration;
 
-/// Accepting the plan of a split: the value says whether to review each message. Reviewing
-/// comes first, since `y` picks the first choice.
-const PLAN_REVIEW: Review<bool> = Review {
+/// What accepting the plan of a split does. Reviewing each message comes first, since `y`
+/// picks the first choice.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum PlanAcceptance {
+    ReviewEach,
+    CommitAll,
+}
+
+impl PlanAcceptance {
+    fn reviews_each_message(self) -> bool {
+        match self {
+            Self::ReviewEach => true,
+            Self::CommitAll => false,
+        }
+    }
+}
+
+const PLAN_REVIEW: Review<PlanAcceptance> = Review {
     heading: "Proposed commits",
     first_line: "first line",
     noun: "plan",
@@ -40,12 +53,12 @@ const PLAN_REVIEW: Review<bool> = Review {
         Choice {
             word: "commit",
             help: "make the commits one at a time, reviewing each message",
-            value: true,
+            value: PlanAcceptance::ReviewEach,
         },
         Choice {
             word: "all commits",
             help: "make all the commits, without stopping to review their messages",
-            value: false,
+            value: PlanAcceptance::CommitAll,
         },
     ],
     quit: "quit without committing anything",
@@ -54,8 +67,14 @@ const PLAN_REVIEW: Review<bool> = Review {
 /// A plan that leaves out at least this many parts is asked for once more.
 const ASK_AGAIN_MISSING: usize = 3;
 
-/// Accepting one commit of a split: the value says whether to make it.
-const SPLIT_COMMIT_REVIEW: Review<bool> = Review {
+/// What accepting one commit of a split does.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum SplitCommitAcceptance {
+    Commit,
+    Skip,
+}
+
+const SPLIT_COMMIT_REVIEW: Review<SplitCommitAcceptance> = Review {
     heading: "Proposed commit message",
     first_line: "subject line",
     noun: "message",
@@ -65,12 +84,12 @@ const SPLIT_COMMIT_REVIEW: Review<bool> = Review {
         Choice {
             word: "commit",
             help: "commit these changes with this message",
-            value: true,
+            value: SplitCommitAcceptance::Commit,
         },
         Choice {
             word: "skip",
             help: "leave these changes uncommitted and go on to the next commit",
-            value: false,
+            value: SplitCommitAcceptance::Skip,
         },
     ],
     quit: "stop here; the commits made so far stay, and the rest stays uncommitted",
@@ -169,17 +188,14 @@ async fn split_changes<S: ModelServer>(
         server,
         model,
     };
-    let Some((plan, review_messages)) = splitter.accepted_plan(&conversation).await? else {
+    let Some((plan, acceptance)) = splitter.accepted_plan(&conversation).await? else {
         return Ok(());
     };
     let prepared = splitter.prepare_commits(&plan).await?;
-    let outcome = splitter
-        .make_commits(&prepared, review_messages)
-        .await
-        .context(
-            "the split stopped; the commits made so far stay, and the rest of the changes are as \
-             they were",
-        )?;
+    let outcome = splitter.make_commits(&prepared, acceptance).await.context(
+        "the split stopped; the commits made so far stay, and the rest of the changes are as \
+         they were",
+    )?;
     finish(repo, args, config, work, &outcome)
 }
 
@@ -341,13 +357,16 @@ impl<S: ModelServer> Splitter<'_, S> {
         split::show(plan, &self.work.files, self.units)
     }
 
-    /// The plan to carry out, and whether to review each message, or `None` if
-    /// nothing should be committed.
-    async fn accepted_plan(&self, conversation: &[Message]) -> Result<Option<(Plan, bool)>> {
+    /// The plan to carry out, and how it was accepted, or `None` if nothing should be
+    /// committed.
+    async fn accepted_plan(
+        &self,
+        conversation: &[Message],
+    ) -> Result<Option<(Plan, PlanAcceptance)>> {
         let plan = self.new_plan(conversation).await?;
         if self.args.commit {
             ui::show_framed(PLAN_REVIEW.heading, &self.show(&plan));
-            return Ok(Some((plan, false)));
+            return Ok(Some((plan, PlanAcceptance::CommitAll)));
         }
         if !io::stdin().is_terminal() {
             ui::show_framed(PLAN_REVIEW.heading, &self.show(&plan));
@@ -427,16 +446,16 @@ impl<S: ModelServer> Splitter<'_, S> {
     }
 
     /// Lets the user review the plan until they accept or quit it. Returns
-    /// the accepted plan and whether to review each message, or `None` on quit.
+    /// the accepted plan and how it was accepted, or `None` on quit.
     async fn review_plan(
         &self,
         mut plan: Plan,
         conversation: &[Message],
-    ) -> Result<Option<(Plan, bool)>> {
+    ) -> Result<Option<(Plan, PlanAcceptance)>> {
         loop {
             ui::show_framed(PLAN_REVIEW.heading, &self.show(&plan));
-            let revised = match ask_action(&PLAN_REVIEW)? {
-                Action::Accept(review) => return Ok(Some((plan, review))),
+            let revised = match review::ask_action(&PLAN_REVIEW)? {
+                Action::Accept(acceptance) => return Ok(Some((plan, acceptance))),
                 Action::Quit => return Ok(None),
                 Action::Edit => self.edit_plan(&plan),
                 Action::Regenerate => self.new_plan(conversation).await.map(Some),
@@ -455,7 +474,7 @@ impl<S: ModelServer> Splitter<'_, S> {
     }
 
     fn edit_plan(&self, plan: &Plan) -> Result<Option<Plan>> {
-        let text = edit_plan(
+        let text = review::edit_plan(
             self.repo,
             "GIT_AGENT_SPLIT_PLAN",
             &split::to_text(plan, &self.work.files, self.units),
@@ -540,9 +559,13 @@ impl<S: ModelServer> Splitter<'_, S> {
     }
 
     /// Makes the planned commits one by one, each built in a temporary index
-    /// from HEAD and its own changes. With `review_messages`, the user reviews each
-    /// commit's message.
-    async fn make_commits(&self, prepared: &CommitPlan, review_messages: bool) -> Result<Outcome> {
+    /// from HEAD and its own changes, with the user reviewing each commit's message if the
+    /// plan's `acceptance` says so.
+    async fn make_commits(
+        &self,
+        prepared: &CommitPlan,
+        acceptance: PlanAcceptance,
+    ) -> Result<Outcome> {
         let path = self.repo.git_path("GIT_AGENT_SPLIT_INDEX")?;
         let index = self.repo.with_index(path.clone());
         let outcome = self
@@ -550,7 +573,7 @@ impl<S: ModelServer> Splitter<'_, S> {
                 prepared,
                 &index,
                 async |message: String, conversation: &[Message], kind: Option<Kind>| {
-                    if review_messages {
+                    if acceptance.reviews_each_message() {
                         self.reviewed(message, conversation, kind).await
                     } else {
                         Ok(Decision::Commit(message))
@@ -621,19 +644,19 @@ impl<S: ModelServer> Splitter<'_, S> {
         conversation: &[Message],
         kind: Option<Kind>,
     ) -> Result<Decision> {
-        let reviewed = review(
+        let reviewed = review::revise(
             &SPLIT_COMMIT_REVIEW,
             message,
             self.server,
             self.model,
             conversation,
-            |message: &str| edit_message(self.repo, message),
+            |message: &str| review::edit_message(self.repo, message),
             |message| separated(message).map(|message| kinds::with_type(&message, kind)),
         )
         .await?;
         Ok(match reviewed {
-            Some((true, message)) => Decision::Commit(message),
-            Some((false, _)) => Decision::Skip,
+            Some((SplitCommitAcceptance::Commit, message)) => Decision::Commit(message),
+            Some((SplitCommitAcceptance::Skip, _)) => Decision::Skip,
             None => Decision::Stop,
         })
     }
@@ -757,7 +780,7 @@ impl<S: ModelServer> Splitter<'_, S> {
         let kind = kinds::kind_of(planned, &self.work.files, self.units);
         let message = commit_message(self.server, self.model, &conversation).await?;
         let message = kinds::with_type(&message, kind);
-        show_proposal(&SPLIT_COMMIT_REVIEW, &message);
+        review::show_proposal(&SPLIT_COMMIT_REVIEW, &message);
         Ok(Some((message, conversation)))
     }
 }
@@ -861,35 +884,46 @@ mod tests {
 
     #[test]
     fn yes_at_the_plan_keeps_the_review_of_each_message() {
-        for (typed, reviews_messages) in [
-            ("y", true),
-            ("yes", true),
-            ("c", true),
-            ("commit", true),
-            ("a", false),
-            ("all", false),
-            ("all commits", false),
+        for (typed, acceptance) in [
+            ("y", PlanAcceptance::ReviewEach),
+            ("yes", PlanAcceptance::ReviewEach),
+            ("c", PlanAcceptance::ReviewEach),
+            ("commit", PlanAcceptance::ReviewEach),
+            ("a", PlanAcceptance::CommitAll),
+            ("all", PlanAcceptance::CommitAll),
+            ("all commits", PlanAcceptance::CommitAll),
         ] {
             assert_eq!(
-                crate::review::accepted(&PLAN_REVIEW, typed),
-                Some(reviews_messages),
+                review::accepted(&PLAN_REVIEW, typed),
+                Some(acceptance),
                 "{typed:?}"
             );
         }
     }
 
     #[test]
+    fn only_the_first_choice_at_the_plan_reviews_each_message() {
+        assert!(PlanAcceptance::ReviewEach.reviews_each_message());
+        assert!(!PlanAcceptance::CommitAll.reviews_each_message());
+    }
+
+    #[test]
     fn both_reviews_of_a_split_can_be_typed() {
-        crate::review::test_support::assert_typable(&PLAN_REVIEW);
-        crate::review::test_support::assert_typable(&SPLIT_COMMIT_REVIEW);
+        review::test_support::assert_typable(&PLAN_REVIEW);
+        review::test_support::assert_typable(&SPLIT_COMMIT_REVIEW);
     }
 
     #[test]
     fn yes_at_a_split_message_makes_the_commit() {
-        for (typed, commits) in [("y", true), ("yes", true), ("c", true), ("s", false)] {
+        for (typed, acceptance) in [
+            ("y", SplitCommitAcceptance::Commit),
+            ("yes", SplitCommitAcceptance::Commit),
+            ("c", SplitCommitAcceptance::Commit),
+            ("s", SplitCommitAcceptance::Skip),
+        ] {
             assert_eq!(
-                crate::review::accepted(&SPLIT_COMMIT_REVIEW, typed),
-                Some(commits),
+                review::accepted(&SPLIT_COMMIT_REVIEW, typed),
+                Some(acceptance),
                 "{typed:?}"
             );
         }

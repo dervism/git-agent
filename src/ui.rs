@@ -128,7 +128,7 @@ pub fn out(line: &str) {
 /// Writes text to stdout without styles, for what a pipeline reads: a model's cleaned
 /// reply, or the user's own settings. Those are safe already, so escaping changes nothing
 /// in them, and it keeps a new caller from printing what isn't.
-pub fn raw_out(text: &str) {
+pub fn plain_out(text: &str) {
     to_stdout(text, false);
 }
 
@@ -200,7 +200,7 @@ pub fn show_answer(heading: &str, text: &str) {
     if io::stdout().is_terminal() {
         show_framed(heading, text);
     } else {
-        raw_out(text);
+        plain_out(text);
     }
 }
 

@@ -39,10 +39,7 @@ use git::{Changes, CommitPatch, Repo, Scope};
 use github::PullRequest;
 use prompt::Work;
 use redact::{Change, Finding};
-use review::{
-    Action, Choice, Review, ask_action, edit_message, edit_plan, edit_pull_request, review,
-    show_proposal,
-};
+use review::{Action, Choice, Review};
 use server::{Message, ModelServer, Server};
 use split::signals::Stopped;
 use std::fs;
@@ -51,8 +48,23 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use ui::thousands;
 
-/// Accepting a commit message: the value says whether to push afterwards.
-const COMMIT_REVIEW: Review<bool> = Review {
+/// What accepting a commit message does.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum CommitAcceptance {
+    Commit,
+    CommitAndPush,
+}
+
+impl CommitAcceptance {
+    fn pushes(self) -> bool {
+        match self {
+            Self::Commit => false,
+            Self::CommitAndPush => true,
+        }
+    }
+}
+
+const COMMIT_REVIEW: Review<CommitAcceptance> = Review {
     heading: "Proposed commit message",
     first_line: "subject line",
     noun: "message",
@@ -62,19 +74,34 @@ const COMMIT_REVIEW: Review<bool> = Review {
         Choice {
             word: "commit",
             help: "commit with this message",
-            value: false,
+            value: CommitAcceptance::Commit,
         },
         Choice {
             word: "push",
             help: "commit with this message, then push",
-            value: true,
+            value: CommitAcceptance::CommitAndPush,
         },
     ],
     quit: "quit without committing",
 };
 
-/// Accepting a pull request: the value says whether it is a draft.
-const PULL_REQUEST_REVIEW: Review<bool> = Review {
+/// What accepting a pull request does.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum PullRequestAcceptance {
+    Create,
+    CreateDraft,
+}
+
+impl PullRequestAcceptance {
+    fn is_draft(self) -> bool {
+        match self {
+            Self::Create => false,
+            Self::CreateDraft => true,
+        }
+    }
+}
+
+const PULL_REQUEST_REVIEW: Review<PullRequestAcceptance> = Review {
     heading: "Proposed pull request",
     first_line: "title",
     noun: "pull request",
@@ -84,12 +111,12 @@ const PULL_REQUEST_REVIEW: Review<bool> = Review {
         Choice {
             word: "create",
             help: "push the branch if needed, then create the pull request",
-            value: false,
+            value: PullRequestAcceptance::Create,
         },
         Choice {
             word: "draft",
             help: "the same, as a draft pull request",
-            value: true,
+            value: PullRequestAcceptance::CreateDraft,
         },
     ],
     quit: "quit without creating it",
@@ -110,8 +137,23 @@ const TIDY_REVIEW: Review<()> = Review {
     quit: "quit without changing anything",
 };
 
-/// Accepting a new message for a commit being tidied: the value says whether to use it.
-const TIDY_MESSAGE_REVIEW: Review<bool> = Review {
+/// What accepting a new message for a commit being tidied does.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum TidyMessageAcceptance {
+    UseNew,
+    KeepOld,
+}
+
+impl TidyMessageAcceptance {
+    fn uses_new(self) -> bool {
+        match self {
+            Self::UseNew => true,
+            Self::KeepOld => false,
+        }
+    }
+}
+
+const TIDY_MESSAGE_REVIEW: Review<TidyMessageAcceptance> = Review {
     heading: "Proposed commit message",
     first_line: "subject line",
     noun: "message",
@@ -121,12 +163,12 @@ const TIDY_MESSAGE_REVIEW: Review<bool> = Review {
         Choice {
             word: "use",
             help: "give the commit this message",
-            value: true,
+            value: TidyMessageAcceptance::UseNew,
         },
         Choice {
             word: "keep",
             help: "keep the commit's old message",
-            value: false,
+            value: TidyMessageAcceptance::KeepOld,
         },
     ],
     quit: "stop without changing anything",
@@ -242,10 +284,10 @@ async fn generate(args: &GenerateArgs, overrides: &Overrides) -> Result<()> {
     let message = commit_message(&server, &model, &conversation).await?;
 
     if args.raw {
-        ui::raw_out(&message);
+        ui::plain_out(&message);
         return Ok(());
     }
-    show_proposal(&COMMIT_REVIEW, &message);
+    review::show_proposal(&COMMIT_REVIEW, &message);
     if args.commit {
         commit(&repo, &message, scope, &args.git_args, &leave_out)?;
         if args.push {
@@ -262,8 +304,8 @@ async fn generate(args: &GenerateArgs, overrides: &Overrides) -> Result<()> {
         return Ok(());
     }
 
-    let edit = |message: &str| edit_message(&repo, message);
-    let reviewed = review(
+    let edit = |message: &str| review::edit_message(&repo, message);
+    let reviewed = review::revise(
         &COMMIT_REVIEW,
         message,
         &server,
@@ -273,12 +315,12 @@ async fn generate(args: &GenerateArgs, overrides: &Overrides) -> Result<()> {
         separated,
     )
     .await?;
-    let Some((and_push, message)) = reviewed else {
+    let Some((acceptance, message)) = reviewed else {
         ui::info("Nothing committed.");
         return Ok(());
     };
     commit(&repo, &message, scope, &args.git_args, &leave_out)?;
-    if and_push || args.push {
+    if acceptance.pushes() || args.push {
         check_outgoing(&repo, &config).context(NOT_PUSHED)?;
         push(&repo, true).context(NOT_PUSHED)?;
     }
@@ -406,12 +448,12 @@ async fn pull_request(args: &PrArgs, overrides: &Overrides) -> Result<()> {
     let text = generate_message(&server, &model, &conversation).await?;
 
     if args.raw {
-        ui::raw_out(&text);
+        ui::plain_out(&text);
         return Ok(());
     }
-    show_proposal(&PULL_REQUEST_REVIEW, &text);
-    let (draft, text) = if args.create {
-        (false, text)
+    review::show_proposal(&PULL_REQUEST_REVIEW, &text);
+    let (acceptance, text) = if args.create {
+        (PullRequestAcceptance::Create, text)
     } else if !io::stdin().is_terminal() {
         ui::info(ui::dim(
             "Input is not a terminal, so not asking for review. \
@@ -419,8 +461,8 @@ async fn pull_request(args: &PrArgs, overrides: &Overrides) -> Result<()> {
         ));
         return Ok(());
     } else {
-        let edit = |text: &str| edit_pull_request(&repo, text);
-        let reviewed = review(
+        let edit = |text: &str| review::edit_pull_request(&repo, text);
+        let reviewed = review::revise(
             &PULL_REQUEST_REVIEW,
             text,
             &server,
@@ -443,7 +485,7 @@ async fn pull_request(args: &PrArgs, overrides: &Overrides) -> Result<()> {
         body: &body,
         base: &base,
         head: &branch,
-        draft: draft || args.draft,
+        draft: acceptance.is_draft() || args.draft,
         extra_args: &args.gh_args,
     };
     create_pull_request(&repo, &config, &pull_request, !args.create)
@@ -513,11 +555,11 @@ async fn new_branch(args: &BranchArgs, overrides: &Overrides) -> Result<()> {
     };
     let mut name = clean(generate_message(&server, &model, &conversation).await?)?;
     if args.raw {
-        ui::raw_out(&name);
+        ui::plain_out(&name);
         return Ok(());
     }
 
-    show_proposal(&BRANCH_REVIEW, &name);
+    review::show_proposal(&BRANCH_REVIEW, &name);
     let exists = |name: &str| taken.iter().any(|known| known == name);
     if exists(&name) {
         ui::warn(format!("a branch named {name} already exists"));
@@ -540,7 +582,7 @@ async fn new_branch(args: &BranchArgs, overrides: &Overrides) -> Result<()> {
             edited.map(|edited| branch_name(&repo, &edited)).transpose()
         };
         name = loop {
-            let reviewed = review(
+            let reviewed = review::revise(
                 &BRANCH_REVIEW,
                 name,
                 &server,
@@ -790,10 +832,10 @@ impl Tidier<'_> {
     ) -> Result<Option<tidy::Plan>> {
         loop {
             ui::show_framed(TIDY_REVIEW.heading, &tidy::show(&plan, self.commits));
-            let revised = match ask_action(&TIDY_REVIEW)? {
+            let revised = match review::ask_action(&TIDY_REVIEW)? {
                 Action::Accept(()) => return Ok(Some(plan)),
                 Action::Quit => return Ok(None),
-                Action::Edit => edit_plan(
+                Action::Edit => review::edit_plan(
                     self.repo,
                     "GIT_AGENT_TIDY_PLAN",
                     &tidy::to_text(&plan, self.commits),
@@ -851,12 +893,12 @@ impl Tidier<'_> {
                 report_fit(self.model, &fit, "message", None);
             }
             let message = commit_message(self.server, self.model, &conversation).await?;
-            show_proposal(&TIDY_MESSAGE_REVIEW, &message);
-            let (use_it, message) = if args.apply {
-                (true, message)
+            review::show_proposal(&TIDY_MESSAGE_REVIEW, &message);
+            let (acceptance, message) = if args.apply {
+                (TidyMessageAcceptance::UseNew, message)
             } else {
-                let edit = |message: &str| edit_message(self.repo, message);
-                let reviewed = review(
+                let edit = |message: &str| review::edit_message(self.repo, message);
+                let reviewed = review::revise(
                     &TIDY_MESSAGE_REVIEW,
                     message,
                     self.server,
@@ -871,7 +913,7 @@ impl Tidier<'_> {
                     None => return Ok(false),
                 }
             };
-            if use_it {
+            if acceptance.uses_new() {
                 let path = std::path::absolute(
                     self.repo
                         .git_path(&format!("GIT_AGENT_TIDY_MSG_{position}"))?,
@@ -1394,14 +1436,14 @@ fn show_config(overrides: &Overrides) -> Result<()> {
         (Some(path), false) => format!("# No file at {}; using defaults", path.display()),
         (None, _) => "# No config location found; using defaults".to_owned(),
     };
-    ui::raw_out(&format!(
+    ui::plain_out(&format!(
         "{source}\n# Flags and GIT_AGENT_* environment variables are applied."
     ));
     if loaded.config.model.is_none() {
-        ui::raw_out("# `model` is not set: git-agent uses the model loaded on the server.");
+        ui::plain_out("# `model` is not set: git-agent uses the model loaded on the server.");
     }
     if loaded.config.context_length.is_none() {
-        ui::raw_out(&format!(
+        ui::plain_out(&format!(
             "# `context_length` is not set: git-agent asks the server, or assumes {} tokens.",
             config::FALLBACK_CONTEXT_LENGTH
         ));
@@ -1410,13 +1452,13 @@ fn show_config(overrides: &Overrides) -> Result<()> {
         .api_key
         .as_deref()
         .is_some_and(|key| !key.trim().is_empty());
-    ui::raw_out(match (flag_key, loaded.config.api_key.is_some()) {
+    ui::plain_out(match (flag_key, loaded.config.api_key.is_some()) {
         (true, _) => "# API key: from --api-key or GIT_AGENT_API_KEY.",
         (false, true) => "# API key: saved in the macOS keychain.",
         (false, false) => "# API key: none.",
     });
     let settings_text = toml::to_string_pretty(&loaded.config)?;
-    ui::raw_out(&format!("\n{}", settings_text.trim_end()));
+    ui::plain_out(&format!("\n{}", settings_text.trim_end()));
     Ok(())
 }
 
@@ -1429,15 +1471,34 @@ mod tests {
     use tempfile::TempDir;
 
     #[test]
+    fn each_acceptance_does_what_its_choice_says() {
+        assert!(!CommitAcceptance::Commit.pushes());
+        assert!(CommitAcceptance::CommitAndPush.pushes());
+        assert!(!PullRequestAcceptance::Create.is_draft());
+        assert!(PullRequestAcceptance::CreateDraft.is_draft());
+        assert!(TidyMessageAcceptance::UseNew.uses_new());
+        assert!(!TidyMessageAcceptance::KeepOld.uses_new());
+    }
+
+    #[test]
     fn yes_picks_the_plain_acceptance() {
         for typed in ["y", "yes"] {
-            let push = review::accepted(&COMMIT_REVIEW, typed);
-            assert_eq!(push, Some(false), "{typed:?} commits without pushing");
-            let draft = review::accepted(&PULL_REQUEST_REVIEW, typed);
-            assert_eq!(draft, Some(false), "{typed:?} creates no draft");
+            assert_eq!(
+                review::accepted(&COMMIT_REVIEW, typed),
+                Some(CommitAcceptance::Commit),
+                "{typed:?}"
+            );
+            assert_eq!(
+                review::accepted(&PULL_REQUEST_REVIEW, typed),
+                Some(PullRequestAcceptance::Create),
+                "{typed:?}"
+            );
             assert_eq!(review::accepted(&TIDY_REVIEW, typed), Some(()), "{typed:?}");
-            let new_message = review::accepted(&TIDY_MESSAGE_REVIEW, typed);
-            assert_eq!(new_message, Some(true), "{typed:?} uses the new message");
+            assert_eq!(
+                review::accepted(&TIDY_MESSAGE_REVIEW, typed),
+                Some(TidyMessageAcceptance::UseNew),
+                "{typed:?}"
+            );
             assert_eq!(
                 review::accepted(&BRANCH_REVIEW, typed),
                 Some(()),

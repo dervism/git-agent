@@ -23,7 +23,7 @@ pub fn show_proposal<T>(review: &Review<T>, text: &str) {
 /// Lets the user review `text` until they accept or quit it, revising it as
 /// they ask; `clean` checks and tidies each new reply from the model. Returns
 /// the accept choice and the final text, or `None` on quit.
-pub async fn review<T: Copy>(
+pub async fn revise<T: Copy>(
     review: &Review<T>,
     mut text: String,
     server: &impl ModelServer,

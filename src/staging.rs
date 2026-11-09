@@ -1,7 +1,9 @@
 //! What git-agent checks and stages before it reads the changes to commit.
 
+mod untracked;
+
 use crate::git::{IndexEntry, Repo, names, shell_quote};
-use crate::{ui, untracked};
+use crate::ui;
 use anyhow::{Context, Result, bail};
 use std::collections::HashSet;
 use std::path::Path;
@@ -86,16 +88,46 @@ fn stage_all_but_findings(repo: &Repo, ask: bool) -> Result<Option<Vec<IndexEntr
         ));
         return Ok(Some(staged));
     }
-    let staged = match ui::ask_untracked()? {
-        ui::UntrackedChoice::Ignore => {
+    let staged = match ask_untracked()? {
+        UntrackedChoice::Ignore => {
             let staged = ignore_and_stage_the_rest(repo, &top, &findings)?;
             ensure_left_out(repo, &findings)?;
             staged
         }
-        ui::UntrackedChoice::Commit => add_all(repo, &[])?,
-        ui::UntrackedChoice::Quit => return Ok(None),
+        UntrackedChoice::Commit => add_all(repo, &[])?,
+        UntrackedChoice::Quit => return Ok(None),
     };
     Ok(Some(staged))
+}
+
+/// What to do with untracked files that look like they should be ignored.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum UntrackedChoice {
+    /// Add them to .gitignore.
+    Ignore,
+    /// Stage them with everything else.
+    Commit,
+    Quit,
+}
+
+/// Asks what to do with untracked files that look like they should be
+/// ignored. Enter means ignore them; end of input means quit.
+pub fn ask_untracked() -> Result<UntrackedChoice> {
+    loop {
+        let question = format!(
+            "Add them to .gitignore? {}",
+            ui::dim("[Y]es  [n]o, commit them too  [q]uit ›")
+        );
+        let Some(answer) = ui::read_line(&question)? else {
+            return Ok(UntrackedChoice::Quit);
+        };
+        match answer.to_lowercase().as_str() {
+            "" | "y" | "yes" => return Ok(UntrackedChoice::Ignore),
+            "n" | "no" => return Ok(UntrackedChoice::Commit),
+            "q" | "quit" => return Ok(UntrackedChoice::Quit),
+            _ => ui::info("Please answer y, n or q."),
+        }
+    }
 }
 
 /// Runs `git add --all`, except on what the `exclude` pathspecs name, and then puts back the
@@ -349,6 +381,45 @@ mod tests {
     use super::*;
     use crate::git::test_support::{isolated_repo, run};
     use std::fs;
+
+    #[test]
+    fn stages_everything_but_the_untracked_files_left_out() {
+        let (dir, repo) = isolated_repo();
+        fs::write(dir.path().join("Cargo.toml"), "[package]\n").unwrap();
+        fs::create_dir_all(dir.path().join("target/debug")).unwrap();
+        fs::write(dir.path().join("target/debug/app"), "binary").unwrap();
+        fs::create_dir_all(dir.path().join("src")).unwrap();
+        fs::write(dir.path().join("src/a b.rs"), "fn a() {}\n").unwrap();
+        fs::write(dir.path().join("lib.rs"), "fn changed() {}\n").unwrap();
+        run(dir.path(), &["mv", "lib.rs", "core.rs"]);
+        fs::write(dir.path().join("x.o"), "object").unwrap();
+
+        let mut untracked = repo.untracked_files().unwrap();
+        untracked.sort();
+        assert_eq!(
+            untracked,
+            ["Cargo.toml", "src/a b.rs", "target/debug/app", "x.o"]
+        );
+        assert_eq!(
+            repo.toplevel().unwrap().canonicalize().unwrap(),
+            dir.path().canonicalize().unwrap()
+        );
+
+        let findings = untracked::check(&repo.toplevel().unwrap(), &untracked);
+        repo.stage_all_except(&untracked::exclude(&findings))
+            .unwrap();
+        let staged = run(dir.path(), &["diff", "--cached", "--name-only"]);
+        // The rename shows by its new name.
+        assert_eq!(staged, "Cargo.toml\ncore.rs\nsrc/a b.rs\n");
+        assert_eq!(repo.untracked_files().unwrap().len(), 2);
+
+        // Once ignored, they stay out of a plain `git add --all` too.
+        untracked::add_to_gitignore(&repo.toplevel().unwrap(), &findings).unwrap();
+        repo.stage_all_except(&[]).unwrap();
+        assert!(repo.untracked_files().unwrap().is_empty());
+        let staged = run(dir.path(), &["diff", "--cached", "--name-only"]);
+        assert!(staged.contains(".gitignore") && !staged.contains("target"));
+    }
 
     #[test]
     fn keeps_a_file_that_gitignore_cant_name_out_of_what_it_stages() {

@@ -2068,45 +2068,6 @@ mod tests {
     }
 
     #[test]
-    fn stages_everything_but_the_untracked_files_left_out() {
-        let (dir, repo) = setup();
-        fs::write(dir.path().join("Cargo.toml"), "[package]\n").unwrap();
-        fs::create_dir_all(dir.path().join("target/debug")).unwrap();
-        fs::write(dir.path().join("target/debug/app"), "binary").unwrap();
-        fs::create_dir_all(dir.path().join("src")).unwrap();
-        fs::write(dir.path().join("src/a b.rs"), "fn a() {}\n").unwrap();
-        fs::write(dir.path().join("lib.rs"), "fn changed() {}\n").unwrap();
-        run(dir.path(), &["mv", "lib.rs", "core.rs"]);
-        fs::write(dir.path().join("x.o"), "object").unwrap();
-
-        let mut untracked = repo.untracked_files().unwrap();
-        untracked.sort();
-        assert_eq!(
-            untracked,
-            ["Cargo.toml", "src/a b.rs", "target/debug/app", "x.o"]
-        );
-        assert_eq!(
-            repo.toplevel().unwrap().canonicalize().unwrap(),
-            dir.path().canonicalize().unwrap()
-        );
-
-        let findings = crate::untracked::check(&repo.toplevel().unwrap(), &untracked);
-        repo.stage_all_except(&crate::untracked::exclude(&findings))
-            .unwrap();
-        let staged = run(dir.path(), &["diff", "--cached", "--name-only"]);
-        // The rename shows by its new name.
-        assert_eq!(staged, "Cargo.toml\ncore.rs\nsrc/a b.rs\n");
-        assert_eq!(repo.untracked_files().unwrap().len(), 2);
-
-        // Once ignored, they stay out of a plain `git add --all` too.
-        crate::untracked::add_to_gitignore(&repo.toplevel().unwrap(), &findings).unwrap();
-        repo.stage_all_except(&[]).unwrap();
-        assert!(repo.untracked_files().unwrap().is_empty());
-        let staged = run(dir.path(), &["diff", "--cached", "--name-only"]);
-        assert!(staged.contains(".gitignore") && !staged.contains("target"));
-    }
-
-    #[test]
     fn detached_head_has_no_branch() {
         let (dir, repo) = setup();
         run(dir.path(), &["switch", "-q", "--detach"]);

@@ -268,36 +268,6 @@ pub fn read_line(prompt: &str) -> Result<Option<String>> {
     Ok(Some(line.trim().to_owned()))
 }
 
-/// What to do with untracked files that look like they should be ignored.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum UntrackedChoice {
-    /// Add them to .gitignore.
-    Ignore,
-    /// Stage them with everything else.
-    Commit,
-    Quit,
-}
-
-/// Asks what to do with untracked files that look like they should be
-/// ignored. Enter means ignore them; end of input means quit.
-pub fn ask_untracked() -> Result<UntrackedChoice> {
-    loop {
-        let question = format!(
-            "Add them to .gitignore? {}",
-            dim("[Y]es  [n]o, commit them too  [q]uit ›")
-        );
-        let Some(answer) = read_line(&question)? else {
-            return Ok(UntrackedChoice::Quit);
-        };
-        match answer.to_lowercase().as_str() {
-            "" | "y" | "yes" => return Ok(UntrackedChoice::Ignore),
-            "n" | "no" => return Ok(UntrackedChoice::Commit),
-            "q" | "quit" => return Ok(UntrackedChoice::Quit),
-            _ => say!("Please answer y, n or q."),
-        }
-    }
-}
-
 /// Asks a yes/no question. Enter means yes; end of input means no.
 pub fn confirm(question: &str) -> Result<bool> {
     loop {

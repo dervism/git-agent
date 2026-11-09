@@ -42,7 +42,6 @@ const LAYERS: &[(&str, Layer)] = &[
     ("tidy", Feature),
     ("why", Feature),
     ("staging", Shared("staging")),
-    ("untracked", Shared("staging")),
     ("secrets", Shared("secrets")),
     ("review", Shared("review")),
     ("conversation", Shared("conversation")),
@@ -74,8 +73,6 @@ const KNOWN: &[(&str, &str)] = &[
     ("split", "cli"),
     // Step 3: the shared steps leave `main`.
     ("split", "main"),
-    // Step 3: git's test of `stage_all_except` with untracked files moves to staging's tests.
-    ("git", "untracked"),
     // Step 5: why's parsers of git's output move to `git/blame.rs`, and git's tests build their
     // line ranges themselves instead of with `why::Target` and `why::head_line`.
     ("git", "why"),

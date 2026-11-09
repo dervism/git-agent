@@ -22,7 +22,6 @@ mod staging;
 mod temp;
 mod tidy;
 mod ui;
-mod untracked;
 mod why;
 
 use anyhow::{Context, Result, bail};

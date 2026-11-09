@@ -1,6 +1,7 @@
 //! Command-line interface.
 
 use crate::config::{OnSecrets, Overrides};
+use crate::ui::OutputClosed;
 use clap::error::ErrorKind;
 use clap::parser::ValueSource;
 use clap::{Arg, ArgMatches, Args, CommandFactory, FromArgMatches, Parser, Subcommand};
@@ -319,9 +320,26 @@ pub enum ConfigCommand {
     Show,
 }
 
-/// Parses the command line, and exits the way clap does when it's wrong.
+/// Parses the command line, and exits the way clap does when it's wrong, or when it asks for
+/// help or the version.
 pub fn parse() -> Cli {
-    try_parse_from(std::env::args_os()).unwrap_or_else(|error| error.exit())
+    try_parse_from(std::env::args_os()).unwrap_or_else(|error| {
+        let printed = error.print();
+        std::process::exit(status_after_printing(&error, printed))
+    })
+}
+
+/// The status to exit with after `error` was printed, with `printed` as the result. It is the
+/// one clap gives, except for help and the version: they go to stdout, and with the reader
+/// of it gone, that's the status the other commands end with. clap's own `Error::exit`
+/// ignores a broken pipe.
+fn status_after_printing(error: &clap::Error, printed: std::io::Result<()>) -> i32 {
+    match printed {
+        Err(failure) if !error.use_stderr() && failure.kind() == std::io::ErrorKind::BrokenPipe => {
+            i32::from(OutputClosed::EXIT_STATUS)
+        }
+        _ => error.exit_code(),
+    }
 }
 
 /// Parses `args`, and refuses the default command's options when they come with a subcommand.
@@ -462,6 +480,55 @@ mod tests {
     #[test]
     fn cli_definition_is_valid() {
         Cli::command().debug_assert();
+    }
+
+    fn broken_pipe() -> std::io::Result<()> {
+        Err(std::io::ErrorKind::BrokenPipe.into())
+    }
+
+    fn asked_for_help() -> clap::Error {
+        try_parse_from(["git-agent", "--help"]).unwrap_err()
+    }
+
+    fn asked_for_the_version() -> clap::Error {
+        try_parse_from(["git-agent", "--version"]).unwrap_err()
+    }
+
+    fn got_the_command_line_wrong() -> clap::Error {
+        try_parse_from(["git-agent", "--no-such-option"]).unwrap_err()
+    }
+
+    #[test]
+    fn exits_with_141_when_help_or_the_version_cant_be_printed_to_a_reader_that_went_away() {
+        for error in [asked_for_help(), asked_for_the_version()] {
+            assert_eq!(status_after_printing(&error, broken_pipe()), 141);
+        }
+    }
+
+    #[test]
+    fn exits_with_clap_s_status_when_what_it_printed_got_through() {
+        assert_eq!(status_after_printing(&asked_for_help(), Ok(())), 0);
+        assert_eq!(status_after_printing(&asked_for_the_version(), Ok(())), 0);
+        assert_eq!(
+            status_after_printing(&got_the_command_line_wrong(), Ok(())),
+            2
+        );
+    }
+
+    #[test]
+    fn exits_with_clap_s_status_for_a_usage_error_even_when_stderr_is_gone() {
+        let error = got_the_command_line_wrong();
+        assert_eq!(status_after_printing(&error, broken_pipe()), 2);
+    }
+
+    #[test]
+    fn exits_with_clap_s_status_when_printing_fails_for_another_reason() {
+        let full = || Err(std::io::Error::other("disk full"));
+        assert_eq!(status_after_printing(&asked_for_help(), full()), 0);
+        assert_eq!(
+            status_after_printing(&got_the_command_line_wrong(), full()),
+            2
+        );
     }
 
     #[test]

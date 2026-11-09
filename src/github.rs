@@ -137,8 +137,11 @@ pub fn open_pull_request(dir: &Path, branch: &str) -> Result<Option<String>> {
     Ok((!url.is_empty()).then_some(url))
 }
 
-/// Creates the pull request. gh prints its progress and the new pull request's URL.
-pub fn create_pull_request(dir: &Path, pull_request: &PullRequest) -> Result<()> {
+/// Creates the pull request. gh prints its progress to the user, and returns the new pull
+/// request's URL, which is for the caller to print: gh's own stdout isn't git-agent's, so that
+/// with the reader of that output gone, gh doesn't die of `SIGPIPE` after it has made the
+/// pull request.
+pub fn create_pull_request(dir: &Path, pull_request: &PullRequest) -> Result<String> {
     let mut command = gh(
         dir,
         &[
@@ -157,9 +160,16 @@ pub fn create_pull_request(dir: &Path, pull_request: &PullRequest) -> Result<()>
     if pull_request.draft {
         command.arg("--draft");
     }
+    command.args(pull_request.extra_args);
+    send_description(command, pull_request.body)
+}
+
+/// Runs `command` with `description` on its standard input, and returns its trimmed standard
+/// output. Its standard error stays the user's.
+fn send_description(mut command: Command, description: &str) -> Result<String> {
     let mut child = command
-        .args(pull_request.extra_args)
         .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
         .spawn()
         .map_err(start_error)?;
     // Dropping stdin closes it, so gh sees the end of the description.
@@ -167,13 +177,13 @@ pub fn create_pull_request(dir: &Path, pull_request: &PullRequest) -> Result<()>
         .stdin
         .take()
         .context("gh has no input")?
-        .write_all(pull_request.body.as_bytes());
-    let status = child.wait().context("failed to wait for gh")?;
+        .write_all(description.as_bytes());
+    let output = child.wait_with_output().context("failed to wait for gh")?;
     written.context("failed to send the description to gh")?;
-    if !status.success() {
-        bail!("`gh pr create` failed ({status})");
+    if !output.status.success() {
+        bail!("`gh pr create` failed ({})", output.status);
     }
-    Ok(())
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
 }
 
 #[cfg(test)]
@@ -192,6 +202,46 @@ mod tests {
             issue.summary(),
             "Issue #7: Fiks å lagre\\n✅ Pushed.\\033[2J"
         );
+    }
+
+    fn script(text: &str) -> Command {
+        let mut command = Command::new("sh");
+        command.arg("-c").arg(text);
+        command
+    }
+
+    #[test]
+    fn sends_the_description_and_returns_what_gh_prints_trimmed() {
+        let gh = script("body=$(cat); echo \"  https://github.example/pull/7 ($body)  \"");
+        assert_eq!(
+            send_description(gh, "the body").unwrap(),
+            "https://github.example/pull/7 (the body)"
+        );
+    }
+
+    #[test]
+    fn returns_nothing_when_gh_prints_nothing() {
+        assert_eq!(send_description(script("cat >/dev/null"), "x").unwrap(), "");
+    }
+
+    #[test]
+    fn fails_with_gh_s_status_and_no_url_when_gh_fails() {
+        let gh = script("cat >/dev/null; echo not-a-url; exit 3");
+        let err = send_description(gh, "x").unwrap_err();
+        assert_eq!(err.to_string(), "`gh pr create` failed (exit status: 3)");
+    }
+
+    #[test]
+    fn fails_with_an_error_to_report_when_the_description_cant_be_sent() {
+        let err = send_description(Command::new("true"), &"x".repeat(1 << 20)).unwrap_err();
+        assert_eq!(err.to_string(), "failed to send the description to gh");
+        assert!(!err.is::<crate::ui::OutputClosed>());
+    }
+
+    #[test]
+    fn says_what_to_install_when_gh_is_missing() {
+        let err = send_description(Command::new("gh-that-is-not-installed"), "x").unwrap_err();
+        assert!(err.to_string().contains("GitHub CLI"), "{err}");
     }
 
     #[test]

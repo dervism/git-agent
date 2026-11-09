@@ -6,6 +6,7 @@ mod cli;
 mod config;
 mod conversation;
 mod delivery;
+mod exit;
 mod explain;
 mod git;
 mod github;
@@ -46,7 +47,6 @@ use secrets::{
     warn_about_commits,
 };
 use server::{Message, ModelServer, Server};
-use split::signals::Stopped;
 use staging::{Purpose, Staged};
 use std::fs;
 use std::io::{self, IsTerminal};
@@ -238,9 +238,10 @@ async fn main() -> ExitCode {
     match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
-            ui::error(&err);
-            err.downcast_ref::<Stopped>()
-                .map_or(ExitCode::FAILURE, |Stopped(code)| ExitCode::from(*code))
+            if exit::is_reported(&err) {
+                ui::error(&err);
+            }
+            ExitCode::from(exit::status(&err))
         }
     }
 }
@@ -320,10 +321,10 @@ async fn generate(args: &GenerateArgs, overrides: &Overrides) -> Result<()> {
     let message = commit_message(&server, &model, &conversation).await?;
 
     if args.raw {
-        ui::plain_out(&message);
+        ui::plain_out(&message)?;
         return Ok(());
     }
-    review::show_proposal(&COMMIT_REVIEW, &message);
+    review::show_proposal(&COMMIT_REVIEW, &message)?;
     if args.commit {
         commit(&repo, &new_commit(&message), at)?;
         if args.push {
@@ -475,10 +476,10 @@ async fn pull_request(args: &PrArgs, overrides: &Overrides) -> Result<()> {
     let text = generate_message(&server, &model, &conversation).await?;
 
     if args.raw {
-        ui::plain_out(&text);
+        ui::plain_out(&text)?;
         return Ok(());
     }
-    review::show_proposal(&PULL_REQUEST_REVIEW, &text);
+    review::show_proposal(&PULL_REQUEST_REVIEW, &text)?;
     let (acceptance, text) = if args.create {
         (PullRequestAcceptance::Create, text)
     } else if !io::stdin().is_terminal() {
@@ -579,11 +580,11 @@ async fn new_branch(args: &BranchArgs, overrides: &Overrides) -> Result<()> {
     };
     let mut name = clean(generate_message(&server, &model, &conversation).await?)?;
     if args.raw {
-        ui::plain_out(&name);
+        ui::plain_out(&name)?;
         return Ok(());
     }
 
-    review::show_proposal(&BRANCH_REVIEW, &name);
+    review::show_proposal(&BRANCH_REVIEW, &name)?;
     let exists = |name: &str| taken.iter().any(|known| known == name);
     if exists(&name) {
         ui::warn(format!("a branch named {name} already exists"));
@@ -773,7 +774,7 @@ async fn tidy_commits(args: &TidyArgs, overrides: &Overrides) -> Result<()> {
     };
     let mut plan = tidier.ask_for_plan(&conversation, true).await?;
     if args.apply || !io::stdin().is_terminal() {
-        ui::show_framed(TIDY_REVIEW.heading, &tidy::show(&plan, &commits));
+        ui::show_framed(TIDY_REVIEW.heading, &tidy::show(&plan, &commits))?;
         if !plan.changes_anything() {
             ui::info("✨ The commits look tidy already.");
             return Ok(());
@@ -884,7 +885,7 @@ impl Tidier<'_> {
         conversation: &[Message],
     ) -> Result<Option<tidy::Plan>> {
         loop {
-            ui::show_framed(TIDY_REVIEW.heading, &tidy::show(&plan, self.commits));
+            ui::show_framed(TIDY_REVIEW.heading, &tidy::show(&plan, self.commits))?;
             let revised = match review::ask_action(&TIDY_REVIEW, self.person)? {
                 Action::Accept(()) => return Ok(Some(plan)),
                 Action::Quit => return Ok(None),
@@ -946,7 +947,7 @@ impl Tidier<'_> {
                 report_fit(self.model, &fit, "message", None);
             }
             let message = commit_message(self.server, self.model, &conversation).await?;
-            review::show_proposal(&TIDY_MESSAGE_REVIEW, &message);
+            review::show_proposal(&TIDY_MESSAGE_REVIEW, &message)?;
             let (acceptance, message) = if args.apply {
                 (TidyMessageAcceptance::UseNew, message)
             } else {
@@ -1269,21 +1270,29 @@ fn create_pull_request(
             return Ok(());
         }
     }
-    if let Err(err) = github::create_pull_request(repo.workdir(), pull_request) {
-        // Like a failed commit, keep the text so it isn't lost.
-        let path = repo.git_path("GIT_AGENT_PR.md")?;
-        fs::write(&path, format!("{}\n", pull_request.body))
-            .with_context(|| format!("failed to write {}", path.display()))?;
-        bail!(
-            "{err}; the description was saved, create the pull request with:\n  \
-             gh pr create --base {} --title {} --body-file {}",
-            pull_request.base,
-            git::shell_quote(pull_request.title),
-            path.display()
-        );
-    }
+    let url = match github::create_pull_request(repo.workdir(), pull_request) {
+        Ok(url) => url,
+        Err(err) => {
+            // Like a failed commit, keep the text so it isn't lost.
+            let path = repo.git_path("GIT_AGENT_PR.md")?;
+            fs::write(&path, format!("{}\n", pull_request.body))
+                .with_context(|| format!("failed to write {}", path.display()))?;
+            bail!(
+                "{err}; the description was saved, create the pull request with:\n  \
+                 gh pr create --base {} --title {} --body-file {}",
+                pull_request.base,
+                git::shell_quote(pull_request.title),
+                path.display()
+            );
+        }
+    };
+    let shown = if url.is_empty() {
+        Ok(())
+    } else {
+        ui::out(&url)
+    };
     ui::info(ui::green("✅ Pull request created."));
-    Ok(())
+    shown
 }
 
 async fn list_models(overrides: &Overrides) -> Result<()> {
@@ -1313,10 +1322,10 @@ async fn list_models(overrides: &Overrides) -> Result<()> {
             details.push(format!("{} tokens of context", thousands(tokens)));
         }
         if details.is_empty() {
-            ui::out(&format!("{marker} {}", shown_id(model)));
+            ui::out(&format!("{marker} {}", shown_id(model)))?;
         } else {
             let details = ui::dim(&details.join(", "));
-            ui::out(&format!("{marker} {:width$}  {details}", shown_id(model)));
+            ui::out(&format!("{marker} {:width$}  {details}", shown_id(model)))?;
         }
     }
 
@@ -1362,15 +1371,15 @@ fn show_config(overrides: &Overrides) -> Result<()> {
     };
     ui::plain_out(&format!(
         "{source}\n# Flags and GIT_AGENT_* environment variables are applied."
-    ));
+    ))?;
     if loaded.config.model.is_none() {
-        ui::plain_out("# `model` is not set: git-agent uses the model loaded on the server.");
+        ui::plain_out("# `model` is not set: git-agent uses the model loaded on the server.")?;
     }
     if loaded.config.context_length.is_none() {
         ui::plain_out(&format!(
             "# `context_length` is not set: git-agent asks the server, or assumes {} tokens.",
             config::FALLBACK_CONTEXT_LENGTH
-        ));
+        ))?;
     }
     let flag_key = overrides
         .api_key
@@ -1380,10 +1389,9 @@ fn show_config(overrides: &Overrides) -> Result<()> {
         (true, _) => "# API key: from --api-key or GIT_AGENT_API_KEY.",
         (false, true) => "# API key: saved in the macOS keychain.",
         (false, false) => "# API key: none.",
-    });
+    })?;
     let settings_text = toml::to_string_pretty(&loaded.config)?;
-    ui::plain_out(&format!("\n{}", settings_text.trim_end()));
-    Ok(())
+    ui::plain_out(&format!("\n{}", settings_text.trim_end()))
 }
 
 #[cfg(test)]

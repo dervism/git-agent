@@ -160,6 +160,25 @@ commit should hold the changes git-agent checked and the message describes: `-s`
 `--cleanup=…`, `-q`, `-v`, `--allow-empty` and `--no-post-rewrite`. git-agent refuses
 anything else, such as a path, `-a` or `--amend`, before it asks the model.
 
+### If the program reading the output stops
+
+When the program that reads git-agent's output closes it early, as `head` does, git-agent
+stops, prints nothing more, and exits with status 141. That's the status a shell reports for
+git in the same case, so a script with `set -o pipefail` can't tell them apart.
+
+What that means for the commands that change the repository:
+
+- `git agent -c` shows the message before it commits, so if the reader has gone away by then,
+  nothing is committed.
+- `git agent split -c` shows each message between the commits, so it stops after the commits
+  it has made. The changes that aren't committed stay where they were, and with `-p`, the
+  commits it made stay unpushed.
+- `git agent tidy --apply` shows the plan and each new message before it rewrites the commits,
+  so if the reader has gone away by then, it changes nothing.
+
+A push or a pull request that was under way when the reader went away still finishes, and
+git-agent says so.
+
 ## Starting a branch
 
 `git agent branch` names a new branch after what it is for, creates it and switches

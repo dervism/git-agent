@@ -9,8 +9,8 @@ use anyhow::Result;
 
 const SUBJECT_LIMIT: usize = 72;
 
-pub fn show_proposal<T>(review: &Review<T>, text: &str) {
-    ui::show_framed(review.heading, text);
+pub fn show_proposal<T>(review: &Review<T>, text: &str) -> Result<()> {
+    ui::show_framed(review.heading, text)?;
     let first_len = text.lines().next().unwrap_or_default().chars().count();
     if first_len > SUBJECT_LIMIT {
         ui::warn(format!(
@@ -18,6 +18,7 @@ pub fn show_proposal<T>(review: &Review<T>, text: &str) {
             review.first_line
         ));
     }
+    Ok(())
 }
 
 /// Where new versions of a proposal come from: the model, asked with `conversation`, whose
@@ -83,7 +84,7 @@ where
             )),
             Err(err) => ui::error(&err),
         }
-        show_proposal(review, &text);
+        show_proposal(review, &text)?;
     }
 }
 

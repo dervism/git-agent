@@ -15,8 +15,9 @@ pub trait Discussant {
     /// answers on one.
     fn is_interactive(&self) -> bool;
 
-    /// Shows the person the model's answer, under `heading`.
-    fn show_answer(&self, heading: &str, answer: &str);
+    /// Shows the person the model's answer, under `heading`, or fails if they can't be shown
+    /// it, as when the program that reads the output has closed it.
+    fn show_answer(&self, heading: &str, answer: &str) -> Result<()>;
 
     /// The follow-up question the person types, or `None` at end of input. An empty one
     /// ends the discussion too.
@@ -91,7 +92,7 @@ pub async fn discuss(
     discussant: &dyn Discussant,
 ) -> Result<()> {
     let mut answer = generate_message(server, model, &conversation).await?;
-    discussant.show_answer(heading, &answer);
+    discussant.show_answer(heading, &answer)?;
     if !discussant.is_interactive() {
         return Ok(());
     }
@@ -112,7 +113,7 @@ pub async fn discuss(
             Ok(reply) => {
                 conversation = next;
                 answer = reply;
-                discussant.show_answer(heading, &answer);
+                discussant.show_answer(heading, &answer)?;
             }
             Err(err) => ui::error(&err),
         }
@@ -124,6 +125,7 @@ pub async fn discuss(
 #[cfg(test)]
 pub mod test_support {
     use super::Discussant;
+    use crate::ui::OutputClosed;
     use anyhow::Result;
     use std::cell::RefCell;
     use std::collections::VecDeque;
@@ -132,6 +134,7 @@ pub mod test_support {
     /// keeps every answer they were shown.
     pub struct ScriptedPerson {
         interactive: bool,
+        closes_after: Option<usize>,
         lines: RefCell<VecDeque<String>>,
         pub shown: RefCell<Vec<String>>,
     }
@@ -141,8 +144,18 @@ pub mod test_support {
         pub fn typing(lines: &[&str]) -> Self {
             Self {
                 interactive: true,
+                closes_after: None,
                 lines: RefCell::new(lines.iter().map(|&line| line.to_owned()).collect()),
                 shown: RefCell::new(Vec::new()),
+            }
+        }
+
+        /// Whose output closes after `answers` answers were shown to them: the program reading
+        /// it has gone away.
+        pub fn with_the_output_closed_after(self, answers: usize) -> Self {
+            Self {
+                closes_after: Some(answers),
+                ..self
             }
         }
 
@@ -176,8 +189,12 @@ pub mod test_support {
             self.interactive
         }
 
-        fn show_answer(&self, _heading: &str, answer: &str) {
+        fn show_answer(&self, _heading: &str, answer: &str) -> Result<()> {
+            if self.closes_after == Some(self.shown.borrow().len()) {
+                return Err(OutputClosed.into());
+            }
             self.shown.borrow_mut().push(answer.to_owned());
+            Ok(())
         }
 
         fn ask_follow_up(&self) -> Result<Option<String>> {
@@ -193,6 +210,7 @@ mod tests {
     use crate::conversation::test_support::configured;
     use crate::server::Role;
     use crate::server::test_support::FakeServer;
+    use crate::ui::OutputClosed;
     use anyhow::anyhow;
     use std::cell::Cell;
 
@@ -294,6 +312,36 @@ mod tests {
 
         assert_eq!(error.to_string(), "the server went away");
         assert!(person.shown.borrow().is_empty());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn stops_when_the_first_answer_cant_be_shown_and_asks_nothing() {
+        let server = FakeServer::replying("the answer");
+        let person = ScriptedPerson::typing(&["never asked"]).with_the_output_closed_after(0);
+
+        let error = discuss(&server, &configured(100_000), "H", vec![], &person)
+            .await
+            .unwrap_err();
+
+        assert!(error.is::<OutputClosed>());
+        assert_eq!(person.lines_left(), 1);
+        assert_eq!(server.received.borrow().len(), 1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn stops_when_an_answer_to_a_follow_up_cant_be_shown() {
+        let server = FakeServer::answering(numbering(0));
+        let person =
+            ScriptedPerson::typing(&["Why?", "never asked"]).with_the_output_closed_after(1);
+
+        let error = discuss(&server, &configured(100_000), "H", vec![], &person)
+            .await
+            .unwrap_err();
+
+        assert!(error.is::<OutputClosed>());
+        assert_eq!(*person.shown.borrow(), ["answer 1"]);
+        assert_eq!(person.lines_left(), 1);
+        assert_eq!(server.received.borrow().len(), 2);
     }
 
     #[tokio::test(flavor = "current_thread")]

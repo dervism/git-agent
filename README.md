@@ -601,7 +601,8 @@ lists the secrets and carries on, and the model still gets `[REDACTED]` in their
 - API keys and tokens in the formats of GitHub, GitLab, Slack, Stripe, AWS, OpenAI,
   Anthropic, Google, Hugging Face, Groq, xAI, npm and PyPI, and JSON web tokens
 - private keys (`-----BEGIN … PRIVATE KEY-----`)
-- passwords in URLs, such as `postgres://app:s3cret@db.example.com`, and bearer tokens
+- passwords and tokens in URLs, such as `postgres://app:s3cret@db.example.com`,
+  and bearer tokens
 - values assigned to names such as `password`, `secret`, `token` or `API_KEY`, in
   `.env` files, YAML, JSON or code
 

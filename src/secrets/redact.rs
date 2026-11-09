@@ -10,6 +10,7 @@
 use crate::git::names;
 use crate::safe_text::without_hidden;
 use regex_lite::Regex;
+use std::ops::Range;
 use std::sync::LazyLock;
 
 pub const REDACTED: &str = "[REDACTED]";
@@ -50,6 +51,9 @@ enum Check {
     /// A value that may be code or a setting: it also needs letters and digits,
     /// and no characters that only code uses.
     Value,
+    /// A token as a URL's user name: a value, but not the public key of a Sentry DSN, which
+    /// is meant to be public.
+    UrlUser,
 }
 
 struct Rule {
@@ -171,8 +175,17 @@ const RULES: &[Rule] = &[
         kind: "password in a URL",
         needles: &["://"],
         // The host is part of the match, so placeholders such as example.com are skipped.
-        pattern: r#"\b[A-Za-z][A-Za-z0-9+.-]*://[^\s:/@]+:(?P<secret>[^\s/@]+)@[^\s/:?#"'`]+"#,
+        pattern: r#"\b[A-Za-z][A-Za-z0-9+.-]*://[^\s:/@]*:(?P<secret>[^\s/@]+)@[^\s/:?#"'`]+"#,
         check: Check::Token,
+    },
+    // A token as the user name of a web address, as some package registries and GitHub write
+    // it: 20 letters and digits, or 32 characters with `-` or `_`, as a UUID has. Names such as
+    // `git`, `oauth2` or a team's name are too short or hold other characters.
+    Rule {
+        kind: "token in a URL",
+        needles: &["://"],
+        pattern: r#"\b(?:(?:git|registry|sparse)\+)?https?://(?P<secret>[A-Za-z0-9]{20,}|[A-Za-z0-9_-]{32,})(?::x-oauth-basic|:)?@[^\s/:?#"'`]+(?::[0-9]+)?(?P<path>/[^\s"'`]*)?"#,
+        check: Check::UrlUser,
     },
     Rule {
         kind: "bearer token",
@@ -411,22 +424,7 @@ fn replace_secrets(line: &str, kinds: &mut Vec<String>) -> String {
         if !rule.needles.iter().any(|needle| lower.contains(needle)) {
             continue;
         }
-        let found: Vec<_> = regex
-            .captures_iter(&line)
-            .filter_map(|captures| {
-                let secret = captures.name("secret")?;
-                let whole = captures.get(0)?.as_str();
-                if !plausible(secret.as_str(), whole, rule.check)
-                    || is_type_annotation(&captures, &line[secret.end()..])
-                {
-                    return None;
-                }
-                let kind = captures.name("name").map_or(rule.kind.to_owned(), |name| {
-                    format!("{} value", name.as_str())
-                });
-                Some((secret.range(), kind))
-            })
-            .collect();
+        let found = secrets_found(rule, regex, &line);
         // From the end, so the ranges of earlier matches stay valid.
         for (range, _) in found.iter().rev() {
             line.replace_range(range.clone(), REDACTED);
@@ -434,6 +432,56 @@ fn replace_secrets(line: &str, kinds: &mut Vec<String>) -> String {
         kinds.extend(found.into_iter().map(|(_, kind)| kind));
     }
     line
+}
+
+/// The secrets `rule` finds in `line`, with their kinds. A match that isn't a secret is searched
+/// again from the start of its value, so that it can't hide one inside it, as a package's URL can
+/// in its query; a few times per line, so that a crafted line can't cost time in the square of its
+/// length.
+fn secrets_found(rule: &Rule, regex: &Regex, line: &str) -> Vec<(Range<usize>, String)> {
+    const MOST_RESTARTS: usize = 8;
+    let mut found = Vec::new();
+    let (mut start, mut restarts) = (0, 0);
+    while let Some(captures) = regex.captures_at(line, start) {
+        let (Some(whole), Some(secret)) = (captures.get(0), captures.name("secret")) else {
+            break;
+        };
+        let path = captures.name("path").map_or("", |path| path.as_str());
+        let judged = &line[whole.start()..whole.end() - path.len()];
+        if plausible(secret.as_str(), judged, path, rule.check)
+            && !is_type_annotation(&captures, &line[secret.end()..])
+        {
+            let kind = captures.name("name").map_or(rule.kind.to_owned(), |name| {
+                format!("{} value", name.as_str())
+            });
+            found.push((secret.range(), kind));
+            start = whole.end();
+        } else if restarts < MOST_RESTARTS {
+            restarts += 1;
+            start = restart_in(line, whole.start(), secret.start());
+        } else {
+            start = whole.end();
+        }
+    }
+    found
+}
+
+/// Where to search again inside a match at `whole` that isn't a secret: from its `secret`, or
+/// from the next character if the secret starts the match.
+fn restart_in(line: &str, whole: usize, secret: usize) -> usize {
+    if secret > whole {
+        secret
+    } else {
+        next_char(line, whole)
+    }
+}
+
+/// Where the character after the one at `at` starts.
+fn next_char(text: &str, at: usize) -> usize {
+    text[at..]
+        .chars()
+        .next()
+        .map_or(text.len(), |c| at + c.len_utf8())
 }
 
 /// Whether an unquoted value after ":" is code, as in `TOKEN: Kind = Kind::A`,
@@ -450,8 +498,9 @@ fn is_type_annotation(captures: &regex_lite::Captures, after: &str) -> bool {
 }
 
 /// Whether a match looks like a real secret rather than a placeholder or code.
-/// Placeholder words count anywhere in the `whole` match, e.g. in a URL's host.
-fn plausible(secret: &str, whole: &str, check: Check) -> bool {
+/// Placeholder words count anywhere in the `whole` match, e.g. in a URL's host, but not in a
+/// URL's `path`, which can name a repository such as `example-app`.
+fn plausible(secret: &str, whole: &str, path: &str, check: Check) -> bool {
     const PLACEHOLDER_PARTS: &[&str] = &[
         "example",
         "placeholder",
@@ -465,7 +514,16 @@ fn plausible(secret: &str, whole: &str, check: Check) -> bool {
         "{",
         "<",
     ];
-    const PLACEHOLDERS: &[&str] = &["password", "passwd", "pass", "secret", "token", "user"];
+    const PLACEHOLDERS: &[&str] = &[
+        "password",
+        "passwd",
+        "pass",
+        "secret",
+        "token",
+        "user",
+        // GitHub's password for a token given as the user name.
+        "x-oauth-basic",
+    ];
     let whole = whole.to_ascii_lowercase();
     if PLACEHOLDER_PARTS.iter().any(|part| whole.contains(part))
         || PLACEHOLDERS.contains(&secret.to_ascii_lowercase().as_str())
@@ -480,12 +538,63 @@ fn plausible(secret: &str, whole: &str, check: Check) -> bool {
     }
     match check {
         Check::Token => true,
-        Check::Value => {
-            secret.bytes().any(|byte| byte.is_ascii_digit())
-                && secret.bytes().any(|byte| byte.is_ascii_alphabetic())
-                && !secret.contains(['(', ')', '[', ']', '{', '}', '<', '>', '$', '%', '\\'])
-        }
+        Check::Value => is_value(secret),
+        Check::UrlUser => is_value(secret) && !is_public_dsn(secret, path),
     }
+}
+
+/// Whether `secret` could be a setting's value rather than code or a package's name: it has
+/// letters and digits, no characters that only code uses, and names no package.
+fn is_value(secret: &str) -> bool {
+    secret.bytes().any(|byte| byte.is_ascii_digit())
+        && secret.bytes().any(|byte| byte.is_ascii_alphabetic())
+        && !secret.contains(['(', ')', '[', ']', '{', '}', '<', '>', '$', '%', '\\'])
+        && !is_package_reference(secret)
+}
+
+/// Whether a token in a URL is a Sentry DSN's public key: 32 hex digits, with a project number
+/// at the end of the URL's `path`.
+fn is_public_dsn(token: &str, path: &str) -> bool {
+    let project = path.rsplit_once('/').map_or("", |(_, last)| last);
+    token.len() == 32
+        && token.bytes().all(|byte| byte.is_ascii_hexdigit())
+        && !project.is_empty()
+        && project.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+/// Whether `value` names a package, as lockfiles write one, rather than holds a secret: a
+/// specifier such as `npm:^9.0.0` or `github:owner/repo`, or a version such as `4.0.0-beta.1`.
+fn is_package_reference(value: &str) -> bool {
+    const SPECIFIERS: &[&str] = &[
+        "npm:",
+        "workspace:",
+        "github:",
+        "git+",
+        "file:",
+        "link:",
+        "patch:",
+        "portal:",
+        "jsr:",
+        "gitlab:",
+        "bitbucket:",
+        "gist:",
+    ];
+    SPECIFIERS
+        .iter()
+        .any(|specifier| value.starts_with(specifier))
+        || is_version(value)
+}
+
+/// Whether `value` is a semantic version, with any prerelease tag or build after it, as
+/// `4.0.0-beta.1` or `^1.2.0-rc.1`.
+fn is_version(value: &str) -> bool {
+    let value = value.trim_start_matches(['^', '~', '=', 'v']);
+    let core = value.split(['-', '+']).next().unwrap_or_default();
+    let numbers: Vec<&str> = core.split('.').collect();
+    numbers.len() == 3
+        && numbers
+            .iter()
+            .all(|number| !number.is_empty() && number.bytes().all(|byte| byte.is_ascii_digit()))
 }
 
 #[cfg(test)]
@@ -598,6 +707,163 @@ mod tests {
             let (redacted_line, kinds) = redacted(&line);
             assert_eq!(redacted_line, line.replace(&value, REDACTED));
             assert_eq!(kinds, [format!("{name} value")]);
+        }
+    }
+
+    /// Checks that each line is found once as `kind`, and its secret replaced.
+    fn assert_found(lines: &[String], kind: &str) {
+        for line in lines {
+            let (text, kinds) = redacted(line);
+            assert_eq!(kinds, [kind], "{line}");
+            assert!(text.contains(REDACTED), "{text}");
+        }
+    }
+
+    #[test]
+    fn finds_passwords_in_lockfile_urls() {
+        let password = noise(16);
+        let lines = [
+            format!(
+                r#""resolved": "https://ci-bot:{password}@npm.corp.internal/a/-/a-1.0.0.tgz","#
+            ),
+            format!(
+                r#"source = "git+https://deploy:{password}@git.corp.internal/x.git?branch=main#3f2a1b9""#
+            ),
+            format!(r#"source = "registry+https://ci:{password}@crates.corp.internal/index""#),
+            format!(r#"source = "sparse+https://ci:{password}@crates.corp.internal/index/""#),
+        ];
+        assert_found(&lines, "password in a URL");
+    }
+
+    #[test]
+    fn finds_tokens_in_lockfile_urls() {
+        let token = noise(24);
+        let hex = "3f9a1c7e5b2d8f4a6c0e9b1d7f3a5c8e2b4d6f80";
+        let as_user = [
+            format!("  remote: https://{token}@gems.corp.internal/acme/"),
+            format!("  remote: https://{token}:@gems.corp.internal/acme/"),
+        ];
+        assert_found(&as_user, "token in a URL");
+        let in_query = format!(
+            r#""resolved": "https://gitlab.corp.internal/api/v4/projects/7/packages/npm/a.tgz?private_token={token}""#
+        );
+        assert_found(&[in_query], "private_token value");
+        let in_query =
+            format!(r#""resolved": "https://npm.corp.internal/a.tgz?v=1&access_token={hex}""#);
+        assert_found(&[in_query], "access_token value");
+    }
+
+    const HEX_32: &str = "3f9a1c7e5b2d8f4a6c0e9b1d7f3a5c8e";
+    const UUID: &str = "3f9a1c7e-5b2d-8f4a-6c0e-9b1d7f3a5c8e";
+
+    #[test]
+    fn finds_tokens_as_url_user_names() {
+        let hex = format!("{HEX_32}5b2d8f40");
+        let lines = [
+            format!(r#"source = "git+https://{hex}@git.corp.internal/x.git""#),
+            format!("https://{UUID}@registry.corp.internal/"),
+            format!("https://{HEX_32}@files.corp.internal/releases"),
+            format!(r#"source = "git+https://{hex}@github.com/acme/example-app.git""#),
+        ];
+        assert_found(&lines, "token in a URL");
+        let oauth = format!("https://{hex}:x-oauth-basic@github.com/acme/x.git");
+        let (text, kinds) = redacted(&oauth);
+        assert_eq!(kinds, ["token in a URL"], "{oauth}");
+        assert!(
+            !text.contains(&hex) && text.contains("x-oauth-basic"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn finds_a_password_with_an_empty_user_name() {
+        let line = format!("https://:{}@git.heroku.com/app.git", noise(24));
+        assert_found(&[line], "password in a URL");
+    }
+
+    /// A match that isn't a secret, such as a package reference, may still hold one.
+    #[test]
+    fn finds_a_secret_inside_a_package_reference() {
+        let line = format!(
+            r#""auth-token": "git+https://gitlab.corp.internal/x.git?private_token={}#v1""#,
+            noise(24)
+        );
+        assert_found(&[line], "private_token value");
+    }
+
+    /// Searching again inside a match that isn't a secret has a limit, so a crafted line costs
+    /// time in proportion to its length.
+    #[test]
+    fn scans_a_long_line_of_refused_values() {
+        let line = "token=abcdefgh ".repeat(14_000);
+        let (_, kinds) = redacted(&line);
+        assert!(kinds.is_empty(), "{}", kinds.len());
+    }
+
+    /// A secret behind a semantic version is missed: versions with prerelease tags are far more
+    /// common in lockfiles than secrets shaped like them.
+    #[test]
+    fn takes_a_version_shaped_value_for_a_version() {
+        let (_, kinds) = redacted(&format!("password: 1.2.3-{}", noise(12)));
+        assert!(kinds.is_empty(), "{kinds:?}");
+    }
+
+    #[test]
+    fn leaves_public_keys_and_names_in_urls_alone() {
+        for line in [
+            format!(r#"Sentry.init({{ dsn: "https://{HEX_32}@o450123.ingest.sentry.io/5501234" }})"#),
+            format!("SENTRY_DSN=https://{HEX_32}@sentry.corp.internal/2"),
+            format!("SENTRY_DSN=https://{HEX_32}@sentry.corp.internal:9000/2"),
+            format!("https://{}@registry.example.com/", noise(24)),
+            "git clone https://contoso-platform-team-01@dev.azure.com/contoso-platform-team-01/Web/_git/web".to_owned(),
+            "git clone https://jsmith-consulting-2019@bitbucket.org/acme/repo.git".to_owned(),
+            "DATABASE_URL=postgres://analytics_readonly_2023@db.internal/warehouse".to_owned(),
+            "DATABASE_URL=postgres://analyticsreadonly2023@db.internal/warehouse".to_owned(),
+            "url = sftp://deploy-production-01@files.corp.internal/releases".to_owned(),
+            r#"    "auth-token": "jsr:^1.0.0","#.to_owned(),
+            r#"    "auth-token": "gitlab:acme/auth-token#v1.0.0","#.to_owned(),
+        ] {
+            let (_, kinds) = redacted(&line);
+            assert!(kinds.is_empty(), "{line}: {kinds:?}");
+        }
+    }
+
+    #[test]
+    fn leaves_lockfile_lines_without_credentials_alone() {
+        for line in [
+            r#"  jsonwebtoken: "npm:^9.0.0""#,
+            r#"    "@octokit/auth-token": "npm:^4.0.0","#,
+            r#"    "jsonwebtoken": "github:auth0/node-jsonwebtoken#v9","#,
+            "  '@octokit/auth-token': 4.0.0-beta.1",
+            r#"    "auth-token": "workspace:^1.2.0-rc.1","#,
+            r#"    "auth-token": "file:../auth-token-2","#,
+            r#"    "auth-token": "patch:auth-token@npm%3A1.0.0#./fix.patch","#,
+            r#"      "integrity": "sha512-3aWv1O3QW/LPPmbUnmEtmXp1jg2SHp+8CRS7IuwRWp6r6b4WjUBQSNfpQyBg3S8tLkP6CEuFjFn5Mbhr6uT8EA==","#,
+            r#"checksum = "8f2d6b7cbbd4d0f8e0b3c5e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1""#,
+            "golang.org/x/net v0.23.0 h1:Ab3dEf6hIj9kLm2nOp5qRs8tUv1wXy4zAb7dEf0hIj3=",
+            r#"sdist = { url = "https://files.pythonhosted.org/packages/a-1.0.tar.gz", hash = "sha256:6b5d6e8f0a1c3e5f7b9d1f3a5c7e9b1d3f5a7c9e1b3d5f7a9c1e3b5d7f9a1c3e" }"#,
+            r#"      "resolved": "https://registry.npmjs.org:443/a/-/a-1.0.0.tgz","#,
+            r#"source = "git+ssh://git@github.com:acme/x.git#3f2a1b9c""#,
+            "  remote: https://user:pass@registry.example.com/",
+            "  remote: https://rubygems.org/",
+        ] {
+            let (_, kinds) = redacted(line);
+            assert!(kinds.is_empty(), "{line}: {kinds:?}");
+        }
+    }
+
+    #[test]
+    fn takes_only_long_tokens_with_letters_and_digits_as_a_user_name() {
+        for user in [
+            "git",
+            "oauth2",
+            "x-access-token",
+            "__token__",
+            "build-agent-for-the-team",
+            "12345678901234567890",
+        ] {
+            let (_, kinds) = redacted(&format!("https://{user}@gems.corp.internal/acme/"));
+            assert!(kinds.is_empty(), "{user}: {kinds:?}");
         }
     }
 

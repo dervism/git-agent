@@ -43,7 +43,7 @@ const LAYERS: &[(&str, Layer)] = &[
     ("why", Feature),
     ("staging", Shared("staging")),
     ("untracked", Shared("staging")),
-    ("redact", Shared("secrets")),
+    ("secrets", Shared("secrets")),
     ("review", Shared("review")),
     ("conversation", Shared("conversation")),
     ("prompt", Shared("conversation")),

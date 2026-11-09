@@ -16,11 +16,10 @@ use crate::conversation::{
 use crate::git::worktree::TempWorktree;
 use crate::git::{Changes, Repo, Scope, names};
 use crate::review::{self, Action, Choice, Person, Review, Revisions, Terminal};
+use crate::secrets::{check_outgoing, redact, reject_added, report_secrets};
 use crate::server::{Message, ModelServer};
 use crate::ui;
-use crate::{
-    check_outgoing, commit, prompt, push, redact, reject_added, report_secrets, split, staging,
-};
+use crate::{commit, prompt, push, split, staging};
 use anyhow::{Context, Result, bail};
 use std::fs;
 use std::io::{self, IsTerminal};

@@ -15,8 +15,8 @@ impl Discussant for Terminal {
         io::stdin().is_terminal() && ui::stdout_is_terminal()
     }
 
-    fn show_answer(&self, heading: &str, answer: &str) {
-        ui::show_answer(heading, answer);
+    fn show_answer(&self, heading: &str, answer: &str) -> Result<()> {
+        ui::show_answer(heading, answer)
     }
 
     fn ask_follow_up(&self) -> Result<Option<String>> {

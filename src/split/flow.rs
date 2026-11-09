@@ -370,11 +370,11 @@ impl<S: ModelServer> Splitter<'_, S> {
     ) -> Result<Option<(Plan, PlanAcceptance)>> {
         let plan = self.new_plan(conversation).await?;
         if self.args.commit {
-            ui::show_framed(PLAN_REVIEW.heading, &self.show(&plan));
+            ui::show_framed(PLAN_REVIEW.heading, &self.show(&plan))?;
             return Ok(Some((plan, PlanAcceptance::CommitAll)));
         }
         if !io::stdin().is_terminal() {
-            ui::show_framed(PLAN_REVIEW.heading, &self.show(&plan));
+            ui::show_framed(PLAN_REVIEW.heading, &self.show(&plan))?;
             ui::info(ui::dim(
                 "Input is not a terminal, so not asking for review. \
                  Use --commit to make these commits directly.",
@@ -458,7 +458,7 @@ impl<S: ModelServer> Splitter<'_, S> {
         conversation: &[Message],
     ) -> Result<Option<(Plan, PlanAcceptance)>> {
         loop {
-            ui::show_framed(PLAN_REVIEW.heading, &self.show(&plan));
+            ui::show_framed(PLAN_REVIEW.heading, &self.show(&plan))?;
             let revised = match review::ask_action(&PLAN_REVIEW, self.person)? {
                 Action::Accept(acceptance) => return Ok(Some((plan, acceptance))),
                 Action::Quit => return Ok(None),
@@ -516,7 +516,7 @@ impl<S: ModelServer> Splitter<'_, S> {
             }
         };
         if prepared.plan.commits.len() < plan.commits.len() {
-            ui::show_framed("Commits to make", &self.show(&prepared.plan));
+            ui::show_framed("Commits to make", &self.show(&prepared.plan))?;
         }
         Ok(prepared)
     }
@@ -784,7 +784,7 @@ impl<S: ModelServer> Splitter<'_, S> {
         let kind = kinds::kind_of(planned, &self.work.files, self.units);
         let message = commit_message(self.server, self.model, &conversation).await?;
         let message = kinds::with_type(&message, kind);
-        review::show_proposal(&SPLIT_COMMIT_REVIEW, &message);
+        review::show_proposal(&SPLIT_COMMIT_REVIEW, &message)?;
         Ok(Some((message, conversation)))
     }
 }

@@ -35,6 +35,7 @@ use Layer::{Core, Feature, Shared, Top};
 const LAYERS: &[(&str, Layer)] = &[
     ("main", Top),
     ("cli", Top),
+    ("exit", Top),
     ("branch", Feature),
     ("explain", Feature),
     ("menu", Feature),

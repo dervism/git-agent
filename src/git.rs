@@ -8,6 +8,7 @@ pub mod worktree;
 
 use crate::safe_text::one_line;
 use crate::temp::PrivateDir;
+use crate::ui;
 use anyhow::{Context, Result, anyhow, bail};
 use blob::Blob;
 use std::collections::HashSet;
@@ -1329,8 +1330,32 @@ impl Repo {
         fs::write(&path, format!("{message}\n"))
             .with_context(|| format!("failed to write {}", path.display()))?;
 
-        let mut command = self.command(&["commit", "--file"]);
-        command.arg(&path);
+        let status = self
+            .commit_command(&path, scope, extra_args, leave_out)
+            .status()
+            .context("failed to run git commit")?;
+        if !status.success() {
+            bail!(
+                "git commit failed; the message was saved, reuse it with:\n  git commit --file {}",
+                path.display()
+            );
+        }
+        let _ = fs::remove_file(&path);
+        Ok(())
+    }
+
+    /// The `git commit` that commits the message in `message_file`. It is `--quiet`: git
+    /// writes its summary after the commit exists, and with the reader of the output gone,
+    /// that write would kill it, and a commit that was made would be reported as failed.
+    fn commit_command(
+        &self,
+        message_file: &Path,
+        scope: Scope,
+        extra_args: &[String],
+        leave_out: &[String],
+    ) -> Command {
+        let mut command = self.command(&["commit", "--quiet", "--file"]);
+        command.arg(message_file);
         if scope == Scope::Tracked {
             // What `--all` commits, apart from the work-tree changes in `leave_out`:
             // `--include` adds the work-tree contents of the paths given to what's
@@ -1350,30 +1375,35 @@ impl Repo {
                 pathspec
             }));
         }
-        let status = command.status().context("failed to run git commit")?;
-        if !status.success() {
-            bail!(
-                "git commit failed; the message was saved, reuse it with:\n  git commit --file {}",
-                path.display()
-            );
-        }
-        let _ = fs::remove_file(&path);
-        Ok(())
+        command
     }
 
     /// Pushes the current branch. A branch without an upstream is pushed to the
     /// default remote and its upstream is set, like `git push --set-upstream`.
     pub fn push(&self) -> Result<()> {
+        let status = self
+            .push_command(ui::child_stdout_on_stderr()?)?
+            .status()
+            .context("failed to run git push")?;
+        if !status.success() {
+            bail!("`git push` failed ({status})");
+        }
+        Ok(())
+    }
+
+    /// The `git push` of [`Repo::push`], with `stdout` for git's standard output. It isn't
+    /// git-agent's own: the first push of a branch writes there that it tracks the remote
+    /// now, and a `pre-push` hook writes there too. With the reader of that output gone,
+    /// git would die of `SIGPIPE` after it has pushed, and the push would be reported as
+    /// failed.
+    fn push_command(&self, stdout: Stdio) -> Result<Command> {
         let mut command = self.command(&["push"]);
         if !self.has_upstream() {
             let remote = self.push_remote()?;
             command.args(["--set-upstream", remote.as_str(), "HEAD"]);
         }
-        let status = command.status().context("failed to run git push")?;
-        if !status.success() {
-            bail!("`git push` failed ({status})");
-        }
-        Ok(())
+        command.stdout(stdout);
+        Ok(command)
     }
 
     /// Fetches the upstream and returns the commits on it that the current branch
@@ -2079,6 +2109,78 @@ mod tests {
         assert_eq!(pushed.trim(), "feat: second");
     }
 
+    /// A repository with `origin` as a bare repository that holds nothing yet, so that the
+    /// branch has no upstream to push to.
+    fn with_an_empty_remote() -> (TempDir, Repo, TempDir) {
+        let (dir, repo) = setup();
+        let remote = TempDir::new().unwrap();
+        run(
+            remote.path(),
+            &["init", "--bare", "-q", "--initial-branch", "main"],
+        );
+        repo.git(&["remote", "add", "origin", remote.path().to_str().unwrap()])
+            .unwrap();
+        (dir, repo, remote)
+    }
+
+    fn remote_has_main(remote: &TempDir) -> bool {
+        run(remote.path(), &["branch", "--list", "main"]).contains("main")
+    }
+
+    #[test]
+    fn a_first_push_into_a_stdout_nobody_reads_dies_of_sigpipe_after_it_pushed() {
+        use std::os::unix::process::ExitStatusExt;
+        let (_dir, repo, remote) = with_an_empty_remote();
+        let (reader, writer) = std::io::pipe().unwrap();
+        drop(reader);
+
+        let status = repo
+            .push_command(Stdio::from(writer))
+            .unwrap()
+            .status()
+            .unwrap();
+
+        assert_eq!(status.signal(), Some(13));
+        assert!(remote_has_main(&remote));
+    }
+
+    #[test]
+    fn a_first_push_writes_that_it_tracks_the_remote_to_the_stream_it_is_given() {
+        let (_dir, repo, remote) = with_an_empty_remote();
+        let (mut reader, writer) = std::io::pipe().unwrap();
+
+        let status = repo
+            .push_command(Stdio::from(writer))
+            .unwrap()
+            .status()
+            .unwrap();
+
+        assert!(status.success());
+        assert!(remote_has_main(&remote));
+        let mut written = String::new();
+        std::io::Read::read_to_string(&mut reader, &mut written).unwrap();
+        assert!(written.contains("set up to track"), "{written:?}");
+    }
+
+    #[test]
+    fn a_push_to_an_upstream_writes_nothing_to_stdout_so_it_survives_a_closed_one() {
+        let (dir, repo) = setup();
+        let _remote = add_remote(&repo);
+        fs::write(dir.path().join("lib.rs"), "fn b() {}\n").unwrap();
+        repo.commit("feat: second", Scope::Tracked, &[], &[])
+            .unwrap();
+        let (reader, writer) = std::io::pipe().unwrap();
+        drop(reader);
+
+        let status = repo
+            .push_command(Stdio::from(writer))
+            .unwrap()
+            .status()
+            .unwrap();
+
+        assert!(status.success());
+    }
+
     #[test]
     fn push_without_remote_explains_how_to_add_one() {
         let (_dir, repo) = setup();
@@ -2642,6 +2744,57 @@ mod tests {
             .read_tree("HEAD")
             .unwrap();
         assert!(mark.exists());
+    }
+
+    fn commit_arguments(
+        repo: &Repo,
+        scope: Scope,
+        extra: &[&str],
+        leave_out: &[&str],
+    ) -> Vec<String> {
+        let extra: Vec<String> = extra.iter().map(|arg| (*arg).to_owned()).collect();
+        let leave_out: Vec<String> = leave_out.iter().map(|path| (*path).to_owned()).collect();
+        repo.commit_command(Path::new("MSG"), scope, &extra, &leave_out)
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    #[test]
+    fn commits_quietly_whatever_the_scope_and_arguments() {
+        let (_dir, repo) = setup();
+        for (scope, extra, leave_out) in [
+            (Scope::Staged, vec![], vec![]),
+            (Scope::Tracked, vec![], vec![]),
+            (Scope::Tracked, vec!["--no-verify"], vec![]),
+            (Scope::Tracked, vec!["--no-verify"], vec!["library"]),
+        ] {
+            let args = commit_arguments(&repo, scope, &extra, &leave_out);
+            assert!(
+                args.windows(2).any(|pair| pair == ["commit", "--quiet"]),
+                "{args:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_commit_that_succeeds_writes_no_summary() {
+        let (dir, repo) = setup();
+        fs::write(dir.path().join("lib.rs"), "fn b() {}\n").unwrap();
+        let message = dir.path().join("message");
+        fs::write(&message, "feat: b\n").unwrap();
+
+        let output = repo
+            .commit_command(&message, Scope::Tracked, &[], &[])
+            .output()
+            .unwrap();
+
+        assert!(output.status.success());
+        assert_eq!(String::from_utf8_lossy(&output.stdout), "");
+        assert_eq!(
+            run(dir.path(), &["log", "-1", "--format=%s"]).trim(),
+            "feat: b"
+        );
     }
 
     #[test]

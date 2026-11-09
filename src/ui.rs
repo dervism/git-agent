@@ -7,8 +7,10 @@
 
 use crate::safe_text;
 use anyhow::{Context, Result};
-use std::fmt::Display;
+use std::fmt::{self, Display};
 use std::io::{self, BufRead, IsTerminal, Write};
+use std::os::fd::{AsFd, BorrowedFd};
+use std::process::Stdio;
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
@@ -49,7 +51,12 @@ fn color_enabled() -> bool {
 }
 
 fn paint(style: &str, text: &str) -> String {
-    if color_enabled() {
+    painted(color_enabled(), style, text)
+}
+
+/// `text` in `style` when `color` is on, and as it is when it isn't.
+fn painted(color: bool, style: &str, text: &str) -> String {
+    if color {
         format!("{style}{text}{RESET}")
     } else {
         text.to_owned()
@@ -115,27 +122,64 @@ fn next_style(text: &str) -> Option<(usize, &'static str)> {
     })
 }
 
+/// A stdout for a child process that writes where the user reads status, and not to the
+/// reader of git-agent's output. A child that inherits stdout dies of `SIGPIPE` once that
+/// reader has gone, even after it has done its work.
+pub fn child_stdout_on_stderr() -> io::Result<Stdio> {
+    stdio_cloned_from(io::stderr().as_fd())
+}
+
+/// A [`Stdio`] that writes to `stream`, which stays open for the caller too.
+fn stdio_cloned_from(stream: BorrowedFd<'_>) -> io::Result<Stdio> {
+    stream.try_clone_to_owned().map(Stdio::from)
+}
+
 /// The one way to stderr for everything the user reads there.
 fn to_stderr(line: &str) {
     let _ = write_line(&mut io::stderr(), line, color_enabled());
 }
 
-/// Writes a line to stdout, after making it safe for the terminal.
-pub fn out(line: &str) {
-    to_stdout(line, color_enabled());
+/// The program that reads git-agent's output has closed it, as `head` does once it has read
+/// enough. It is no failure to report: git-agent ends without a word, as git does.
+#[derive(Debug, PartialEq, Eq)]
+pub struct OutputClosed;
+
+impl OutputClosed {
+    /// What a shell reports for a program that `SIGPIPE` killed (128 and 13), which is how it
+    /// reports git here. It is a status, and not a death by a signal.
+    pub const EXIT_STATUS: u8 = 141;
+}
+
+impl fmt::Display for OutputClosed {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("the program reading the output has closed it")
+    }
+}
+
+impl std::error::Error for OutputClosed {}
+
+/// Writes a line to stdout, after making it safe for the terminal. Fails with
+/// [`OutputClosed`] when the reader has gone away.
+pub fn out(line: &str) -> Result<()> {
+    write_to_stdout(&mut io::stdout().lock(), line, color_enabled())
 }
 
 /// Writes text to stdout without styles, for what a pipeline reads: a model's cleaned
 /// reply, or the user's own settings. Those are safe already, so escaping changes nothing
-/// in them, and it keeps a new caller from printing what isn't.
-pub fn plain_out(text: &str) {
-    to_stdout(text, false);
+/// in them, and it keeps a new caller from printing what isn't. Fails with [`OutputClosed`]
+/// when the reader has gone away.
+pub fn plain_out(text: &str) -> Result<()> {
+    write_to_stdout(&mut io::stdout().lock(), text, false)
 }
 
-/// The one way to stdout. Like `println!`, it panics when stdout has gone away.
-fn to_stdout(line: &str, color: bool) {
-    write_line(&mut io::stdout().lock(), line, color)
-        .unwrap_or_else(|err| panic!("failed printing to stdout: {err}"));
+/// Writes `line` to `stdout`, the one way to it. Only a broken pipe means that the reader has
+/// gone away, and is [`OutputClosed`]: a search for that kind of error anywhere would also
+/// catch a failed write to `gh` or to git, which is a failure to report.
+fn write_to_stdout(stdout: &mut impl Write, line: &str, color: bool) -> Result<()> {
+    write_line(stdout, line, color).map_err(|err| match err.kind() {
+        io::ErrorKind::BrokenPipe => OutputClosed.into(),
+        _ => anyhow::Error::new(err).context("failed to write to stdout"),
+    })
 }
 
 /// Writes `line` to `to` as [`for_terminal`] makes it, and ends the line.
@@ -184,23 +228,34 @@ pub fn error(err: &anyhow::Error) {
     say!("{} {err:#}", red("error:"));
 }
 
-/// Prints `text` between two rules, the first titled `heading`.
-pub fn show_framed(heading: &str, text: &str) {
+/// Prints `text` between two rules, the first titled `heading`. Fails with [`OutputClosed`]
+/// when the reader has gone away.
+pub fn show_framed(heading: &str, text: &str) -> Result<()> {
+    write_framed(&mut io::stdout().lock(), heading, text, color_enabled())
+}
+
+/// Writes `text` between two rules to `stdout`, the first titled `heading`, and stops at the
+/// first line that can't be written.
+fn write_framed(stdout: &mut impl Write, heading: &str, text: &str, color: bool) -> Result<()> {
     const WIDTH: usize = 64;
     let title = format!("── {heading} ");
     let title_rule = "─".repeat(WIDTH.saturating_sub(title.chars().count()));
-    out(&format!("\n{}", dim(&format!("{title}{title_rule}"))));
-    out(text);
-    out(&dim(&"─".repeat(WIDTH)));
+    let rule = |text: &str| painted(color, DIM, text);
+    let top = format!("\n{}", rule(&format!("{title}{title_rule}")));
+    let bottom = rule(&"─".repeat(WIDTH));
+    [top.as_str(), text, bottom.as_str()]
+        .into_iter()
+        .try_for_each(|line| write_to_stdout(stdout, line, color))
 }
 
 /// Prints the model's answer: framed under `heading` in a terminal, and as it
-/// is when the output goes to a file or a pipe.
-pub fn show_answer(heading: &str, text: &str) {
+/// is when the output goes to a file or a pipe. Fails with [`OutputClosed`] when the reader has
+/// gone away.
+pub fn show_answer(heading: &str, text: &str) -> Result<()> {
     if io::stdout().is_terminal() {
-        show_framed(heading, text);
+        show_framed(heading, text)
     } else {
-        plain_out(text);
+        plain_out(text)
     }
 }
 
@@ -254,18 +309,32 @@ impl Drop for Spinner {
 
 /// Prompts on stderr and reads a trimmed line, or `None` at end of input.
 pub fn read_line(prompt: &str) -> Result<Option<String>> {
-    let _ = write!(io::stderr(), "{} ", for_terminal(prompt, color_enabled()));
-    io::stderr().flush()?;
-    let mut line = String::new();
-    let read = io::stdin()
-        .lock()
-        .read_line(&mut line)
-        .context("failed to read input")?;
-    if read == 0 {
+    let line = prompt_and_read(
+        &mut io::stderr(),
+        &mut io::stdin().lock(),
+        prompt,
+        color_enabled(),
+    )?;
+    if line.is_none() {
         say!("");
-        return Ok(None);
     }
-    Ok(Some(line.trim().to_owned()))
+    Ok(line)
+}
+
+/// Writes `prompt` to `to`, then reads a trimmed line from `from`, or `None` at end of input.
+/// A prompt that can't be written ends here with an error: nobody sees it, so nobody answers.
+fn prompt_and_read(
+    to: &mut impl Write,
+    from: &mut impl BufRead,
+    prompt: &str,
+    color: bool,
+) -> Result<Option<String>> {
+    write!(to, "{} ", for_terminal(prompt, color))
+        .and_then(|()| to.flush())
+        .context("failed to show the prompt")?;
+    let mut line = String::new();
+    let read = from.read_line(&mut line).context("failed to read input")?;
+    Ok((read > 0).then(|| line.trim().to_owned()))
 }
 
 /// Asks a yes/no question. Enter means yes; end of input means no.
@@ -385,6 +454,249 @@ mod tests {
             assert_eq!(written("one\ntwo", color), "one\ntwo\n");
             assert_eq!(written("one\n", color), "one\n\n");
         }
+    }
+
+    /// A writer that takes `room` bytes, and then fails every write with `kind`.
+    struct Closing {
+        kind: io::ErrorKind,
+        room: usize,
+        taken: Vec<u8>,
+        failures: usize,
+    }
+
+    impl Closing {
+        fn after(room: usize, kind: io::ErrorKind) -> Self {
+            Self {
+                kind,
+                room,
+                taken: Vec::new(),
+                failures: 0,
+            }
+        }
+
+        fn at_once(kind: io::ErrorKind) -> Self {
+            Self::after(0, kind)
+        }
+    }
+
+    impl Write for Closing {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            if self.room == 0 {
+                self.failures += 1;
+                return Err(io::Error::from(self.kind));
+            }
+            let taken = bytes.len().min(self.room);
+            self.taken.extend_from_slice(&bytes[..taken]);
+            self.room -= taken;
+            Ok(taken)
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// A writer that takes everything, and fails to flush it.
+    struct FlushFails;
+
+    impl Write for FlushFails {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Err(io::Error::from(io::ErrorKind::BrokenPipe))
+        }
+    }
+
+    const OTHER_FAILURES: [io::ErrorKind; 8] = [
+        io::ErrorKind::PermissionDenied,
+        io::ErrorKind::WriteZero,
+        io::ErrorKind::StorageFull,
+        io::ErrorKind::ConnectionReset,
+        io::ErrorKind::ConnectionAborted,
+        io::ErrorKind::NotConnected,
+        io::ErrorKind::TimedOut,
+        io::ErrorKind::Other,
+    ];
+
+    #[test]
+    fn writes_a_line_to_a_reader_that_is_there() {
+        let mut stdout = Vec::new();
+        write_to_stdout(&mut stdout, "one\ntwo", false).unwrap();
+        assert_eq!(stdout, b"one\ntwo\n");
+    }
+
+    #[test]
+    fn a_broken_pipe_means_the_reader_has_gone_away() {
+        let err = write_to_stdout(&mut Closing::at_once(io::ErrorKind::BrokenPipe), "x", true)
+            .unwrap_err();
+        assert_eq!(err.downcast_ref::<OutputClosed>(), Some(&OutputClosed));
+    }
+
+    #[test]
+    fn a_broken_pipe_in_the_middle_of_a_line_means_the_same() {
+        let mut stdout = Closing::after(3, io::ErrorKind::BrokenPipe);
+        let err = write_to_stdout(&mut stdout, "a long line", false).unwrap_err();
+        assert!(err.is::<OutputClosed>());
+        assert_eq!(stdout.taken, b"a l");
+    }
+
+    #[test]
+    fn no_other_failure_means_the_reader_has_gone_away() {
+        for kind in OTHER_FAILURES {
+            let err = write_to_stdout(&mut Closing::at_once(kind), "x", false).unwrap_err();
+            assert!(!err.is::<OutputClosed>(), "{kind}");
+            assert_eq!(err.to_string(), "failed to write to stdout", "{kind}");
+            let cause = err
+                .downcast_ref::<io::Error>()
+                .expect("the failure is kept");
+            assert_eq!(cause.kind(), kind);
+        }
+    }
+
+    #[test]
+    fn a_closed_output_stays_one_with_context_around_it() {
+        let err = write_to_stdout(&mut Closing::at_once(io::ErrorKind::BrokenPipe), "x", false)
+            .context("nothing was changed")
+            .unwrap_err();
+        assert!(err.is::<OutputClosed>());
+    }
+
+    /// What [`write_framed`] writes for the frame of "text" under "Head".
+    fn frame() -> String {
+        let mut stdout = Vec::new();
+        write_framed(&mut stdout, "Head", "text", false).unwrap();
+        String::from_utf8(stdout).unwrap()
+    }
+
+    #[test]
+    fn frames_text_between_two_rules_with_the_heading_in_the_first() {
+        let top = format!("── Head {}", "─".repeat(64 - "── Head ".chars().count()));
+        let rule = "─".repeat(64);
+        assert_eq!(frame(), format!("\n{top}\ntext\n{rule}\n"));
+    }
+
+    #[test]
+    fn dims_the_rules_of_a_frame_with_color_and_only_then() {
+        let top = format!("── Head {}", "─".repeat(64 - "── Head ".chars().count()));
+        let rule = "─".repeat(64);
+        let mut stdout = Vec::new();
+        write_framed(&mut stdout, "Head", "text", true).unwrap();
+        assert_eq!(
+            String::from_utf8(stdout).unwrap(),
+            format!("\n{DIM}{top}{RESET}\ntext\n{DIM}{rule}{RESET}\n")
+        );
+    }
+
+    #[test]
+    fn stops_a_frame_at_the_first_line_that_cant_be_written() {
+        let whole = frame().len();
+        for room in 0..whole {
+            let mut stdout = Closing::after(room, io::ErrorKind::BrokenPipe);
+            let err = write_framed(&mut stdout, "Head", "text", false).unwrap_err();
+            assert!(err.is::<OutputClosed>(), "room for {room} of {whole} bytes");
+            assert_eq!(stdout.failures, 1, "room for {room} of {whole} bytes");
+        }
+        let mut stdout = Closing::after(whole, io::ErrorKind::BrokenPipe);
+        write_framed(&mut stdout, "Head", "text", false).unwrap();
+        assert_eq!(stdout.failures, 0);
+    }
+
+    #[test]
+    fn a_frame_fails_for_other_reasons_too_without_saying_the_reader_is_gone() {
+        let mut stdout = Closing::at_once(io::ErrorKind::PermissionDenied);
+        let err = write_framed(&mut stdout, "Head", "text", false).unwrap_err();
+        assert!(!err.is::<OutputClosed>());
+    }
+
+    #[test]
+    fn exits_with_the_status_a_shell_reports_for_git_killed_by_sigpipe() {
+        assert_eq!(OutputClosed::EXIT_STATUS, 128 + 13);
+    }
+
+    #[test]
+    fn gives_a_child_the_stream_it_clones_and_keeps_that_stream_open() {
+        let (mut reader, mut writer) = io::pipe().unwrap();
+        let stdout = stdio_cloned_from(writer.as_fd()).unwrap();
+
+        let status = std::process::Command::new("sh")
+            .args(["-c", "echo from the child"])
+            .stdout(stdout)
+            .status()
+            .unwrap();
+        writeln!(writer, "from the owner").unwrap();
+        drop(writer);
+
+        assert!(status.success());
+        let mut read = String::new();
+        io::Read::read_to_string(&mut reader, &mut read).unwrap();
+        assert_eq!(read, "from the child\nfrom the owner\n");
+    }
+
+    #[test]
+    fn can_give_a_child_stderr_for_its_stdout() {
+        assert!(child_stdout_on_stderr().is_ok());
+    }
+
+    #[test]
+    fn asks_and_reads_a_trimmed_line() {
+        for (typed, answer) in [
+            ("  yes \n", "yes"),
+            ("\n", ""),
+            ("no", "no"),
+            (" é ø\r\n", "é ø"),
+        ] {
+            let mut asked = Vec::new();
+            let line = prompt_and_read(&mut asked, &mut typed.as_bytes(), "Go?", false).unwrap();
+            assert_eq!(line.as_deref(), Some(answer), "{typed:?}");
+            assert_eq!(asked, b"Go? ");
+        }
+    }
+
+    #[test]
+    fn reads_nothing_at_the_end_of_input() {
+        let mut asked = Vec::new();
+        let line = prompt_and_read(&mut asked, &mut "".as_bytes(), "Go?", false).unwrap();
+        assert_eq!(line, None);
+        assert_eq!(asked, b"Go? ");
+    }
+
+    #[test]
+    fn escapes_the_prompt_it_shows() {
+        let mut asked = Vec::new();
+        prompt_and_read(&mut asked, &mut "\n".as_bytes(), "x\x1b[2J", true).unwrap();
+        assert_eq!(asked, b"x\\033[2J ");
+    }
+
+    #[test]
+    fn ends_with_an_error_when_the_prompt_cant_be_written_and_reads_nothing() {
+        let kinds = OTHER_FAILURES
+            .into_iter()
+            .chain([io::ErrorKind::BrokenPipe]);
+        for kind in kinds {
+            let mut typed = io::Cursor::new("yes\n");
+            let err =
+                prompt_and_read(&mut Closing::at_once(kind), &mut typed, "Go?", false).unwrap_err();
+            assert_eq!(err.to_string(), "failed to show the prompt", "{kind}");
+            assert_eq!(typed.position(), 0, "{kind}: the answer was waited for");
+        }
+    }
+
+    #[test]
+    fn ends_with_an_error_when_the_prompt_cant_be_flushed() {
+        let mut typed = io::Cursor::new("yes\n");
+        let err = prompt_and_read(&mut FlushFails, &mut typed, "Go?", false).unwrap_err();
+        assert_eq!(err.to_string(), "failed to show the prompt");
+        assert_eq!(typed.position(), 0);
+    }
+
+    #[test]
+    fn ends_with_an_error_when_the_input_cant_be_read() {
+        let mut asked = Vec::new();
+        let err =
+            prompt_and_read(&mut asked, &mut [0xff, b'\n'].as_slice(), "Go?", false).unwrap_err();
+        assert_eq!(err.to_string(), "failed to read input");
     }
 
     #[test]

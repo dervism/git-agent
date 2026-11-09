@@ -17,7 +17,7 @@ use crate::delivery::{commit, push};
 use crate::git::worktree::TempWorktree;
 use crate::git::{Changes, Repo, Scope, names};
 use crate::review::{self, Action, Choice, Person, Review, Revisions, Terminal};
-use crate::secrets::{Wording, check_changes, check_outgoing, redact, report_secrets};
+use crate::secrets::{Wording, check_changes, redact, report_secrets};
 use crate::server::{Message, ModelServer};
 use crate::staging::{self, Purpose, Staged};
 use crate::ui;
@@ -257,8 +257,7 @@ fn finish(
         }
     }
     if args.push && outcome.made > 0 {
-        check_outgoing(repo, config.on_secrets).context(NOT_PUSHED)?;
-        push(repo, !args.commit).context(NOT_PUSHED)?;
+        push(repo, !args.commit, config.on_secrets).context(NOT_PUSHED)?;
     }
     Ok(())
 }

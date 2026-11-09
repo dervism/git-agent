@@ -68,7 +68,8 @@ pub fn check_changes(
     reported: &[Finding],
     wording: &Wording,
 ) -> Result<()> {
-    settle(changes_verdict(repo, scope, on_secrets, reported, wording)?)
+    let findings = found_in_changes(repo, scope)?;
+    settle(verdict(&findings, on_secrets, reported, wording))
 }
 
 /// Checks the messages and every file of the commits `range` (`git log` arguments) publishes.
@@ -80,7 +81,8 @@ pub fn check_commits(
     reported: &[Finding],
     wording: &Wording,
 ) -> Result<()> {
-    settle(commits_verdict(repo, range, on_secrets, reported, wording)?)
+    let findings = found_in_commits(repo, range)?;
+    settle(verdict(&findings, on_secrets, reported, wording))
 }
 
 /// Warns, whatever the setting, about the secrets the commits `range` publishes add, apart
@@ -91,47 +93,31 @@ pub fn warn_about_commits(
     reported: &[Finding],
     warned: &str,
 ) -> Result<()> {
-    settle(commits_warning(repo, range, reported, warned)?)
+    let findings = found_in_commits(repo, range)?;
+    settle(warning(&findings, reported, warned).map_or(Verdict::Clean, Verdict::Warn))
 }
 
-/// Checks the commits a push of HEAD would send.
+/// Checks the commits a push of HEAD would send. Its warning lists every secret they add, even
+/// one the flow listed before: a finding names a file rather than the secret, so leaving out
+/// what the flow listed could hide another secret of the same kind in an older commit.
 pub fn check_outgoing(repo: &Repo, on_secrets: OnSecrets) -> Result<()> {
-    check_commits(repo, &OUTGOING, on_secrets, &[], &PUSH)
+    settle(outgoing_verdict(repo, on_secrets)?)
 }
 
-/// What [`check_changes`] decides.
-fn changes_verdict(
-    repo: &Repo,
-    scope: Scope,
-    on_secrets: OnSecrets,
-    reported: &[Finding],
-    wording: &Wording,
-) -> Result<Verdict> {
-    let findings = redact::diff_findings(&repo.changes_to_publish(scope)?);
-    Ok(verdict(&findings, on_secrets, reported, wording))
+/// What [`check_outgoing`] decides.
+fn outgoing_verdict(repo: &Repo, on_secrets: OnSecrets) -> Result<Verdict> {
+    let findings = found_in_commits(repo, &OUTGOING)?;
+    Ok(verdict(&findings, on_secrets, &[], &PUSH))
 }
 
-/// What [`check_commits`] decides.
-fn commits_verdict(
-    repo: &Repo,
-    range: &[&str],
-    on_secrets: OnSecrets,
-    reported: &[Finding],
-    wording: &Wording,
-) -> Result<Verdict> {
-    let findings = scan_commits(&repo.published_commits(range)?);
-    Ok(verdict(&findings, on_secrets, reported, wording))
+/// The secrets in every file of what a commit of `scope` will hold.
+fn found_in_changes(repo: &Repo, scope: Scope) -> Result<Vec<Finding>> {
+    Ok(redact::diff_findings(&repo.changes_to_publish(scope)?))
 }
 
-/// What [`warn_about_commits`] decides.
-fn commits_warning(
-    repo: &Repo,
-    range: &[&str],
-    reported: &[Finding],
-    warned: &str,
-) -> Result<Verdict> {
-    let findings = scan_commits(&repo.published_commits(range)?);
-    Ok(warning(&findings, reported, warned).map_or(Verdict::Clean, Verdict::Warn))
+/// The secrets in the messages and every file of the commits `range` publishes.
+fn found_in_commits(repo: &Repo, range: &[&str]) -> Result<Vec<Finding>> {
+    Ok(scan_commits(&repo.published_commits(range)?))
 }
 
 /// What to do about `findings`: a refusal lists every secret they add, and a warning those of
@@ -304,7 +290,7 @@ mod tests {
     }
 
     /// The refusal of a check, or a panic if it passed.
-    fn refusal_of(checked: Result<()>) -> String {
+    fn refusal_of<T: std::fmt::Debug>(checked: Result<T>) -> String {
         checked.unwrap_err().to_string()
     }
 
@@ -487,9 +473,10 @@ mod tests {
             let refusal = refusal_of(check_staged(&repo, Scope::Staged));
 
             assert_eq!(refusal, refused(&[&format!("   {path}:1  AWS access key")]));
-            let warned = changes_verdict(&repo, Scope::Staged, OnSecrets::Warn, &[], &WORDING);
+            let found = found_in_changes(&repo, Scope::Staged).unwrap();
             let listed = format!("going on:\n   {path}:1  AWS access key");
-            assert_eq!(warned.unwrap(), Verdict::Warn(listed));
+            let warned = verdict(&found, OnSecrets::Warn, &[], &WORDING);
+            assert_eq!(warned, Verdict::Warn(listed));
         }
     }
 
@@ -755,16 +742,15 @@ mod tests {
         let hash = commit_file(dir.path(), &format!("aws {}\n", key()), "add the settings");
         let shown = format!("going on:\n   commit {hash} deploy.env:1  AWS access key");
 
-        let warned = commits_warning(&repo, &["HEAD"], &[], "going on").unwrap();
+        let found = found_in_commits(&repo, &["HEAD"]).unwrap();
 
-        assert_eq!(warned, Verdict::Warn(shown));
+        assert_eq!(warning(&found, &[], "going on"), Some(shown));
         let in_file = finding("deploy.env", Some(1), Change::Added);
         let reported = [Finding {
             kind: "AWS access key".to_owned(),
             ..in_file
         }];
-        let warned = commits_warning(&repo, &["HEAD"], &reported, "going on").unwrap();
-        assert_eq!(warned, Verdict::Clean);
+        assert_eq!(warning(&found, &reported, "going on"), None);
         assert!(warn_about_commits(&repo, &["HEAD"], &[], "going on").is_ok());
     }
 
@@ -777,13 +763,35 @@ mod tests {
              AWS access key"
         );
 
-        let warned = commits_verdict(&repo, &OUTGOING, OnSecrets::Warn, &[], &PUSH).unwrap();
+        let found = found_in_commits(&repo, &OUTGOING).unwrap();
 
-        assert_eq!(warned, Verdict::Warn(shown));
+        assert_eq!(
+            verdict(&found, OnSecrets::Warn, &[], &PUSH),
+            Verdict::Warn(shown)
+        );
         assert!(check_outgoing(&repo, OnSecrets::Warn).is_ok());
     }
 
-    /// A merge of commits that were checked or published adds nothing itself.
+    /// The push lists each commit's secret, even where the commit check listed the same kind in
+    /// the same file, since an older commit it sends may hold another.
+    #[test]
+    fn lists_every_commit_a_push_sends_that_adds_a_secret() {
+        let (dir, repo) = isolated_repo();
+        let older = commit_file(dir.path(), &format!("aws {}\n", key()), "add the settings");
+        let both = format!("aws {}\naws AKIA{}\n", key(), "R".repeat(16));
+        stage(dir.path(), "deploy.env", &both);
+        check_changes(&repo, Scope::Staged, OnSecrets::Warn, &[], &WORDING).unwrap();
+        let newer = commit_file(dir.path(), &both, "add another key");
+        let shown = format!(
+            "pushing commits that add what look like secrets:\n   commit {newer} deploy.env:2  \
+             AWS access key\n   commit {older} deploy.env:1  AWS access key"
+        );
+
+        let warned = outgoing_verdict(&repo, OnSecrets::Warn).unwrap();
+
+        assert_eq!(warned, Verdict::Warn(shown));
+    }
+
     #[test]
     fn lets_a_merge_of_published_commits_through() {
         let (dir, repo) = isolated_repo();

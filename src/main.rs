@@ -29,7 +29,7 @@ use anyhow::{Context, Result, bail};
 use cli::{
     BranchArgs, Command, ConfigCommand, ExplainArgs, GenerateArgs, PrArgs, TidyArgs, WhyArgs,
 };
-use config::{Config, Overrides};
+use config::{Config, OnSecrets, Overrides};
 use conversation::models::{self, Model};
 use conversation::{
     commit_message, connect, discuss, generate_message, initial_messages, notes_bytes,
@@ -42,8 +42,7 @@ use prompt::Work;
 use review::{Action, Choice, Person, Review, Revisions, Terminal};
 use secrets::redact::{self, Finding};
 use secrets::{
-    Wording, added, check_changes, check_commits, check_outgoing, list_findings, report_secrets,
-    warn_about_commits,
+    Wording, added, check_changes, check_commits, list_findings, report_secrets, warn_about_commits,
 };
 use server::{Message, ModelServer, Server};
 use split::signals::Stopped;
@@ -314,8 +313,7 @@ async fn generate(args: &GenerateArgs, overrides: &Overrides) -> Result<()> {
     if args.commit {
         commit(&repo, &message, scope, &args.git_args, &leave_out)?;
         if args.push {
-            check_outgoing(&repo, config.on_secrets).context(NOT_PUSHED)?;
-            push(&repo, false).context(NOT_PUSHED)?;
+            push(&repo, false, config.on_secrets).context(NOT_PUSHED)?;
         }
         return Ok(());
     }
@@ -341,8 +339,7 @@ async fn generate(args: &GenerateArgs, overrides: &Overrides) -> Result<()> {
     };
     commit(&repo, &message, scope, &args.git_args, &leave_out)?;
     if acceptance.pushes() || args.push {
-        check_outgoing(&repo, config.on_secrets).context(NOT_PUSHED)?;
-        push(&repo, true).context(NOT_PUSHED)?;
+        push(&repo, true, config.on_secrets).context(NOT_PUSHED)?;
     }
     Ok(())
 }
@@ -501,7 +498,7 @@ async fn pull_request(args: &PrArgs, overrides: &Overrides) -> Result<()> {
         draft: acceptance.is_draft() || args.draft,
         extra_args: &args.gh_args,
     };
-    create_pull_request(&repo, &config, &pull_request, !args.create)
+    create_pull_request(&repo, &pull_request, !args.create, config.on_secrets)
 }
 
 async fn new_branch(args: &BranchArgs, overrides: &Overrides) -> Result<()> {
@@ -1211,22 +1208,22 @@ async fn explain_commits(args: &ExplainArgs, overrides: &Overrides) -> Result<()
     discuss(&server, &model, &subject.heading, conversation, &Terminal).await
 }
 
-/// Pushes the branch if GitHub lacks some of its commits, then creates the
-/// pull request. With `ask`, the user confirms a rebase before the push.
+/// Pushes the branch if GitHub lacks some of its commits, checking them for secrets as
+/// `on_secrets` says, then creates the pull request. With `ask`, the user confirms a rebase
+/// before the push.
 fn create_pull_request(
     repo: &Repo,
-    config: &Config,
     pull_request: &PullRequest,
     ask: bool,
+    on_secrets: OnSecrets,
 ) -> Result<()> {
     const NOT_PUSHED: &str = "the branch was not pushed, so no pull request was created";
     if repo.has_unpushed_commits()? {
-        check_outgoing(repo, config.on_secrets).context(NOT_PUSHED)?;
         ui::info(format!(
             "Pushing {} so GitHub has its commits.",
             pull_request.head
         ));
-        let pushed = push(repo, ask).context(NOT_PUSHED)?;
+        let pushed = push(repo, ask, on_secrets).context(NOT_PUSHED)?;
         if !pushed {
             ui::info("No pull request created.");
             return Ok(());

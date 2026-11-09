@@ -1719,15 +1719,47 @@ pub mod test_support {
         (1..=count).map(|n| format!("line {n}\n")).collect()
     }
 
+    /// Keeps the user's global settings (signing, hooks) out of the tests.
+    pub fn isolate(dir: &Path) {
+        run(dir, &["config", "user.name", "Test"]);
+        run(dir, &["config", "user.email", "test@example.com"]);
+        run(dir, &["config", "commit.gpgsign", "false"]);
+        run(dir, &["config", "core.hooksPath", "no-hooks"]);
+    }
+
+    /// Adds a bare repository as `origin` and pushes to it, setting the upstream.
+    pub fn add_remote(repo: &Repo) -> TempDir {
+        let remote = TempDir::new().unwrap();
+        run(
+            remote.path(),
+            &["init", "--bare", "-q", "--initial-branch", "main"],
+        );
+        repo.git(&["remote", "add", "origin", remote.path().to_str().unwrap()])
+            .unwrap();
+        repo.push().unwrap();
+        remote
+    }
+
+    /// Pushes a commit to `remote` from another clone, like an edit made on GitHub.
+    pub fn commit_elsewhere(remote: &TempDir, file: &str, content: &str, subject: &str) {
+        let clone = TempDir::new().unwrap();
+        run(
+            clone.path(),
+            &["clone", "-q", remote.path().to_str().unwrap(), "."],
+        );
+        isolate(clone.path());
+        fs::write(clone.path().join(file), content).unwrap();
+        run(clone.path(), &["add", "--all"]);
+        run(clone.path(), &["commit", "-q", "-m", subject]);
+        run(clone.path(), &["push", "-q"]);
+    }
+
     /// A repository with lib.rs committed, without the user's global settings
     /// for signing and hooks.
     pub fn isolated_repo() -> (TempDir, Repo) {
         let dir = TempDir::new().unwrap();
         run(dir.path(), &["init", "-q", "--initial-branch", "main"]);
-        run(dir.path(), &["config", "user.name", "Test"]);
-        run(dir.path(), &["config", "user.email", "test@example.com"]);
-        run(dir.path(), &["config", "commit.gpgsign", "false"]);
-        run(dir.path(), &["config", "core.hooksPath", "no-hooks"]);
+        isolate(dir.path());
         fs::write(dir.path().join("lib.rs"), "fn a() {}\n").unwrap();
         run(dir.path(), &["add", "lib.rs"]);
         run(dir.path(), &["commit", "-q", "-m", "init"]);
@@ -1777,6 +1809,7 @@ pub mod test_support {
 
 #[cfg(test)]
 mod tests {
+    use super::test_support::{add_remote, commit_elsewhere, isolate};
     use super::*;
     use tempfile::TempDir;
 
@@ -1837,14 +1870,6 @@ mod tests {
         String::from_utf8_lossy(&output.stdout).into_owned()
     }
 
-    /// Keeps the user's global settings (signing, hooks) out of the tests.
-    fn isolate(dir: &Path) {
-        run(dir, &["config", "user.name", "Test"]);
-        run(dir, &["config", "user.email", "test@example.com"]);
-        run(dir, &["config", "commit.gpgsign", "false"]);
-        run(dir, &["config", "core.hooksPath", "no-hooks"]);
-    }
-
     fn setup() -> (TempDir, Repo) {
         let dir = TempDir::new().unwrap();
         run(dir.path(), &["init", "-q", "--initial-branch", "main"]);
@@ -1862,33 +1887,6 @@ mod tests {
         run(dir, &["add", "--all"]);
         run(dir, &["commit", "-q", "-m", "add the file"]);
         fs::write(dir.join("Kjøre.txt"), "to\n").unwrap();
-    }
-
-    /// Adds a bare repository as `origin` and pushes to it, setting the upstream.
-    fn add_remote(repo: &Repo) -> TempDir {
-        let remote = TempDir::new().unwrap();
-        run(
-            remote.path(),
-            &["init", "--bare", "-q", "--initial-branch", "main"],
-        );
-        repo.git(&["remote", "add", "origin", remote.path().to_str().unwrap()])
-            .unwrap();
-        repo.push().unwrap();
-        remote
-    }
-
-    /// Pushes a commit to `remote` from another clone, like an edit made on GitHub.
-    fn commit_elsewhere(remote: &TempDir, file: &str, content: &str, subject: &str) {
-        let clone = TempDir::new().unwrap();
-        run(
-            clone.path(),
-            &["clone", "-q", remote.path().to_str().unwrap(), "."],
-        );
-        isolate(clone.path());
-        fs::write(clone.path().join(file), content).unwrap();
-        run(clone.path(), &["add", "--all"]);
-        run(clone.path(), &["commit", "-q", "-m", subject]);
-        run(clone.path(), &["push", "-q"]);
     }
 
     fn log(repo: &Repo) -> String {

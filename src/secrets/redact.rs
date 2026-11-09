@@ -353,6 +353,47 @@ pub fn commit(hash: &str, message: &str, patch: &str) -> Vec<Finding> {
     findings
 }
 
+/// A line that holds what look like secrets.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SecretLine {
+    /// Its number, counted from 1.
+    pub number: usize,
+    /// The line, or for a private key every line of its data, since keys of one type can
+    /// begin with the same line.
+    pub text: String,
+    /// What each secret on it looks like.
+    pub kinds: Vec<String>,
+}
+
+/// The lines of `lines` that hold secrets, scanned with the rules a diff's lines get, a private
+/// key's block across lines included.
+pub fn secret_lines(lines: impl IntoIterator<Item = String>) -> Vec<SecretLine> {
+    let mut scanner = Scanner::default();
+    lines
+        .into_iter()
+        .enumerate()
+        .fold(Vec::new(), |mut found: Vec<SecretLine>, (index, text)| {
+            let mut kinds = Vec::new();
+            match scanner.scan(&text, &mut kinds) {
+                // Only the later data lines of a private key are left out, and they belong to
+                // the key found on the line before.
+                None => {
+                    if let Some(key) = found.last_mut() {
+                        key.text.push('\n');
+                        key.text.push_str(&text);
+                    }
+                }
+                Some(_) if !kinds.is_empty() => found.push(SecretLine {
+                    number: index + 1,
+                    text,
+                    kinds,
+                }),
+                Some(_) => {}
+            }
+            found
+        })
+}
+
 /// Replaces the secrets in plain text, such as a commit message. Findings name
 /// the text as `place`.
 pub fn text(text: &str, place: &str) -> Redacted {
@@ -1168,6 +1209,28 @@ mod tests {
                 ("commit 1a2b3c4 .env".to_owned(), Some(1), Change::Added)
             ]
         );
+    }
+
+    /// A key's finding holds all of its data, since keys of one type can begin alike.
+    #[test]
+    fn keeps_a_private_keys_whole_data_with_its_line() {
+        let lines = [
+            "x = 1".to_owned(),
+            "-----BEGIN OPENSSH PRIVATE KEY-----".to_owned(),
+            "b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9u".to_owned(),
+            "A".repeat(64),
+            "-----END OPENSSH PRIVATE KEY-----".to_owned(),
+            format!("token = ghp_{}", noise(36)),
+        ];
+
+        let found = secret_lines(lines.clone());
+
+        let numbers: Vec<usize> = found.iter().map(|line| line.number).collect();
+        assert_eq!(numbers, [3, 6]);
+        assert_eq!(found[0].text, format!("{}\n{}", lines[2], lines[3]));
+        assert_eq!(found[0].kinds, ["private key"]);
+        assert_eq!(found[1].text, lines[5]);
+        assert!(secret_lines(Vec::new()).is_empty());
     }
 
     #[test]

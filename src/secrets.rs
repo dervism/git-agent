@@ -2,14 +2,17 @@
 //! reaches a model, and refusing or warning when a commit or a push would add them.
 //!
 //! The checks read what git publishes, every file of every commit, rather than what the model
-//! reads, so that no setting, such as `exclude`, can hide a secret from them.
+//! reads, so that no setting, such as `exclude`, can hide a secret from them. A file a diff shows
+//! only as binary is read whole (`contents`).
 
+pub mod contents;
 pub mod redact;
 
 use crate::config::OnSecrets;
 use crate::git::{CommitPatch, Repo, Scope};
 use crate::ui;
 use anyhow::{Result, bail};
+use contents::{BinaryFile, MOST_BINARY_BYTES, Scanned, Unchecked};
 use redact::{Change, Finding};
 
 /// How to make a check pass when its findings aren't secrets.
@@ -68,8 +71,9 @@ pub fn check_changes(
     reported: &[Finding],
     wording: &Wording,
 ) -> Result<()> {
-    let findings = found_in_changes(repo, scope)?;
-    settle(verdict(&findings, on_secrets, reported, wording))
+    let scanned = found_in_changes(repo, scope)?;
+    settle(unchecked_verdict(&scanned.unchecked))?;
+    settle(verdict(&scanned.findings, on_secrets, reported, wording))
 }
 
 /// Checks the messages and every file of the commits `range` (`git log` arguments) publishes.
@@ -81,8 +85,9 @@ pub fn check_commits(
     reported: &[Finding],
     wording: &Wording,
 ) -> Result<()> {
-    let findings = found_in_commits(repo, range)?;
-    settle(verdict(&findings, on_secrets, reported, wording))
+    let scanned = found_in_commits(repo, range)?;
+    settle(unchecked_verdict(&scanned.unchecked))?;
+    settle(verdict(&scanned.findings, on_secrets, reported, wording))
 }
 
 /// Warns, whatever the setting, about the secrets the commits `range` publishes add, apart
@@ -93,31 +98,78 @@ pub fn warn_about_commits(
     reported: &[Finding],
     warned: &str,
 ) -> Result<()> {
-    let findings = found_in_commits(repo, range)?;
-    settle(warning(&findings, reported, warned).map_or(Verdict::Clean, Verdict::Warn))
+    let scanned = found_in_commits(repo, range)?;
+    settle(unchecked_verdict(&scanned.unchecked))?;
+    settle(warning(&scanned.findings, reported, warned).map_or(Verdict::Clean, Verdict::Warn))
 }
 
 /// Checks the commits a push of HEAD would send. Its warning lists every secret they add, even
 /// one the flow listed before: a finding names a file rather than the secret, so leaving out
 /// what the flow listed could hide another secret of the same kind in an older commit.
 pub fn check_outgoing(repo: &Repo, on_secrets: OnSecrets) -> Result<()> {
-    settle(outgoing_verdict(repo, on_secrets)?)
-}
-
-/// What [`check_outgoing`] decides.
-fn outgoing_verdict(repo: &Repo, on_secrets: OnSecrets) -> Result<Verdict> {
-    let findings = found_in_commits(repo, &OUTGOING)?;
-    Ok(verdict(&findings, on_secrets, &[], &PUSH))
+    let scanned = found_in_commits(repo, &OUTGOING)?;
+    settle(unchecked_verdict(&scanned.unchecked))?;
+    settle(verdict(&scanned.findings, on_secrets, &[], &PUSH))
 }
 
 /// The secrets in every file of what a commit of `scope` will hold.
-fn found_in_changes(repo: &Repo, scope: Scope) -> Result<Vec<Finding>> {
-    Ok(redact::diff_findings(&repo.changes_to_publish(scope)?))
+fn found_in_changes(repo: &Repo, scope: Scope) -> Result<Scanned> {
+    let diff = repo.changes_to_publish(scope)?;
+    let whole = contents::scan(repo, &contents::binary_files(&diff)?, MOST_BINARY_BYTES)?;
+    let findings = redact::diff_findings(&diff)
+        .into_iter()
+        .chain(whole.findings);
+    Ok(Scanned {
+        findings: findings.collect(),
+        unchecked: whole.unchecked,
+    })
 }
 
 /// The secrets in the messages and every file of the commits `range` publishes.
-fn found_in_commits(repo: &Repo, range: &[&str]) -> Result<Vec<Finding>> {
-    Ok(scan_commits(&repo.published_commits(range)?))
+fn found_in_commits(repo: &Repo, range: &[&str]) -> Result<Scanned> {
+    let commits = repo.published_commits(range)?;
+    let binary = commits
+        .iter()
+        .map(|commit| {
+            let files = contents::binary_files(&commit.patch)?;
+            Ok(files.into_iter().map(|file| BinaryFile {
+                place: format!("commit {} {}", commit.hash, file.place),
+                ..file
+            }))
+        })
+        .collect::<Result<Vec<_>>>()?
+        .into_iter()
+        .flatten()
+        .collect::<Vec<BinaryFile>>();
+    let whole = contents::scan(repo, &binary, MOST_BINARY_BYTES)?;
+    let findings = scan_commits(&commits).into_iter().chain(whole.findings);
+    Ok(Scanned {
+        findings: findings.collect(),
+        unchecked: whole.unchecked,
+    })
+}
+
+/// The warning that lists the binary files too large to check, if there are any. They don't
+/// stop anything, whatever the setting.
+fn unchecked_verdict(unchecked: &[Unchecked]) -> Verdict {
+    const SHOWN: usize = 5;
+    const MIB: f64 = 1024.0 * 1024.0;
+    if unchecked.is_empty() {
+        return Verdict::Clean;
+    }
+    let mut lines: Vec<String> = unchecked
+        .iter()
+        .take(SHOWN)
+        .map(|file| format!("   {}  ({:.1} MiB)", file.place, file.size as f64 / MIB))
+        .collect();
+    if unchecked.len() > SHOWN {
+        lines.push(format!("   … and {} more", unchecked.len() - SHOWN));
+    }
+    Verdict::Warn(format!(
+        "git-agent didn't check these binary files for secrets, since each is over {} MiB:\n{}",
+        MOST_BINARY_BYTES / (1024 * 1024),
+        lines.join("\n")
+    ))
 }
 
 /// What to do about `findings`: a refusal lists every secret they add, and a warning those of
@@ -473,7 +525,7 @@ mod tests {
             let refusal = refusal_of(check_staged(&repo, Scope::Staged));
 
             assert_eq!(refusal, refused(&[&format!("   {path}:1  AWS access key")]));
-            let found = found_in_changes(&repo, Scope::Staged).unwrap();
+            let found = found_in_changes(&repo, Scope::Staged).unwrap().findings;
             let listed = format!("going on:\n   {path}:1  AWS access key");
             let warned = verdict(&found, OnSecrets::Warn, &[], &WORDING);
             assert_eq!(warned, Verdict::Warn(listed));
@@ -742,7 +794,7 @@ mod tests {
         let hash = commit_file(dir.path(), &format!("aws {}\n", key()), "add the settings");
         let shown = format!("going on:\n   commit {hash} deploy.env:1  AWS access key");
 
-        let found = found_in_commits(&repo, &["HEAD"]).unwrap();
+        let found = found_in_commits(&repo, &["HEAD"]).unwrap().findings;
 
         assert_eq!(warning(&found, &[], "going on"), Some(shown));
         let in_file = finding("deploy.env", Some(1), Change::Added);
@@ -763,7 +815,7 @@ mod tests {
              AWS access key"
         );
 
-        let found = found_in_commits(&repo, &OUTGOING).unwrap();
+        let found = found_in_commits(&repo, &OUTGOING).unwrap().findings;
 
         assert_eq!(
             verdict(&found, OnSecrets::Warn, &[], &PUSH),
@@ -787,7 +839,8 @@ mod tests {
              AWS access key\n   commit {older} deploy.env:1  AWS access key"
         );
 
-        let warned = outgoing_verdict(&repo, OnSecrets::Warn).unwrap();
+        let found = found_in_commits(&repo, &OUTGOING).unwrap().findings;
+        let warned = verdict(&found, OnSecrets::Warn, &[], &PUSH);
 
         assert_eq!(warned, Verdict::Warn(shown));
     }
@@ -873,5 +926,194 @@ mod tests {
         commit_file(dir.path(), "aws none\n", "take the key out");
 
         assert!(check_outgoing(&repo, OnSecrets::Reject).is_ok());
+    }
+
+    /// A file `.gitattributes` marks `-diff` shows only as binary, so it's read whole, with the
+    /// rules a text file's lines get.
+    #[test]
+    fn refuses_a_key_in_a_file_marked_not_to_be_diffed() {
+        let (dir, repo) = isolated_repo();
+        stage(dir.path(), ".gitattributes", "*.env -diff\n");
+        stage(dir.path(), "app.env", &format!("DEBUG=1\naws {}\n", key()));
+        assert!(run(dir.path(), &["diff", "--cached"]).contains("Binary files"));
+
+        let refusal = refusal_of(check_staged(&repo, Scope::Staged));
+
+        assert_eq!(refusal, refused(&["   app.env:2  AWS access key"]));
+    }
+
+    /// The Tracked scope stages the work tree in a private index, as `git commit --all` would,
+    /// and leaves the real one alone.
+    #[test]
+    fn refuses_a_key_in_a_binary_file_staged_or_in_the_work_tree() {
+        let (dir, repo) = isolated_repo();
+        let dir = dir.path();
+        commit_at(dir, "data.bin", "\0old\0", "add the data");
+        fs::write(dir.join("data.bin"), format!("\0aws {}\0", key())).unwrap();
+        let expected = refused(&["   data.bin  AWS access key"]);
+
+        assert!(check_staged(&repo, Scope::Staged).is_ok());
+        assert_eq!(refusal_of(check_staged(&repo, Scope::Tracked)), expected);
+        assert!(run(dir, &["diff", "--cached", "--name-only"]).is_empty());
+        run(dir, &["add", "data.bin"]);
+        assert_eq!(refusal_of(check_staged(&repo, Scope::Staged)), expected);
+    }
+
+    /// A symlink is committed as the path it holds, so what it points to isn't read.
+    #[cfg(unix)]
+    #[test]
+    fn reads_a_symlink_as_the_path_it_holds() {
+        let (dir, repo) = isolated_repo();
+        let outside = TempDir::new().unwrap();
+        let target = outside.path().join("keys.bin");
+        fs::write(&target, format!("\0aws {}\0", key())).unwrap();
+        std::os::unix::fs::symlink(&target, dir.path().join("link")).unwrap();
+        run(dir.path(), &["add", "link"]);
+
+        assert!(check_staged(&repo, Scope::Staged).is_ok());
+        run(dir.path(), &["commit", "-q", "-m", "add the link"]);
+        fs::remove_file(dir.path().join("link")).unwrap();
+        std::os::unix::fs::symlink(outside.path(), dir.path().join("link")).unwrap();
+        assert!(check_staged(&repo, Scope::Tracked).is_ok());
+    }
+
+    /// A binary file over the cap is listed as not checked, and lets the commit through.
+    #[test]
+    fn lists_a_binary_file_over_sixteen_mib_and_lets_it_through() {
+        let (dir, repo) = isolated_repo();
+        let mut bytes = format!("\0aws {}\0", key()).into_bytes();
+        bytes.resize(usize::try_from(MOST_BINARY_BYTES).unwrap() + 1, 0);
+        fs::write(dir.path().join("big.bin"), &bytes).unwrap();
+        run(dir.path(), &["add", "big.bin"]);
+
+        let scanned = found_in_changes(&repo, Scope::Staged).unwrap();
+
+        assert!(scanned.findings.is_empty());
+        let size = MOST_BINARY_BYTES + 1;
+        let big = Unchecked {
+            place: "big.bin".to_owned(),
+            size,
+        };
+        assert_eq!(scanned.unchecked, [big]);
+        assert!(check_staged(&repo, Scope::Staged).is_ok());
+    }
+
+    #[test]
+    fn lists_the_binary_files_too_large_to_check() {
+        let file = |n: u64| Unchecked {
+            place: format!("pkg{n}/data.bin"),
+            size: MOST_BINARY_BYTES + n * 1024 * 1024,
+        };
+        assert_eq!(unchecked_verdict(&[]), Verdict::Clean);
+        assert_eq!(
+            unchecked_verdict(&[file(1)]),
+            Verdict::Warn(
+                "git-agent didn't check these binary files for secrets, since each is over 16 \
+                 MiB:\n   pkg1/data.bin  (17.0 MiB)"
+                    .to_owned()
+            )
+        );
+        let six: Vec<Unchecked> = (1..=6).map(file).collect();
+        let Verdict::Warn(text) = unchecked_verdict(&six) else {
+            panic!("no warning");
+        };
+        assert!(
+            text.ends_with("pkg5/data.bin  (21.0 MiB)\n   … and 1 more"),
+            "{text}"
+        );
+    }
+
+    /// A merge that writes a key into a binary file adds it itself.
+    #[test]
+    fn refuses_a_key_a_merge_writes_into_a_binary_file() {
+        let (dir, repo) = isolated_repo();
+        let dir = dir.path();
+        commit_at(dir, "data.bin", "\0base\0", "add the data");
+        run(dir, &["checkout", "-q", "-b", "side"]);
+        commit_at(dir, "data.bin", "\0side\0", "change it on the side");
+        run(dir, &["checkout", "-q", "main"]);
+        commit_at(dir, "data.bin", "\0main\0", "change it on main");
+        run(dir, &["merge", "-q", "--no-commit", "-X", "ours", "side"]);
+        let merge = commit_at(dir, "data.bin", &format!("\0aws {}\0", key()), "merge");
+
+        let error = check_outgoing(&repo, OnSecrets::Reject).unwrap_err();
+
+        let shown = format!("commit {merge} data.bin  AWS access key");
+        assert!(error.to_string().contains(&shown), "{error}");
+    }
+
+    /// A binary file that keeps a key it had when it was published adds no key.
+    #[test]
+    fn lets_through_a_binary_file_that_keeps_a_published_key() {
+        let (dir, repo) = isolated_repo();
+        let dir = dir.path();
+        let line = format!("aws {}", key());
+        commit_at(dir, "data.bin", &format!("\0{line}\0"), "add the data");
+        run(dir, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
+        let hash = commit_at(dir, "data.bin", &format!("\0more\0{line}\0"), "add more");
+
+        let found = found_in_commits(&repo, &OUTGOING).unwrap().findings;
+
+        let place = format!("commit {hash} data.bin");
+        assert_eq!(
+            found,
+            [Finding {
+                place,
+                line: None,
+                change: Change::Unchanged,
+                kind: "AWS access key".to_owned()
+            }]
+        );
+        assert!(check_outgoing(&repo, OnSecrets::Reject).is_ok());
+    }
+
+    /// Whatever makes git show a file as binary, the `binary` macro or a diff driver set to
+    /// binary, its content is read.
+    #[test]
+    fn refuses_a_key_in_a_file_any_attribute_marks_binary() {
+        let (dir, repo) = isolated_repo();
+        let dir = dir.path();
+        stage(dir, ".gitattributes", "*.cfg binary\n*.ini diff=opaque\n");
+        run(dir, &["config", "diff.opaque.binary", "true"]);
+        stage(dir, "app.cfg", &format!("aws {}\n", key()));
+        stage(dir, "app.ini", &format!("x = 1\naws {}\n", key()));
+        assert_eq!(
+            run(dir, &["diff", "--cached"])
+                .matches("Binary files")
+                .count(),
+            2
+        );
+
+        let refusal = refusal_of(check_staged(&repo, Scope::Staged));
+
+        let shown = [
+            "   app.cfg:1  AWS access key",
+            "   app.ini:2  AWS access key",
+        ];
+        assert_eq!(refusal, refused(&shown));
+    }
+
+    /// A binary file renamed with a change is compared with what it was under its old name.
+    #[test]
+    fn compares_a_renamed_binary_file_with_its_old_content() {
+        let (dir, repo) = isolated_repo();
+        let dir = dir.path();
+        let line = format!("aws {}", key());
+        let padding = "\0padding that keeps the files alike".repeat(20);
+        commit_at(
+            dir,
+            "data.bin",
+            &format!("\0{line}{padding}"),
+            "add the data",
+        );
+        run(dir, &["mv", "data.bin", "moved.bin"]);
+        stage(dir, "moved.bin", &format!("\0{line}{padding}\0more"));
+        assert!(run(dir, &["diff", "--cached", "-M"]).contains("rename to moved.bin"));
+        assert!(check_staged(&repo, Scope::Staged).is_ok());
+
+        let other = format!("AKIA{}", "R".repeat(16));
+        stage(dir, "moved.bin", &format!("\0{line}{padding}\0aws {other}"));
+        let refusal = refusal_of(check_staged(&repo, Scope::Staged));
+        assert_eq!(refusal, refused(&["   moved.bin  AWS access key"]));
     }
 }

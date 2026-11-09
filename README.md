@@ -587,9 +587,15 @@ error: the changes add what look like secrets, so git-agent didn't commit them:
 Take them out of the changes. If they aren't real secrets, add --on-secrets warn, or choose Warn under Secrets in `git agent config`.
 ```
 
-The checks read what git publishes, which is more than the model reads: every file git
-shows as text, including lockfiles and the other files that `exclude` keeps out of the
-prompt, and what a merge commit adds itself.
+The checks read what git publishes, which is more than the model reads: every file,
+including lockfiles and the other files that `exclude` keeps out of the prompt, and
+what a merge commit adds itself. A file that git shows only as binary, or that
+`.gitattributes` marks `-diff`, is read whole: a text file line by line, and a binary
+file by the runs of printable characters in it, a byte to a character or in UTF-16,
+up to 16 MiB. git-agent lists a larger
+binary file as not checked, and carries on. Git LFS sends its content to the LFS
+server without passing it through git, and the inside of a compressed archive can't
+be read this way, so neither is checked.
 
 Before every push, after any rebase onto the remote, git-agent checks each commit the
 push would send, including its message, because a secret that a later commit removes

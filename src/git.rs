@@ -1,12 +1,15 @@
 //! Wrapper around the `git` command line.
 
+pub mod blob;
 pub mod diff;
 pub mod lossless;
 pub mod names;
 pub mod worktree;
 
 use crate::safe_text::one_line;
+use crate::temp::PrivateDir;
 use anyhow::{Context, Result, anyhow, bail};
+use blob::Blob;
 use std::collections::HashSet;
 use std::collections::hash_map::RandomState;
 use std::ffi::OsString;
@@ -807,19 +810,35 @@ impl Repo {
 
     /// What a commit in `scope` will hold, read for the secret checks rather than for the
     /// model: every file, whatever `exclude` says, with git's settings that change a diff
-    /// pinned. The Tracked scope reads from HEAD, so what's staged meanwhile is read too.
+    /// pinned. The Tracked scope is staged first in a private copy of the index, as
+    /// `git commit --all` stages it, so what's staged meanwhile is read too, a clean filter
+    /// applies as it will at the commit, and every new blob exists.
     pub fn changes_to_publish(&self, scope: Scope) -> Result<String> {
-        let base = match scope {
-            Scope::Staged => "--cached".to_owned(),
-            Scope::Tracked => match self.resolve("HEAD")? {
-                Some(head) => head,
-                None => self.empty_tree()?,
-            },
-        };
-        let mut args = vec!["diff", &base];
+        let mut args = vec!["diff", "--cached"];
         args.extend(PUBLISHED_DIFF);
         args.extend(["--", ":/"]);
-        self.git_published(&args)
+        match scope {
+            Scope::Staged => self.git_published(&args),
+            Scope::Tracked => {
+                let folder = PrivateDir::create("check")?;
+                self.staged_as_commit_all(&folder)?.git_published(&args)
+            }
+        }
+    }
+
+    /// This repository with a copy of its index in `folder`, where every change to a tracked
+    /// file is staged, as `git commit --all` stages them. That writes the blobs the commit
+    /// would write.
+    fn staged_as_commit_all(&self, folder: &PrivateDir) -> Result<Repo> {
+        let index = folder.path().join("index");
+        let real = self.git_path("index")?;
+        if real.exists() {
+            fs::copy(&real, &index)
+                .with_context(|| format!("failed to copy the index {}", real.display()))?;
+        }
+        let staged = self.with_index(index).without_hooks();
+        staged.git(&["add", "--update", "--", ":/"])?;
+        Ok(staged)
     }
 
     /// The commits `range` (`git log` arguments) publishes, with their patches, read for the
@@ -910,6 +929,37 @@ impl Repo {
     pub fn parents(&self, commit: &str) -> Result<Vec<String>> {
         let line = self.git(&["rev-list", "--parents", "--max-count=1", commit])?;
         Ok(line.split_whitespace().skip(1).map(str::to_owned).collect())
+    }
+
+    /// The size in bytes of the object `hash`, as it is rather than as a replacement shows it.
+    pub fn object_size(&self, hash: &str) -> Result<u64> {
+        let hash = object_hash(hash)?;
+        let size = self.git(&["--no-replace-objects", "cat-file", "-s", hash])?;
+        size.trim()
+            .parse()
+            .with_context(|| format!("git gave {size:?} as the size of {hash}"))
+    }
+
+    /// The content of the blob `hash`, as it is rather than as a replacement shows it, read as
+    /// git writes it.
+    pub fn open_blob(&self, hash: &str) -> Result<Blob> {
+        let hash = object_hash(hash)?;
+        // A blob over git's big-file threshold is streamed rather than inflated whole first.
+        let child = self
+            .command(&[
+                "-c",
+                "core.bigFileThreshold=16m",
+                "--no-replace-objects",
+                "cat-file",
+                "blob",
+                hash,
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .context("failed to run git; is it installed?")?;
+        Ok(Blob::new(child, hash)?)
     }
 
     /// The hash of the empty tree, which a first commit is compared with.
@@ -1688,6 +1738,16 @@ fn stdout_of(mut command: Command, args: &[&str]) -> Result<Vec<u8>> {
         );
     }
     Ok(output.stdout)
+}
+
+/// `hash`, if it is an object's full hash: 40 or 64 hex digits, so it can't be taken for an
+/// option or a revision.
+fn object_hash(hash: &str) -> Result<&str> {
+    if [40, 64].contains(&hash.len()) && hash.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        Ok(hash)
+    } else {
+        bail!("git-agent read {hash:?} where a full object hash belongs")
+    }
 }
 
 /// Whether `text` is a commit's hash, short or full: 4 to 64 hex digits.
@@ -3083,5 +3143,26 @@ mod tests {
         assert_eq!(repo.git(&["worktree", "list"]).unwrap().lines().count(), 1);
         let whole = format!("pick {}\npick {}\n", commits[0], commits[1]);
         assert!(repo.rewrite(&tip, Some(&base), &whole).is_ok());
+    }
+
+    /// A blob is read as git writes it, and one git can't read fails at its end rather than
+    /// pass for an empty one.
+    #[test]
+    fn reads_a_blob_and_fails_on_one_git_cannot_read() {
+        let (dir, repo) = setup();
+        fs::write(dir.path().join("data.bin"), b"a\0b\n").unwrap();
+        let hash = run(dir.path(), &["hash-object", "-w", "data.bin"]);
+        let mut content = Vec::new();
+        std::io::Read::read_to_end(&mut repo.open_blob(hash.trim()).unwrap(), &mut content)
+            .unwrap();
+        assert_eq!(content, b"a\0b\n");
+        assert_eq!(repo.object_size(hash.trim()).unwrap(), 4);
+
+        let missing = "1".repeat(40);
+        let mut blob = repo.open_blob(&missing).unwrap();
+        assert!(std::io::Read::read_to_end(&mut blob, &mut Vec::new()).is_err());
+        assert!(repo.object_size(&missing).is_err());
+        assert!(repo.open_blob("HEAD").is_err());
+        assert!(repo.object_size(&"a".repeat(41)).is_err());
     }
 }

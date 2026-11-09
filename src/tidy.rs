@@ -349,15 +349,16 @@ pub fn describe(commits: &[Commit], room: usize) -> String {
 }
 
 /// The `git rebase -i` todo list that carries out `plan`. `messages` holds,
-/// for each group in order, the file with its new message, if it gets one.
-pub fn todo(plan: &Plan, commits: &[Commit], messages: &[Option<PathBuf>]) -> String {
+/// for each group in order, the file with its new message, if it gets one. Fails on a commit
+/// whose hash isn't one, since the todo's lines are commands that git runs.
+pub fn todo(plan: &Plan, commits: &[Commit], messages: &[Option<PathBuf>]) -> Result<String> {
     let mut out = String::new();
     for (group, message) in plan.groups.iter().zip(messages) {
         let commit = &commits[group.commit];
-        let _ = writeln!(out, "pick {} {}", commit.short, commit.subject());
+        let _ = writeln!(out, "pick {} {}", hash_of(commit)?, commit.subject());
         for &folded in &group.folded {
             let commit = &commits[folded];
-            let _ = writeln!(out, "fixup {} {}", commit.short, commit.subject());
+            let _ = writeln!(out, "fixup {} {}", hash_of(commit)?, commit.subject());
         }
         if let Some(path) = message {
             let _ = writeln!(
@@ -367,7 +368,18 @@ pub fn todo(plan: &Plan, commits: &[Commit], messages: &[Option<PathBuf>]) -> St
             );
         }
     }
-    out
+    Ok(out)
+}
+
+/// `commit`'s hash, checked to be 4 to 64 hex digits, as SHA-1 and SHA-256 repositories write
+/// them, before it goes into the todo.
+fn hash_of(commit: &Commit) -> Result<&str> {
+    let hash = commit.short.as_str();
+    if (4..=64).contains(&hash.len()) && hash.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        Ok(hash)
+    } else {
+        bail!("git-agent read a commit whose hash isn't one, so it won't rewrite the commits")
+    }
 }
 
 #[cfg(test)]
@@ -503,12 +515,35 @@ mod tests {
     }
 
     #[test]
+    fn refuses_to_write_a_todo_with_a_hash_that_isnt_one() {
+        let plan = Plan {
+            groups: vec![group(0, false, &[])],
+        };
+        for short in [
+            "c000000\nexec echo injected",
+            "abc",
+            &"a".repeat(65),
+            "c00000g",
+            "",
+        ] {
+            let mut commits = commits(&["feat: add cache"]);
+            commits[0].short = short.to_owned();
+            assert!(todo(&plan, &commits, &[None]).is_err(), "{short:?}");
+        }
+        for short in ["abcd", &"f".repeat(40), &"0123456789abcdef".repeat(4)] {
+            let mut commits = commits(&["feat: add cache"]);
+            commits[0].short = short.to_owned();
+            assert!(todo(&plan, &commits, &[None]).is_ok(), "{short:?}");
+        }
+    }
+
+    #[test]
     fn writes_the_rebase_todo_list() {
         let commits = commits(&["feat: add cache", "wip", "fix typo"]);
         let plan = Plan {
             groups: vec![group(0, false, &[2]), group(1, true, &[])],
         };
-        let todo = todo(&plan, &commits, &[None, Some(PathBuf::from("/tmp/it's"))]);
+        let todo = todo(&plan, &commits, &[None, Some(PathBuf::from("/tmp/it's"))]).unwrap();
         assert_eq!(
             todo,
             "pick c000000 feat: add cache\nfixup c000002 fix typo\npick c000001 wip\n\

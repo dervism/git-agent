@@ -751,8 +751,10 @@ async fn tidy_commits(args: &TidyArgs, overrides: &Overrides) -> Result<()> {
             if plan.groups.iter().any(|group| !group.folded.is_empty())
                 || messages.iter().any(Option::is_some) =>
         {
-            let todo = tidy::todo(&plan, &commits, &messages);
-            Some(repo.rewrite(&head, base.as_deref(), &todo))
+            Some(
+                tidy::todo(&plan, &commits, &messages)
+                    .and_then(|todo| repo.rewrite(&head, base.as_deref(), &todo)),
+            )
         }
         Ok(_) => None,
         Err(err) => Some(Err(err)),

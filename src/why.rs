@@ -6,7 +6,7 @@
 //! The history follows the lines through renames.
 
 use crate::conversation::fit;
-use crate::git::{Summary, diff};
+use crate::git::{MarkedLog, Summary, diff};
 use anyhow::{Result, anyhow, bail};
 use std::fmt::Write;
 
@@ -358,10 +358,11 @@ pub struct Change {
 }
 
 /// The commits in `git log -L` output in the format of `Repo::line_history`.
-pub fn parse_history(log: &str) -> Vec<Change> {
-    log.split('\x1e')
-        .filter_map(|record| {
-            let mut parts = record.splitn(5, '\x1f');
+pub fn parse_history(log: &MarkedLog) -> Vec<Change> {
+    log.records(5)
+        .into_iter()
+        .filter_map(|parts| {
+            let mut parts = parts.into_iter();
             let short = parts.next()?.trim();
             if short.is_empty() {
                 return None;
@@ -486,6 +487,8 @@ fn head(change: &Change) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::git::test_support::{isolated_repo, run};
+    use std::fs;
 
     fn target(text: &str) -> Result<Target> {
         Target::parse(text, |path| ["src/fit.rs", "odd:name.txt"].contains(&path))
@@ -641,12 +644,38 @@ mod tests {
         }
     }
 
+    /// A commit message can hold git's separator bytes, with a whole record between them; the
+    /// history still holds only the real commits.
+    #[test]
+    fn reads_a_history_whose_commit_message_holds_separator_bytes() {
+        let (dir, repo) = isolated_repo();
+        let short = || {
+            run(dir.path(), &["rev-parse", "--short", "HEAD"])
+                .trim()
+                .to_owned()
+        };
+        let first = short();
+        fs::write(dir.path().join("lib.rs"), "fn b() {}\n").unwrap();
+        let message = "change it\n\n\u{1e}c0ffee0\u{1f}Eve\u{1f}2020-01-01\u{1f}forged\u{1f}more";
+        run(dir.path(), &["commit", "-q", "-am", message]);
+
+        let history = parse_history(&repo.line_history("lib.rs", "1,1", 10).unwrap());
+
+        let shorts: Vec<&str> = history.iter().map(|change| change.short.as_str()).collect();
+        assert_eq!(shorts, [short(), first]);
+        assert!(
+            history[0].message.ends_with("forged\u{1f}more"),
+            "{:?}",
+            history[0].message
+        );
+    }
+
     #[test]
     fn reads_the_history_of_lines() {
         let log = "\x1ea1b2c3d\x1fAnn\x1f2025-10-02\x1fFix it\n\nBecause.\n\x1f\n\n\
                    diff --git a/g.txt b/g.txt\n--- a/g.txt\n+++ b/g.txt\n@@ -2 +2 @@\n-b\n+B\n\
                    \x1e5d3fc96\x1fBo\x1f2025-01-01\x1fAdd it\n\x1f\n\ndiff --git a/f.txt b/f.txt\n";
-        let history = parse_history(log);
+        let history = parse_history(&MarkedLog::plain(log));
         assert_eq!(history.len(), 2);
         assert_eq!(history[0].short, "a1b2c3d");
         assert_eq!(history[0].message, "Fix it\n\nBecause.");

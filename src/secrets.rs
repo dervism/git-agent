@@ -244,6 +244,20 @@ mod tests {
         );
     }
 
+    /// A commit message can hold git's field separator; what follows it is still scanned as part
+    /// of the message.
+    #[test]
+    fn refuses_a_key_in_a_message_after_a_separator_byte() {
+        let (dir, repo) = isolated_repo();
+        let message = format!("tidy up\n\n\u{1f}aws {}", key());
+        let hash = commit_file(dir.path(), "plain\n", &message);
+
+        let error = check_outgoing(&repo, &config(OnSecrets::Reject)).unwrap_err();
+
+        let shown = format!("commit {hash} message  AWS access key");
+        assert!(error.to_string().contains(&shown), "{error}");
+    }
+
     #[test]
     fn lets_the_push_through_when_set_to_warn() {
         let (dir, repo) = isolated_repo();

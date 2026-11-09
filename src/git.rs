@@ -8,8 +8,10 @@ pub mod worktree;
 use crate::safe_text::one_line;
 use anyhow::{Context, Result, anyhow, bail};
 use std::collections::HashSet;
+use std::collections::hash_map::RandomState;
 use std::ffi::OsString;
 use std::fs;
+use std::hash::{BuildHasher, Hasher};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -728,20 +730,30 @@ impl Repo {
     /// their patches, without the diffs of files matching `exclude`.
     pub fn commit_patches(&self, range: &[&str], exclude: &[String]) -> Result<Vec<CommitPatch>> {
         let excludes = exclude_pathspecs(exclude);
+        let marks = LogMarks::new();
+        let format = format!(
+            "--format={}%h{}%B{}",
+            marks.record_format(),
+            marks.field_format(),
+            marks.field_format()
+        );
         let mut args = vec![
             "log",
             "--patch",
             "--no-color",
             "--no-ext-diff",
             "--irreversible-delete",
-            "--format=%x1e%h%x1f%B%x1f",
+            &format,
         ];
         args.extend_from_slice(range);
         args.extend(["--", ":/"]);
         args.extend(excludes.iter().map(String::as_str));
-        let log = self.git_readable(&args)?;
-        let commits = log.split('\x1e').filter_map(|record| {
-            let mut parts = record.splitn(3, '\x1f');
+        let log = MarkedLog {
+            text: self.git_readable(&args)?,
+            marks,
+        };
+        let commits = log.records(3).into_iter().filter_map(|parts| {
+            let mut parts = parts.into_iter();
             let hash = parts.next()?.trim();
             (!hash.is_empty()).then(|| CommitPatch {
                 hash: hash.to_owned(),
@@ -765,17 +777,17 @@ impl Repo {
     /// The commits `git log` lists for `revisions` (e.g. `main..HEAD`), oldest
     /// first, without merges.
     pub fn commits(&self, revisions: &[&str]) -> Result<Vec<Commit>> {
-        let mut args = vec![
-            "log",
-            "--reverse",
-            "--no-merges",
-            "--format=%x1e%h%n%an%n%as%n%s%n%b",
-        ];
+        let marks = LogMarks::new();
+        let format = format!("--format={}%h%n%an%n%as%n%s%n%b", marks.record_format());
+        let mut args = vec!["log", "--reverse", "--no-merges", &format];
         args.extend_from_slice(revisions);
         args.push("--");
-        let log = self.git(&args)?;
-        let commits = log.split('\x1e').filter_map(|record| {
-            let mut lines = record.trim().lines();
+        let log = MarkedLog {
+            text: self.git(&args)?,
+            marks,
+        };
+        let commits = log.records(1).into_iter().filter_map(|parts| {
+            let mut lines = parts.first()?.trim().lines();
             let hash = lines.next().filter(|hash| !hash.is_empty())?;
             let author = lines.next().unwrap_or_default();
             let date = lines.next().unwrap_or_default();
@@ -1077,15 +1089,22 @@ impl Repo {
 
     /// The newest `limit` commits that changed the lines `range` of `path` at
     /// HEAD (`git log -L`), each followed by its diff of those lines.
-    pub fn line_history(&self, path: &str, range: &str, limit: usize) -> Result<String> {
-        self.git_readable(&[
+    pub fn line_history(&self, path: &str, range: &str, limit: usize) -> Result<MarkedLog> {
+        let marks = LogMarks::new();
+        let field = marks.field_format();
+        let format = format!(
+            "--format={}%h{field}%an{field}%as{field}%B{field}",
+            marks.record_format()
+        );
+        let text = self.git_readable(&[
             "log",
             "--no-color",
             "--no-ext-diff",
             &format!("--max-count={limit}"),
-            "--format=%x1e%h%x1f%an%x1f%as%x1f%B%x1f",
+            &format,
             &format!("-L{range}:{path}"),
-        ])
+        ])?;
+        Ok(MarkedLog { text, marks })
     }
 
     /// The checked-out branch.
@@ -1445,6 +1464,85 @@ fn without_dirty_submodule(file: &str) -> Option<String> {
         return Some(file.to_owned());
     };
     (line_after("-Subproject commit ") != Some(commit)).then(|| file.replace(new, commit))
+}
+
+/// The marks `git log` writes before each commit and between its fields: the bytes 0x1e and
+/// 0x1f, each followed by a random value drawn for the read. A commit message can hold those
+/// bytes, but not the value, so it can't forge a record or a field.
+struct LogMarks {
+    value: String,
+}
+
+/// `git log` output whose records and fields are set apart by [`LogMarks`].
+pub struct MarkedLog {
+    text: String,
+    marks: LogMarks,
+}
+
+impl MarkedLog {
+    /// Each record, split at its field marks into at most `fields` parts.
+    pub fn records(&self, fields: usize) -> Vec<Vec<&str>> {
+        let (record, field) = (self.marks.record(), self.marks.field());
+        self.text
+            .split(record.as_str())
+            .map(|text| text.splitn(fields, field.as_str()).collect())
+            .collect()
+    }
+
+    /// The output as git wrote it.
+    #[cfg(test)]
+    pub fn text(&self) -> &str {
+        &self.text
+    }
+
+    /// Output that uses git's separators as they are, as tests write it.
+    #[cfg(test)]
+    pub fn plain(text: &str) -> Self {
+        Self {
+            text: text.to_owned(),
+            marks: LogMarks {
+                value: String::new(),
+            },
+        }
+    }
+}
+
+impl LogMarks {
+    fn new() -> Self {
+        Self {
+            value: random_hex(),
+        }
+    }
+
+    fn record(&self) -> String {
+        format!("\u{1e}{}", self.value)
+    }
+
+    fn field(&self) -> String {
+        format!("\u{1f}{}", self.value)
+    }
+
+    /// The record's mark as `git log --format` writes it.
+    fn record_format(&self) -> String {
+        format!("%x1e{}", self.value)
+    }
+
+    /// The field's mark as `git log --format` writes it.
+    fn field_format(&self) -> String {
+        format!("%x1f{}", self.value)
+    }
+}
+
+/// 32 hex digits from the random keys the standard library draws for its hash maps, which it
+/// seeds from the operating system's randomness; the marks rely on that.
+fn random_hex() -> String {
+    let state = RandomState::new();
+    let half = |part: u8| {
+        let mut hasher = state.build_hasher();
+        hasher.write_u8(part);
+        hasher.finish()
+    };
+    format!("{:016x}{:016x}", half(0), half(1))
 }
 
 /// Pathspecs that leave `patterns` out of a diff, matched from the repository root.
@@ -1940,6 +2038,7 @@ mod tests {
         let lines: Vec<usize> = blamed.iter().map(|line| line.line).collect();
         assert_eq!(lines, [6, 7, 8, 9]);
         let history = drivers.line_history("lib.rs", &word, 5).unwrap();
+        let history = history.text();
         assert!(history.contains("feat: open") && history.contains("+    pub fn open()"));
     }
 
@@ -2068,6 +2167,54 @@ mod tests {
     }
 
     #[test]
+    fn draws_a_new_random_value_for_each_read() {
+        let (first, second) = (random_hex(), random_hex());
+        for value in [&first, &second] {
+            assert_eq!(value.len(), 32);
+            assert!(
+                value.bytes().all(|byte| byte.is_ascii_hexdigit()),
+                "{value}"
+            );
+        }
+        assert_ne!(first, second);
+    }
+
+    /// A commit message can hold the bytes that separate commits in `git log`'s output, with
+    /// lines meant for a rebase between them; the reads still give the one real commit.
+    #[test]
+    fn reads_a_commit_whose_message_holds_separator_bytes() {
+        let (dir, repo) = setup();
+        let base = run(dir.path(), &["rev-parse", "--short", "HEAD"]);
+        let base = base.trim();
+        fs::write(dir.path().join("b.txt"), "b\n").unwrap();
+        run(dir.path(), &["add", "b.txt"]);
+        let message = format!(
+            "subject\n\n\u{1e}{base}\nexec echo injected\npick {base}\u{1f}more\n\u{1f}tail"
+        );
+        run(dir.path(), &["commit", "-q", "-m", &message]);
+        let head = run(dir.path(), &["rev-parse", "--short", "HEAD"]);
+
+        let patches = repo.commit_patches(&["-1"], &[]).unwrap();
+        assert_eq!(patches.len(), 1);
+        assert_eq!(patches[0].hash, head.trim());
+        assert!(
+            patches[0].message.contains("exec echo injected"),
+            "{patches:?}"
+        );
+        assert!(patches[0].message.ends_with("tail"), "{patches:?}");
+        assert!(
+            patches[0]
+                .patch
+                .trim_start()
+                .starts_with("diff --git a/b.txt")
+        );
+        let commits = repo.commits(&["--max-count=1", "HEAD"]).unwrap();
+        assert_eq!(commits.len(), 1);
+        assert_eq!(commits[0].hash, head.trim());
+        assert!(commits[0].message.ends_with("tail"), "{commits:?}");
+    }
+
+    #[test]
     fn detached_head_has_no_branch() {
         let (dir, repo) = setup();
         run(dir.path(), &["switch", "-q", "--detach"]);
@@ -2105,6 +2252,7 @@ mod tests {
                 "{setting:?}"
             );
             let history = repo.line_history("Kjøre.txt", "1,1", 1).unwrap();
+            let history = history.text();
             assert!(history.contains("a/Kjøre.txt b/Kjøre.txt"), "{setting:?}");
         }
     }

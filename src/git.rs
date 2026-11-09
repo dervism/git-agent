@@ -568,6 +568,21 @@ impl Repo {
         self.diff_names(&["diff", "--name-only", "--diff-filter=U", "-z"])
     }
 
+    /// The paths `commit` changes, with both paths of a rename: against its first parent, or
+    /// all of them for a first commit.
+    pub fn files_of(&self, commit: &str) -> Result<Vec<String>> {
+        self.nul_list(&[
+            "diff-tree",
+            "-r",
+            "-z",
+            "--name-only",
+            "--no-renames",
+            "--no-commit-id",
+            "--root",
+            commit,
+        ])
+    }
+
     /// The paths that differ between two commits or trees, with both paths of a rename,
     /// and submodules whatever their `ignore` setting says.
     pub fn changed_between(&self, from: &str, to: &str) -> Result<Vec<String>> {
@@ -758,17 +773,26 @@ impl Repo {
     }
 
     /// The commits in `range` (`git log` arguments, e.g. `main..HEAD`) with
-    /// their patches, without the diffs of files matching `exclude`.
+    /// their patches, without the diffs of files matching `exclude`. Every commit is there,
+    /// whatever `log.follow` says, and one that changes only such files has an empty patch. A
+    /// first commit shows its diff, and a submodule shows the commit it points to.
     pub fn commit_patches(&self, range: &[&str], exclude: &[String]) -> Result<Vec<CommitPatch>> {
         let excludes = exclude_pathspecs(exclude);
         let marks = LogMarks::new();
         let format = marks.patch_format();
         let mut args = vec![
+            "-c",
+            "log.follow=false",
             "log",
+            "--full-history",
+            "--sparse",
+            "--root",
             "--patch",
             "--no-color",
             "--no-ext-diff",
             "--irreversible-delete",
+            "--ignore-submodules=none",
+            "--submodule=short",
             &format,
         ];
         args.extend_from_slice(range);
@@ -1375,6 +1399,8 @@ fn rebase(dir: &Path, base: Option<&str>, todo_path: &Path) -> Result<String> {
         NO_HOOKS,
         "-c",
         "rebase.updateRefs=false",
+        "-c",
+        "rebase.missingCommitsCheck=error",
         "rebase",
         "--interactive",
         "--empty=keep",
@@ -2951,5 +2977,111 @@ mod tests {
         assert_eq!(run(dir, &["rev-parse", "HEAD^{commit}"]), other);
 
         assert_eq!(repo.resolve("HEAD").unwrap().as_deref(), Some(head.trim()));
+    }
+
+    /// Tidy reads every commit, and one that changes only excluded files keeps its place, with
+    /// an empty patch and its files named by `files_of`.
+    #[test]
+    fn reads_a_commit_that_changes_only_excluded_files() {
+        let (dir, repo) = setup();
+        let dir = dir.path();
+        fs::write(dir.join("Cargo.lock"), "v1\n").unwrap();
+        run(dir, &["add", "Cargo.lock"]);
+        run(dir, &["commit", "-q", "-m", "chore: bump the lockfile"]);
+        fs::write(dir.join("lib.rs"), "fn b() {}\n").unwrap();
+        run(dir, &["commit", "-q", "-am", "feat: b"]);
+        let exclude = ["Cargo.lock".to_owned()];
+
+        let patches = repo.commit_patches(&["HEAD~2..HEAD"], &exclude).unwrap();
+
+        let subjects: Vec<&str> = patches
+            .iter()
+            .map(|commit| commit.message.as_str())
+            .collect();
+        assert_eq!(subjects, ["feat: b", "chore: bump the lockfile"]);
+        assert!(patches[1].patch.trim().is_empty(), "{:?}", patches[1].patch);
+        assert!(patches[0].patch.contains("+fn b() {}"));
+        assert_eq!(repo.files_of(&patches[1].hash).unwrap(), ["Cargo.lock"]);
+        assert_eq!(repo.files_of(&patches[0].hash).unwrap(), ["lib.rs"]);
+        let first = run(dir, &["rev-list", "--max-parents=0", "HEAD"]);
+        assert_eq!(repo.files_of(first.trim()).unwrap(), ["lib.rs"]);
+    }
+
+    /// The commits tidy reads, as `git rev-list` lists them, and the first commit's diff,
+    /// whatever `log.follow` and `log.showRoot` say, with an empty commit and commits that change
+    /// only the lockfile among them.
+    #[test]
+    fn reads_every_commit_to_tidy_whatever_the_users_log_settings() {
+        let (dir, repo) = setup();
+        let dir = dir.path();
+        run(dir, &["commit", "-q", "--allow-empty", "-m", "empty"]);
+        for (text, subject) in [("v2\n", "lock v2"), ("v1\n", "lock v1")] {
+            fs::write(dir.join("Cargo.lock"), text).unwrap();
+            run(dir, &["add", "Cargo.lock"]);
+            run(dir, &["commit", "-q", "-m", subject]);
+        }
+        run(dir, &["config", "log.follow", "true"]);
+        run(dir, &["config", "log.showRoot", "false"]);
+        let listed = run(dir, &["rev-list", "--count", "HEAD"]);
+        assert_eq!(listed.trim(), "4");
+
+        for exclude in [vec![], vec!["Cargo.lock".to_owned()]] {
+            let patches = repo.commit_patches(&["HEAD"], &exclude).unwrap();
+            let subjects: Vec<&str> = patches
+                .iter()
+                .map(|commit| commit.message.as_str())
+                .collect();
+            assert_eq!(
+                subjects,
+                ["lock v1", "lock v2", "empty", "init"],
+                "{exclude:?}"
+            );
+            assert!(patches[3].patch.contains("+fn a() {}"), "{exclude:?}");
+            assert!(patches[2].patch.trim().is_empty());
+        }
+    }
+
+    /// A commit that only moves a submodule shows the commits it moves between, whatever
+    /// `diff.ignoreSubmodules` and `diff.submodule` say, so tidy doesn't take it for one without a
+    /// diff.
+    #[test]
+    fn reads_a_commit_that_moves_a_submodule_whatever_the_users_settings() {
+        let (dir, repo, _library, moved) = test_support::with_submodule();
+        test_support::move_pointer(dir.path(), &moved);
+        run(dir.path(), &["add", "library"]);
+        run(dir.path(), &["commit", "-q", "-m", "move the library"]);
+        run(dir.path(), &["config", "diff.ignoreSubmodules", "all"]);
+        run(dir.path(), &["config", "diff.submodule", "log"]);
+
+        let patches = repo.commit_patches(&["HEAD~1..HEAD"], &[]).unwrap();
+
+        assert_eq!(patches.len(), 1);
+        let shown = format!("+Subproject commit {moved}");
+        assert!(patches[0].patch.contains(&shown), "{:?}", patches[0].patch);
+    }
+
+    /// A todo that leaves a commit out fails, rather than drop the commit while the tree stays
+    /// the same.
+    #[test]
+    fn refuses_a_rewrite_that_leaves_a_commit_out() {
+        let (dir, repo) = setup();
+        let base = repo.resolve("HEAD").unwrap().unwrap();
+        run(
+            dir.path(),
+            &["commit", "-q", "--allow-empty", "-m", "empty"],
+        );
+        fs::write(dir.path().join("lib.rs"), "fn b() {}\n").unwrap();
+        run(dir.path(), &["commit", "-q", "-am", "feat: b"]);
+        let commits = repo.commits_after(&base).unwrap();
+        let tip = repo.resolve("HEAD").unwrap().unwrap();
+
+        let todo = format!("pick {} feat: b\n", commits[1]);
+        let error = repo.rewrite(&tip, Some(&base), &todo).unwrap_err();
+
+        assert!(error.to_string().contains("rebase"), "{error}");
+        assert_eq!(repo.resolve("HEAD").unwrap().unwrap(), tip);
+        assert_eq!(repo.git(&["worktree", "list"]).unwrap().lines().count(), 1);
+        let whole = format!("pick {}\npick {}\n", commits[0], commits[1]);
+        assert!(repo.rewrite(&tip, Some(&base), &whole).is_ok());
     }
 }

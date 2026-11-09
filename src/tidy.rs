@@ -34,12 +34,29 @@ pub struct Commit {
     pub message: String,
     /// The patch, without the diffs of excluded files.
     pub patch: String,
+    /// The files the commit changes, when it has no diff to show.
+    pub left_out: Vec<String>,
 }
 
 impl Commit {
     pub fn subject(&self) -> &str {
         self.message.lines().next().unwrap_or_default()
     }
+
+    /// Whether the commit has no diff to show the model.
+    pub fn shows_no_patch(&self) -> bool {
+        self.patch.trim().is_empty()
+    }
+}
+
+/// Whether `commits`, oldest first, are the commits of `hashes`, git's full hashes in the same
+/// order. A commit missing from them would drop out of the rebase.
+pub fn lists_all(hashes: &[String], commits: &[Commit]) -> bool {
+    hashes.len() == commits.len()
+        && hashes
+            .iter()
+            .zip(commits)
+            .all(|(hash, commit)| !commit.short.is_empty() && hash.starts_with(&commit.short))
 }
 
 /// The commits after tidying, in order.
@@ -325,6 +342,9 @@ pub fn describe(commits: &[Commit], room: usize) -> String {
                 let _ = writeln!(head, "    {line}");
             }
             head.push_str("Changes:\n");
+            if commit.shows_no_patch() {
+                head.push_str(&without_patch(&commit.left_out));
+            }
             head
         })
         .collect();
@@ -339,14 +359,28 @@ pub fn describe(commits: &[Commit], room: usize) -> String {
     let mut out = String::new();
     for ((head, commit), share) in heads.iter().zip(commits).zip(shares) {
         out.push_str(head);
-        if commit.patch.trim().is_empty() {
-            out.push_str("(no changes shown)\n");
-        } else {
+        if !commit.shows_no_patch() {
             out.push_str(&fit::fit(&commit.patch, share).text);
         }
         out.push('\n');
     }
     out
+}
+
+/// The most files named for a commit without a diff to show.
+const MOST_NAMED: usize = 10;
+
+/// What stands for the patch of a commit that has none to show: the first few files it
+/// changes, if it changes any.
+fn without_patch(files: &[String]) -> String {
+    if files.is_empty() {
+        return "(no changes shown)\n".to_owned();
+    }
+    let mut named = files[..files.len().min(MOST_NAMED)].join(", ");
+    if files.len() > MOST_NAMED {
+        let _ = write!(named, ", and {} more", files.len() - MOST_NAMED);
+    }
+    format!("(no diff shown; it changes {named})\n")
 }
 
 /// The `git rebase -i` todo list that carries out `plan`. `messages` holds,
@@ -398,6 +432,7 @@ mod tests {
                     "diff --git a/f{index}.rs b/f{index}.rs\n--- a/f{index}.rs\n+++ b/f{index}.rs\n\
                      @@ -1 +1 @@\n-old\n+new {index}\n"
                 ),
+                left_out: Vec::new(),
             })
             .collect()
     }
@@ -513,6 +548,70 @@ mod tests {
         assert!(text.len() < 6000 + 500, "{} bytes", text.len());
         assert!(text.contains("Commit 2 (c000001):\n    wip\n"));
         assert!(text.contains("+new 0"));
+    }
+
+    /// A commit that changes only files whose diffs are left out, such as lockfiles, is named
+    /// by its files rather than shown as an empty change.
+    #[test]
+    fn names_the_files_of_a_commit_whose_diffs_are_all_left_out() {
+        let mut commits = commits(&["feat: add cache", "chore: bump", "chore: empty"]);
+        commits[1].patch = String::new();
+        commits[1].left_out = vec!["Cargo.lock".to_owned(), "web/package-lock.json".to_owned()];
+        commits[2].patch = "\n".to_owned();
+
+        let text = describe(&commits, 100_000);
+
+        assert!(
+            text.contains(
+                "Commit 2 (c000001):\n    chore: bump\nChanges:\n(no diff shown; it changes \
+                 Cargo.lock, web/package-lock.json)\n\n"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "Commit 3 (c000002):\n    chore: empty\nChanges:\n(no changes shown)\n\n"
+            ),
+            "{text}"
+        );
+        assert!(text.contains("+new 0"));
+    }
+
+    #[test]
+    fn names_at_most_ten_files_of_a_commit_without_a_diff() {
+        let files: Vec<String> = (1..=12)
+            .map(|n| format!("pkg{n}/package-lock.json"))
+            .collect();
+        assert_eq!(
+            without_patch(&files[..10]),
+            format!("(no diff shown; it changes {})\n", files[..10].join(", "))
+        );
+        assert_eq!(
+            without_patch(&files),
+            format!(
+                "(no diff shown; it changes {}, and 2 more)\n",
+                files[..10].join(", ")
+            )
+        );
+        assert_eq!(without_patch(&[]), "(no changes shown)\n");
+    }
+
+    #[test]
+    fn checks_that_the_commits_read_are_the_commits_to_tidy() {
+        let commits = commits(&["feat: add cache", "wip"]);
+        let hashes = vec![
+            format!("c000000{}", "a".repeat(33)),
+            format!("c000001{}", "b".repeat(33)),
+        ];
+        assert!(lists_all(&hashes, &commits));
+        assert!(!lists_all(&hashes[..1], &commits));
+        assert!(!lists_all(&hashes, &commits[..1]));
+        let swapped = [hashes[1].clone(), hashes[0].clone()];
+        assert!(!lists_all(&swapped, &commits));
+        let mut unnamed = commits.clone();
+        unnamed[0].short.clear();
+        assert!(!lists_all(&hashes, &unnamed));
+        assert!(lists_all(&[], &[]));
     }
 
     #[test]

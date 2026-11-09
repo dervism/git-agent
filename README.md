@@ -570,7 +570,8 @@ export GIT_AGENT_API_KEY="your-api-key"
 
 Before git-agent sends anything to the model, it looks for secrets in it and replaces
 each one with `[REDACTED]`. That covers the diff, the commit messages of pull requests
-and explained commits, and the code and history that `git agent why` sends. The model
+and explained commits, the commits that `git agent tidy` sends, and the code and
+history that `git agent why` sends. The model
 still sees that something was there, but the secret itself never goes into a prompt,
 whichever server you use.
 
@@ -586,15 +587,21 @@ error: the changes add what look like secrets, so git-agent didn't commit them:
 Take them out of the changes. If they aren't real secrets, add --on-secrets warn, or choose Warn under Secrets in `git agent config`.
 ```
 
-Before every push, git-agent checks each commit the push would send, including its
-message, because a secret that a later commit removes is still in the history.
-`git agent pr` checks every commit on the branch the same way before it writes the
-pull request. A secret on a line that your change leaves alone or removes doesn't stop
-anything; git-agent only lists it.
+The checks read what git publishes, which is more than the model reads: every file git
+shows as text, including lockfiles and the other files that `exclude` keeps out of the
+prompt, and what a merge commit adds itself.
+
+Before every push, after any rebase onto the remote, git-agent checks each commit the
+push would send, including its message, because a secret that a later commit removes
+is still in the history. `git agent pr` checks every commit on the branch the same way
+before it writes the pull request. A secret on a line that your change leaves alone or
+removes doesn't stop anything; git-agent only lists it.
 
 To be warned instead, set `on_secrets = "warn"` in the config file, choose Warn under
 Secrets in `git agent config`, or pass `--on-secrets warn` for one run. git-agent then
 lists the secrets and carries on, and the model still gets `[REDACTED]` in their place.
+Secrets in files the model doesn't read, such as lockfiles, are listed too, and a push
+lists every secret its commits add, even one the commit already listed.
 
 ### What git-agent recognizes
 
@@ -755,7 +762,9 @@ GIT_AGENT_BASE_URL=http://localhost:11434/v1 git agent -m llama3.2   # Ollama
 ### Notes
 
 - Files matching `exclude` (by default `Cargo.lock`, `package-lock.json` and similar)
-  appear in the list of changed files sent to the model, but their diffs don't.
+  appear in the list of changed files sent to the model, but their diffs don't. The
+  secret checks still read them, and `git agent tidy` names the files of a commit that
+  changes only such files.
   Deleted files are sent by name, without their old content.
 - git-agent removes reasoning blocks (`<think>…</think>`) and code fences around the
   model's reply.

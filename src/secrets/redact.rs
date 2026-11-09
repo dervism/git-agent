@@ -48,6 +48,9 @@ pub struct Redacted {
 enum Check {
     /// A format that is a secret by itself: only placeholders are skipped.
     Token,
+    /// A token, unless it's one of the names OpenSSH gives its algorithms: those end with
+    /// `@openssh.com`, and the names for security keys start with `sk-` as an API key does.
+    TokenNotOpenSshName,
     /// A value that may be code or a setting: it also needs letters and digits,
     /// and no characters that only code uses.
     Value,
@@ -126,8 +129,8 @@ const RULES: &[Rule] = &[
     Rule {
         kind: "API key",
         needles: &["sk-"],
-        pattern: r"\b(?P<secret>sk-[A-Za-z0-9_-]{20,})",
-        check: Check::Token,
+        pattern: r"\b(?P<secret>sk-[A-Za-z0-9_-]{20,})(?:@openssh\.com\b)?",
+        check: Check::TokenNotOpenSshName,
     },
     Rule {
         kind: "Google API key",
@@ -175,7 +178,7 @@ const RULES: &[Rule] = &[
         kind: "password in a URL",
         needles: &["://"],
         // The host is part of the match, so placeholders such as example.com are skipped.
-        pattern: r#"\b[A-Za-z][A-Za-z0-9+.-]*://[^\s:/@]*:(?P<secret>[^\s/@]+)@[^\s/:?#"'`]+"#,
+        pattern: r#"\b[A-Za-z][A-Za-z0-9+.-]*://[^\s:/@]*:(?P<secret>[^\s/@]+)@[^\s/:?#"'`,;]+"#,
         check: Check::Token,
     },
     // A token as the user name of a web address, as some package registries and GitHub write
@@ -184,7 +187,7 @@ const RULES: &[Rule] = &[
     Rule {
         kind: "token in a URL",
         needles: &["://"],
-        pattern: r#"\b(?:(?:git|registry|sparse)\+)?https?://(?P<secret>[A-Za-z0-9]{20,}|[A-Za-z0-9_-]{32,})(?::x-oauth-basic|:)?@[^\s/:?#"'`]+(?::[0-9]+)?(?P<path>/[^\s"'`]*)?"#,
+        pattern: r#"\b(?:(?:git|registry|sparse)\+)?https?://(?P<secret>[A-Za-z0-9]{20,}|[A-Za-z0-9_-]{32,})(?::x-oauth-basic|:)?@[^\s/:?#"'`,;]+(?::[0-9]+)?(?P<path>/[^\s"'`]*)?"#,
         check: Check::UrlUser,
     },
     Rule {
@@ -617,6 +620,7 @@ fn plausible(secret: &str, whole: &str, path: &str, check: Check) -> bool {
         "{",
         "<",
     ];
+    // Also with the `]` that ends an optional part in usage text, as in `user[:pass]@host`.
     const PLACEHOLDERS: &[&str] = &[
         "password",
         "passwd",
@@ -629,7 +633,7 @@ fn plausible(secret: &str, whole: &str, path: &str, check: Check) -> bool {
     ];
     let whole = whole.to_ascii_lowercase();
     if PLACEHOLDER_PARTS.iter().any(|part| whole.contains(part))
-        || PLACEHOLDERS.contains(&secret.to_ascii_lowercase().as_str())
+        || PLACEHOLDERS.contains(&secret.trim_end_matches(']').to_ascii_lowercase().as_str())
     {
         return false;
     }
@@ -641,18 +645,40 @@ fn plausible(secret: &str, whole: &str, path: &str, check: Check) -> bool {
     }
     match check {
         Check::Token => true,
+        Check::TokenNotOpenSshName => !whole.ends_with("@openssh.com"),
         Check::Value => is_value(secret),
         Check::UrlUser => is_value(secret) && !is_public_dsn(secret, path),
     }
 }
 
 /// Whether `secret` could be a setting's value rather than code or a package's name: it has
-/// letters and digits, no characters that only code uses, and names no package.
+/// letters and digits, no characters that only code uses, names no package, and isn't the rest of
+/// an Objective-C selector.
 fn is_value(secret: &str) -> bool {
     secret.bytes().any(|byte| byte.is_ascii_digit())
         && secret.bytes().any(|byte| byte.is_ascii_alphabetic())
         && !secret.contains(['(', ')', '[', ']', '{', '}', '<', '>', '$', '%', '\\'])
+        && !is_selector_parts(secret)
         && !is_package_reference(secret)
+}
+
+/// Whether `value` is the rest of an Objective-C selector: two or more names, each ending with
+/// `:`, as in `notifyIdMS:isDBRv2:reply:`. One name with a `:` after it can be a value.
+fn is_selector_parts(value: &str) -> bool {
+    let Some(names) = value.strip_suffix(':') else {
+        return false;
+    };
+    let names: Vec<&str> = names.split(':').collect();
+    names.len() >= 2 && names.iter().all(|name| is_identifier(name))
+}
+
+/// Whether `text` is a name as code writes one: a letter or `_`, then letters, digits and `_`.
+fn is_identifier(text: &str) -> bool {
+    let mut bytes = text.bytes();
+    bytes
+        .next()
+        .is_some_and(|first| first.is_ascii_alphabetic() || first == b'_')
+        && bytes.all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
 }
 
 /// Whether a token in a URL is a Sentry DSN's public key: 32 hex digits, with a project number
@@ -736,6 +762,13 @@ mod tests {
             .take(len)
             .collect()
     }
+
+    /// OpenSSH's names for two of its security key algorithms, and usage text with a password
+    /// one may leave out. Each is put together from two parts, so that a git-agent older than
+    /// 0.12.0, whose check takes them for secrets, still commits this file.
+    const SK_ECDSA_CERT: &str = concat!("sk", "-ecdsa-sha2-nistp256-cert-v01@openssh.com");
+    const SK_ED25519_CERT: &str = concat!("sk", "-ssh-ed25519-cert-v01@openssh.com");
+    const AFP_USAGE: &str = concat!("afp:", "//user[:pass]@host");
 
     fn redacted(line: &str) -> (String, Vec<String>) {
         let result = text(line, "test");
@@ -1294,5 +1327,79 @@ mod tests {
         assert_eq!(start("@@@ -4,2 -7 +9,3 @@@ fn main\n"), (vec![4, 7], 9));
         assert_eq!(start("@@@@ -1 -2 -3 +5 @@@@\n"), (vec![1, 2, 3], 5));
         assert_eq!(start("@@\n"), (vec![1], 1));
+    }
+
+    /// Text that binaries hold and that isn't a secret: OpenSSH's names for its algorithms, usage
+    /// text with a password one may leave out, and the parts of an Objective-C selector.
+    #[test]
+    fn leaves_names_usage_and_selectors_alone() {
+        for line in [
+            SK_ECDSA_CERT.to_string(),
+            format!("webauthn-{SK_ECDSA_CERT}"),
+            format!("ssh-ed25519-cert-v01@openssh.com,{SK_ED25519_CERT}"),
+            format!("usage: mount_afp {AFP_USAGE}/volume"),
+            "reset:idmsTargetContext:idmsCuttlefishPassword:notifyIdMS:isDBRv2:accountIsW:reply:"
+                .to_string(),
+        ] {
+            let (kept, kinds) = redacted(&line);
+            assert!(kinds.is_empty(), "{line}: {kinds:?}");
+            assert_eq!(kept, line);
+        }
+    }
+
+    /// The same rules still find the secrets beside such text, and those the skips must not take
+    /// for it: a key before an `@` that isn't OpenSSH's, a password with brackets in it or before
+    /// an IPv6 host, and a value with one `:` after it.
+    #[test]
+    fn finds_keys_passwords_and_values_beside_names_and_selectors() {
+        let key = format!("sk-proj-{}", noise(40));
+        let password = noise(16);
+        let cases = [
+            (format!("OPENAI_API_KEY={key}"), "API key"),
+            (format!("{SK_ED25519_CERT},{key}"), "API key"),
+            (format!("{key},{SK_ECDSA_CERT}"), "API key"),
+            (format!("{key}@corp.net"), "API key"),
+            (format!("wss://{key}@stream.corp.net"), "API key"),
+            (
+                format!("afp://user:{password}@files.corp.net/share"),
+                "password in a URL",
+            ),
+            (
+                format!("smb://admin[:{password}]@files.corp.net"),
+                "password in a URL",
+            ),
+            (
+                format!("postgres://app:{password}@[::1]:5432/db"),
+                "password in a URL",
+            ),
+            (
+                format!("postgres://app:Xy7[:{password}@db.corp.net"),
+                "password in a URL",
+            ),
+            (format!("password: {password}"), "password value"),
+            (format!("token={password}: unauthorized"), "token value"),
+            (format!("token={}:{}", noise(12), noise(12)), "token value"),
+        ];
+        for (line, kind) in cases {
+            let (_, kinds) = redacted(&line);
+            assert_eq!(kinds, [kind], "{line}");
+        }
+    }
+
+    /// Usage text beside a real address, or a list of addresses, as a failover broker's setting
+    /// writes them, leaves none of the passwords out.
+    #[test]
+    fn finds_every_password_in_a_line_of_addresses() {
+        let password = noise(16);
+        let usage = format!("{AFP_USAGE},").repeat(10);
+        for line in [
+            format!("{usage}afp://user:{password}@files.corp.net"),
+            format!("amqp://app:{password}@mq1.corp.net;amqp://app:{password}@mq2.corp.net"),
+            format!("amqp://app:{password}@mq1.corp.net,amqp://app:{password}@mq2.corp.net"),
+        ] {
+            let (kept, kinds) = redacted(&line);
+            assert!(!kept.contains(&password), "{kept}");
+            assert!(!kinds.is_empty(), "{line}");
+        }
     }
 }

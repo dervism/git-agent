@@ -43,7 +43,7 @@ fn listed(names_to_show: &[String]) -> String {
 
 /// What `--all` stages for, which changes what its notes say.
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub enum For {
+pub enum Purpose {
     Commit,
     Split,
 }
@@ -65,13 +65,17 @@ pub enum Staged {
 ///
 /// A hidden submodule pointer the user staged stays exactly as they staged it, as does a
 /// staged removal of one, whatever the work tree holds now; those the work tree has moved on
-/// from get a note, worded for what the staging is `for_`. Says so if the user quit.
-pub fn stage_all_and_report(repo: &Repo, asking: Option<&dyn Person>, for_: For) -> Result<Staged> {
+/// from get a note, worded for its `purpose`. Says so if the user quit.
+pub fn stage_all_and_report(
+    repo: &Repo,
+    asking: Option<&dyn Person>,
+    purpose: Purpose,
+) -> Result<Staged> {
     let Some(kept) = stage_all(repo, asking)? else {
         ui::info("Nothing staged or committed.");
         return Ok(Staged::Quit);
     };
-    report_kept(&kept, for_);
+    report_kept(&kept, purpose);
     Ok(Staged::All)
 }
 
@@ -220,9 +224,9 @@ fn kept_and_moved_on(repo: &Repo, kept: &[String]) -> Result<Kept> {
 /// Says which pointers `--all` kept where the user staged them though the work tree has moved
 /// on, as [`stage_all`] returns them. A commit holds the staged commit, and a split leaves the
 /// pointer staged.
-fn report_kept(kept: &Kept, for_: For) {
+fn report_kept(kept: &Kept, purpose: Purpose) {
     if !kept.moved_on.is_empty() {
-        ui::info(moved_on_note(&kept.moved_on, for_));
+        ui::info(moved_on_note(&kept.moved_on, purpose));
     }
     if !kept.replaced.is_empty() {
         ui::info(replaced_note(&kept.replaced));
@@ -328,9 +332,9 @@ pub fn hidden_pointers(repo: &Repo, commits_all: bool) -> Result<HiddenPointers>
 /// Says what happens to the [`hidden_pointers`]: `git agent` commits those the user
 /// staged, and leaves the others out. A split leaves them all out, since its commits only
 /// hold what its plan shows.
-pub fn report_hidden_pointers(hidden: &HiddenPointers, for_: For) {
+pub fn report_hidden_pointers(hidden: &HiddenPointers, purpose: Purpose) {
     if !hidden.staged.is_empty() {
-        ui::warn(hidden_staged_note(&hidden.staged, for_));
+        ui::warn(hidden_staged_note(&hidden.staged, purpose));
     }
     if !hidden.changed.is_empty() {
         ui::info(hidden_changed_note(&hidden.changed));
@@ -339,10 +343,10 @@ pub fn report_hidden_pointers(hidden: &HiddenPointers, for_: For) {
 
 const HIDDEN: &str = "a submodule whose `ignore` setting hides the change from the diff";
 
-fn hidden_staged_note(pointers: &[String], for_: For) -> String {
-    let what_happens = match for_ {
-        For::Split => "The split's commits leave it out, and it stays staged.".to_owned(),
-        For::Commit => format!(
+fn hidden_staged_note(pointers: &[String], purpose: Purpose) -> String {
+    let what_happens = match purpose {
+        Purpose::Split => "The split's commits leave it out, and it stays staged.".to_owned(),
+        Purpose::Commit => format!(
             "You staged it, so the commit includes it; `git restore --staged -- {}` takes it out.",
             quoted(pointers)
         ),
@@ -377,14 +381,14 @@ fn replaced_note(pointers: &[String]) -> String {
     )
 }
 
-fn moved_on_note(pointers: &[String], for_: For) -> String {
+fn moved_on_note(pointers: &[String], purpose: Purpose) -> String {
     let kept = format!(
         "   --all kept {} at the commit you staged, though the submodule has moved on since.",
         joined_names(pointers)
     );
-    match for_ {
-        For::Split => kept,
-        For::Commit => format!(
+    match purpose {
+        Purpose::Split => kept,
+        Purpose::Commit => format!(
             "{kept} To commit where it is now, stage it with `git add -- {}`.",
             quoted(pointers)
         ),
@@ -441,7 +445,7 @@ mod tests {
     /// What `--all` stages in [`with_an_env_file`] with `asking`, and the names it staged.
     fn staged_with(asking: Option<&dyn Person>) -> (Staged, Vec<String>, TempDir) {
         let (dir, repo) = with_an_env_file();
-        let staged = stage_all_and_report(&repo, asking, For::Commit).unwrap();
+        let staged = stage_all_and_report(&repo, asking, Purpose::Commit).unwrap();
         let names = run(dir.path(), &["diff", "--cached", "--name-only"]);
         let names = names.lines().map(str::to_owned).collect();
         (staged, names, dir)
@@ -676,9 +680,9 @@ mod tests {
     fn tells_a_split_that_it_leaves_a_staged_pointer_out() {
         let names = ["library".to_owned()];
         assert!(
-            hidden_staged_note(&names, For::Split).contains("The split's commits leave it out")
+            hidden_staged_note(&names, Purpose::Split).contains("The split's commits leave it out")
         );
-        assert!(hidden_staged_note(&names, For::Commit).contains("so the commit includes it"));
+        assert!(hidden_staged_note(&names, Purpose::Commit).contains("so the commit includes it"));
     }
 
     #[test]
@@ -700,10 +704,10 @@ mod tests {
         let odd = ["a\nb\u{1b}[2J".to_owned()];
         assert_eq!(listed(&odd), "   a\\nb\\033[2J");
         assert!(hidden_changed_note(&odd).starts_with("a\\nb\\033[2J changed"));
-        assert!(hidden_staged_note(&odd, For::Commit).starts_with("a\\nb\\033[2J is staged"));
+        assert!(hidden_staged_note(&odd, Purpose::Commit).starts_with("a\\nb\\033[2J is staged"));
         assert!(left_out_by_all_note(&odd).contains("left out a\\nb\\033[2J,"));
-        assert!(moved_on_note(&odd, For::Commit).contains("kept a\\nb\\033[2J at the commit"));
-        assert!(moved_on_note(&odd, For::Commit).contains("git add -- 'a\\nb\\033[2J'"));
+        assert!(moved_on_note(&odd, Purpose::Commit).contains("kept a\\nb\\033[2J at the commit"));
+        assert!(moved_on_note(&odd, Purpose::Commit).contains("git add -- 'a\\nb\\033[2J'"));
         assert!(replaced_note(&odd).contains("kept a\\nb\\033[2J as you staged it"));
     }
 
@@ -748,8 +752,8 @@ mod tests {
     #[test]
     fn tells_a_commit_how_to_take_the_newer_checkout_and_a_split_only_what_it_kept() {
         let names = ["library".to_owned()];
-        assert!(moved_on_note(&names, For::Commit).contains("To commit where it is now"));
-        let split = moved_on_note(&names, For::Split);
+        assert!(moved_on_note(&names, Purpose::Commit).contains("To commit where it is now"));
+        let split = moved_on_note(&names, Purpose::Split);
         assert!(split.ends_with("has moved on since."), "{split}");
         assert!(!split.contains("git add"), "{split}");
     }

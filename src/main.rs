@@ -42,7 +42,7 @@ use secrets::redact::{self, Finding};
 use secrets::{added, check_outgoing, list_findings, reject_added, report_secrets, scan_commits};
 use server::{Message, ModelServer, Server};
 use split::signals::Stopped;
-use staging::{For, Staged};
+use staging::{Purpose, Staged};
 use std::fs;
 use std::io::{self, IsTerminal};
 use std::path::{Path, PathBuf};
@@ -344,13 +344,13 @@ fn changes_to_commit(
     asking: Option<&dyn Person>,
 ) -> Result<Option<ToCommit>> {
     staging::refuse_unresolved_conflicts(repo, "committing")?;
-    if args.all && staging::stage_all_and_report(repo, asking, For::Commit)? == Staged::Quit {
+    if args.all && staging::stage_all_and_report(repo, asking, Purpose::Commit)? == Staged::Quit {
         return Ok(None);
     }
     let found = repo.changes(&config.exclude)?;
     let commits_all = matches!(found, Some((Scope::Tracked, _)));
     let hidden = staging::hidden_pointers(repo, commits_all)?;
-    staging::report_hidden_pointers(&hidden, For::Commit);
+    staging::report_hidden_pointers(&hidden, Purpose::Commit);
     if found.is_none() {
         match repo.untracked_count()? {
             0 => ui::info("✨ No changes to commit."),

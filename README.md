@@ -141,6 +141,14 @@ git-agent shows the proposed message and waits for one of these keys:
 | `r` | Generate a new message |
 | `f` | Tell the model what to change, e.g. `f shorter, and mention the CLI flags` |
 | `q` | Quit without committing |
+| `y` | The same as `c` |
+| `n` | Quit without committing, the same as `q` |
+| `?` | Show the keys of the review you are in. `h` and `help` do the same |
+
+Every key can be typed in full (`commit`, `quit`, `yes`, `no`) and in any case. At every
+review, `y` picks its first choice. At a split's commit and at a tidied message, `n` turns
+down just that one and goes on; at the other reviews it quits. `?` ends with what `y` and `n`
+do in the review you are in.
 
 git-agent takes control and invisible characters out of the model's reply, and says so, so
 that what you review is what gets committed.
@@ -206,10 +214,10 @@ Without a description, git-agent names the branch after your uncommitted changes
 helps when you started on main and want the work on a branch of its own. The changes
 come along to the new branch.
 
-The review works like the one for commit messages: `c` creates the branch, `e` lets
-you edit the name in place, `r` asks for a new name and `f` tells the model what to
-change. git-agent won't create a branch with the name of an existing local or remote
-branch.
+The review works like the one for commit messages: `c` creates the branch, `e` lets you
+edit the name in place, `r` asks for a new name, `f` tells the model what to change, and `q`
+quits. `y` is the same as `c`, and `n` quits, as `q` does. git-agent won't create a branch
+with the name of an existing local or remote branch.
 
 The new branch starts at HEAD, or where `--from` says, and has no upstream yet. Its
 first push sets an upstream of the same name, so it never pushes to the branch it
@@ -259,7 +267,8 @@ whole files instead. Commits that only change documentation go last in a new pla
 ```
 
 `c` commits them one at a time, and you review each message. `a` makes all the commits
-without stopping at each message; you still see the messages as they are committed.
+without stopping at each message; you still see the messages as they are committed. `y`
+is the same as `c`, and `n` quits, as `q` does.
 `e` opens the plan in your git editor, where each part has a numbered
 line under its commit; move a line to move the part to another commit. `r` asks for a
 new plan, and `f` tells the model what to change, such as
@@ -270,8 +279,9 @@ new plan, and `f` tells the model what to change, such as
 git-agent then makes the commits in order. For each one it writes the message from
 that commit's own changes. If you chose `c` at the plan, you review each message like
 any other, with two differences: `c` commits, and `s` skips the commit and leaves
-its changes as they were. `q` stops; the commits made so far stay. Changes that aren't committed stay
-where they were, staged or not.
+its changes as they were. `y` is the same as `c`, and `n` is the same as `s`: it turns
+down this one commit and goes on to the next. `q` stops; the commits made so far stay.
+Changes that aren't committed stay where they were, staged or not.
 
 git-agent keeps to the changes as they were when you started: what you save or stage while
 it waits for the model stays uncommitted, and what you stage stays staged. If a commit
@@ -358,7 +368,8 @@ reword 237af0f asdf
 [a]ccept  [e]dit  [r]egenerate  [f]eedback  [q]uit  [?] ›
 ```
 
-A folded commit joins the commit on the line above it and keeps that commit's message.
+`y` is the same as `a`, and `n` quits, as `q` does. A folded commit joins the commit on the
+line above it and keeps that commit's message.
 Commits named `fixup! <subject>` or `squash! <subject>`, as `git commit --fixup` makes
 them, fold into the commit they name unless you tell the model otherwise. `e` opens
 the plan in your git editor as lines like those of `git rebase -i`: change a line's
@@ -367,7 +378,8 @@ Every commit must stay in the plan.
 
 After you accept the plan, git-agent writes the new messages one by one, and you review
 each like any commit message, except that `u` uses the new message and `k` keeps the
-old one. `q` stops before anything has changed.
+old one. `y` is the same as `u`, and `n` is the same as `k`: it turns down this one new
+message and goes on to the next new message. `q` stops before anything has changed.
 
 ### What git-agent changes
 
@@ -439,10 +451,10 @@ git agent pr -- --label bug   # pass extra arguments to `gh pr create`
 
 The first line of the proposal is the title, and the rest is the description in
 Markdown. The review works like the one for commit messages, except for its first two
-keys: `c` creates the pull request and `d` creates it as a draft. If the branch isn't
-on GitHub yet, or GitHub lacks some of its commits, git-agent pushes it first, the
-same way it pushes after a commit. Uncommitted changes are not part of the pull
-request, and git-agent tells you when you have some.
+keys: `c` creates the pull request and `d` creates it as a draft. `y` is the same as `c`,
+and `n` quits, as `q` does. If the branch isn't on GitHub yet, or GitHub lacks some of its
+commits, git-agent pushes it first, the same way it pushes after a commit. Uncommitted
+changes are not part of the pull request, and git-agent tells you when you have some.
 
 ### What it needs
 

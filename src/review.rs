@@ -38,8 +38,38 @@ pub struct Review<T: 'static> {
     /// plain acceptance first: it skips no later review and does nothing more, such as
     /// pushing.
     pub accept: &'static [Choice<T>],
+    /// What `n` does: turn down this proposal where the review has a choice for that, and
+    /// otherwise quit. A choice that isn't one of `accept` gets past the compiler;
+    /// `test_support::assert_typable` catches it, in the test of each review.
+    pub decline: Decline<T>,
     /// Help for quitting, e.g. "quit without committing".
     pub quit: &'static str,
+}
+
+/// What typing `n` does at a review.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Decline<T> {
+    /// Quits, like `q`: the review has no way to turn down a proposal but to stop.
+    Quit,
+    /// Picks this accept choice of the review, which turns down the proposal and goes on.
+    Choose(T),
+}
+
+impl<T: Copy> Decline<T> {
+    /// What typing `n` asks for.
+    fn action(self) -> Action<T> {
+        match self {
+            Decline::Quit => Action::Quit,
+            Decline::Choose(value) => Action::Accept(value),
+        }
+    }
+}
+
+impl<T: PartialEq> Review<T> {
+    /// The accept choice whose value is `value`, if the review has one.
+    fn choice_of(&self, value: &T) -> Option<&Choice<T>> {
+        self.accept.iter().find(|choice| choice.value == *value)
+    }
 }
 
 pub struct Choice<T> {
@@ -67,7 +97,7 @@ const HELP_ALIAS: &str = "?";
 enum Key {
     /// Picks the review's first accept choice.
     Yes,
-    /// Quits, like [`Key::Quit`].
+    /// Does what the review's [`Decline`] says.
     No,
     Edit,
     Regenerate,
@@ -103,7 +133,7 @@ impl Key {
     }
 
     fn letter(self) -> &'static str {
-        &self.word()[..1]
+        first_letter(self.word())
     }
 
     /// The key typed as `word`, in lower case, or as [`HELP_ALIAS`].
@@ -130,9 +160,16 @@ pub enum Typed<T> {
     Unknown(String),
 }
 
+/// The letter a choice or key is typed as: the first of its word.
+fn first_letter(word: &str) -> &str {
+    let length = word.chars().next().map_or(0, char::len_utf8);
+    &word[..length]
+}
+
 /// What `line` asks for at `review`. The first word picks the choice or the key, in any
 /// case, and the rest of the line is the feedback, as in `f shorter`. `y` picks the first
-/// accept choice, so a review without one doesn't know it.
+/// accept choice, so a review without one doesn't know it. `n` does what the review's
+/// [`Decline`] says.
 pub fn parse<T: Copy>(review: &Review<T>, line: &str) -> Typed<T> {
     let line = line.trim();
     let (word, rest) = line.split_once(' ').unwrap_or((line, ""));
@@ -148,14 +185,18 @@ pub fn parse<T: Copy>(review: &Review<T>, line: &str) -> Typed<T> {
         (Some(Key::Regenerate), _) => Typed::Action(Action::Regenerate),
         (Some(Key::Feedback), "") => Typed::FeedbackToFollow,
         (Some(Key::Feedback), feedback) => Typed::Action(Action::Refine(feedback.to_owned())),
-        (Some(Key::Quit | Key::No), _) => Typed::Action(Action::Quit),
+        (Some(Key::No), _) => Typed::Action(review.decline.action()),
+        (Some(Key::Quit), _) => Typed::Action(Action::Quit),
         (Some(Key::Help), _) => Typed::Help,
         (Some(Key::Yes) | None, _) => Typed::Unknown(word),
     }
 }
 
 /// Asks `person` what to do with the proposal. End of input counts as quitting.
-pub fn ask_action<T: Copy>(review: &Review<T>, person: &dyn Person) -> Result<Action<T>> {
+pub fn ask_action<T: Copy + PartialEq>(
+    review: &Review<T>,
+    person: &dyn Person,
+) -> Result<Action<T>> {
     let menu = menu(review);
     loop {
         let Some(line) = person.typed_at(&menu)? else {
@@ -192,7 +233,7 @@ pub fn accepted<T: Copy>(review: &Review<T>, choice: &str) -> Option<T> {
         .iter()
         .find(|accept| {
             choice == accept.word
-                || choice == &accept.word[..1]
+                || choice == first_letter(accept.word)
                 || accept.word.split(' ').next() == Some(choice)
         })
         .map(|accept| accept.value)
@@ -202,7 +243,14 @@ pub fn accepted<T: Copy>(review: &Review<T>, choice: &str) -> Option<T> {
 fn menu<T>(review: &Review<T>) -> String {
     let mut items: Vec<String> = menu_words(review)
         .into_iter()
-        .map(|word| format!("{}{}", ui::bold(&format!("[{}]", &word[..1])), &word[1..]))
+        .map(|word| {
+            let letter = first_letter(word);
+            format!(
+                "{}{}",
+                ui::bold(&format!("[{letter}]")),
+                &word[letter.len()..]
+            )
+        })
         .collect();
     items.push(ui::dim(&format!("[{HELP_ALIAS}]")));
     format!("{} ›", items.join("  "))
@@ -214,11 +262,11 @@ fn menu_words<T>(review: &Review<T>) -> Vec<&'static str> {
     choices.chain(Key::SHOWN.map(Key::word)).collect()
 }
 
-fn help<T>(review: &Review<T>) -> String {
+fn help<T: PartialEq>(review: &Review<T>) -> String {
     let mut lines: Vec<String> = review
         .accept
         .iter()
-        .map(|choice| format!("  {}  {}", &choice.word[..1], choice.help))
+        .map(|choice| format!("  {}  {}", first_letter(choice.word), choice.help))
         .collect();
     let feedback = Key::Feedback.letter();
     lines.push(format!("  {}  {}", Key::Edit.letter(), review.edit));
@@ -231,13 +279,39 @@ fn help<T>(review: &Review<T>) -> String {
         "  {feedback}  tell the model what to change, e.g. `{feedback} mention the API change`"
     ));
     lines.push(format!("  {}  {}", Key::Quit.letter(), review.quit));
+    lines.extend(yes_help(review));
+    lines.extend(no_help(review));
     lines.join("\n")
+}
+
+/// The line of the help for `y`, if the review has a choice for it.
+fn yes_help<T>(review: &Review<T>) -> Option<String> {
+    let first = review.accept.first()?;
+    Some(same_as(Key::Yes, first.word))
+}
+
+/// The line of the help for `n`, unless it picks a choice the review lacks.
+fn no_help<T: PartialEq>(review: &Review<T>) -> Option<String> {
+    let word = match &review.decline {
+        Decline::Quit => Key::Quit.word(),
+        Decline::Choose(value) => review.choice_of(value)?.word,
+    };
+    Some(same_as(Key::No, word))
+}
+
+/// A line of the help saying `key` is the same as the key typed for `word`, as in "c (commit)".
+fn same_as(key: Key, word: &str) -> String {
+    format!(
+        "  {}  the same as {} ({word})",
+        key.letter(),
+        first_letter(word)
+    )
 }
 
 /// What the tests of the reviews share.
 #[cfg(test)]
 pub mod test_support {
-    use super::{Choice, Key, Person, Review};
+    use super::{Action, Choice, Decline, Key, Person, Review, ask_action};
     use anyhow::Result;
 
     pub use crate::conversation::test_support::ScriptedPerson;
@@ -246,6 +320,26 @@ pub mod test_support {
         fn typed_at(&self, _prompt: &str) -> Result<Option<String>> {
             Ok(self.next_line())
         }
+    }
+
+    /// What a person who types `line` at `review` asks for, through the port the terminal
+    /// reads from. A `q` follows, so a line the review doesn't take as an action fails here,
+    /// and doesn't pass as a quit: end of input is a quit too.
+    pub fn action_for<T: Copy + PartialEq>(review: &Review<T>, line: &str) -> Action<T> {
+        let person = ScriptedPerson::typing(&[line, "q"]);
+        let action = ask_action(review, &person).expect("a scripted person can always type");
+        assert_eq!(person.lines_left(), 1, "{line:?} wasn't taken as an action");
+        action
+    }
+
+    /// The last `count` lines of the help of `review`, which `?` shows.
+    pub fn last_lines_of_help<T: PartialEq>(review: &Review<T>, count: usize) -> Vec<String> {
+        let help = super::help(review);
+        let lines: Vec<&str> = help.lines().collect();
+        lines[lines.len() - count..]
+            .iter()
+            .map(|line| (*line).to_owned())
+            .collect()
     }
 
     /// A review to test with: `c` creates (1), and `d` makes a draft (2).
@@ -267,14 +361,35 @@ pub mod test_support {
                 value: 2,
             },
         ],
+        decline: Decline::Quit,
         quit: "quit without creating it",
     };
 
-    /// Checks that `review` has a choice for `y`, and that each accept choice can be typed
-    /// as its first letter: a lower-case ASCII letter that no other choice and no other key
-    /// uses.
-    pub fn assert_typable<T>(review: &Review<T>) {
+    /// [`REVIEW`] where `n` picks `value`.
+    pub fn declining_with(value: u8) -> Review<u8> {
+        Review {
+            decline: Decline::Choose(value),
+            ..REVIEW
+        }
+    }
+
+    /// Checks that `review` has a choice for `y`, that the choice `n` picks, if any, is one
+    /// of its accept choices other than the one `y` picks, and that each accept choice can be
+    /// typed as its first letter: a lower-case ASCII letter that no other choice and no other
+    /// key uses.
+    pub fn assert_typable<T: PartialEq>(review: &Review<T>) {
         assert!(!review.accept.is_empty(), "a review needs a choice for `y`");
+        if let Decline::Choose(value) = &review.decline {
+            let picked = review.choice_of(value);
+            assert!(
+                picked.is_some(),
+                "`n` picks a choice the review doesn't have"
+            );
+            assert!(
+                review.accept[0].value != *value,
+                "`n` picks the choice `y` picks"
+            );
+        }
         let letters: Vec<char> = review
             .accept
             .iter()
@@ -299,7 +414,7 @@ pub mod test_support {
 
 #[cfg(test)]
 mod tests {
-    use super::test_support::REVIEW;
+    use super::test_support::{REVIEW, declining_with};
     use super::*;
     use crate::conversation::test_support::ScriptedPerson;
 
@@ -358,7 +473,6 @@ mod tests {
         assert_eq!(accepted(&several, "commits"), None);
         let help = help(&REVIEW);
         assert!(help.starts_with("  c  create it\n  d  create a draft\n  e  edit the thing"));
-        assert!(help.ends_with("  q  quit without creating it"));
     }
 
     #[test]
@@ -438,13 +552,110 @@ mod tests {
     }
 
     #[test]
-    fn helps_with_each_choice_and_key() {
+    fn helps_with_each_choice_and_key_and_ends_with_y_and_n() {
         assert_eq!(
             help(&REVIEW),
             "  c  create it\n  d  create a draft\n  e  edit the thing in your editor\n  \
              r  generate a new thing\n  f  tell the model what to change, e.g. `f mention the \
-             API change`\n  q  quit without creating it"
+             API change`\n  q  quit without creating it\n  \
+             y  the same as c (create)\n  n  the same as q (quit)"
         );
+    }
+
+    #[test]
+    fn says_in_the_help_what_n_picks_when_it_picks_a_choice() {
+        assert_eq!(
+            test_support::last_lines_of_help(&declining_with(2), 2),
+            ["  y  the same as c (create)", "  n  the same as d (draft)"]
+        );
+    }
+
+    #[test]
+    fn leaves_out_of_the_help_the_key_that_picks_nothing() {
+        let without_yes = help(&review_of(&[]));
+        assert!(without_yes.ends_with("  q  quit without creating it\n  n  the same as q (quit)"));
+        assert!(!without_yes.contains("  y  "), "{without_yes:?}");
+        let without_no = help(&declining_with(9));
+        assert!(without_no.ends_with("  q  quit without creating it\n  y  the same as c (create)"));
+        assert!(!without_no.contains("  n  "), "{without_no:?}");
+    }
+
+    #[test]
+    fn names_a_choice_of_several_words_by_its_first_letter_in_the_help() {
+        const SEVERAL: &[Choice<u8>] = &[
+            Choice {
+                word: "commit",
+                help: "",
+                value: 1,
+            },
+            Choice {
+                word: "all commits",
+                help: "",
+                value: 2,
+            },
+        ];
+        let review = Review {
+            accept: SEVERAL,
+            ..declining_with(2)
+        };
+        assert_eq!(
+            test_support::last_lines_of_help(&review, 2),
+            [
+                "  y  the same as c (commit)",
+                "  n  the same as a (all commits)"
+            ]
+        );
+    }
+
+    #[test]
+    fn finds_a_choice_by_its_value() {
+        assert_eq!(
+            REVIEW.choice_of(&2).map(|choice| choice.word),
+            Some("draft")
+        );
+        assert!(REVIEW.choice_of(&9).is_none());
+    }
+
+    #[test]
+    fn declining_asks_for_a_quit_or_for_the_choice() {
+        assert_eq!(Decline::<u8>::Quit.action(), Action::Quit);
+        assert_eq!(Decline::Choose(7).action(), Action::Accept(7));
+    }
+
+    #[test]
+    fn takes_the_first_letter_of_a_word_whatever_its_size() {
+        assert_eq!(first_letter("all commits"), "a");
+        assert_eq!(first_letter("ändern"), "ä");
+        assert_eq!(first_letter(""), "");
+    }
+
+    #[test]
+    fn n_and_no_do_what_the_review_says_in_any_case() {
+        for typed in ["n", "no", "N", "No", "NO", " n ", "n and more words"] {
+            assert_eq!(
+                parse(&REVIEW, typed),
+                Typed::Action(Action::Quit),
+                "quits: {typed:?}"
+            );
+            assert_eq!(
+                parse(&declining_with(2), typed),
+                Typed::Action(Action::Accept(2)),
+                "picks: {typed:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn asking_takes_n_as_the_choice_it_picks_or_as_a_quit() {
+        for typed in ["n", "no"] {
+            let person = ScriptedPerson::typing(&["zap", typed, "c"]);
+            assert_eq!(
+                ask_action(&declining_with(2), &person).unwrap(),
+                Action::Accept(2)
+            );
+            assert_eq!(person.lines_left(), 1, "{typed:?}");
+            assert_eq!(test_support::action_for(&REVIEW, typed), Action::Quit);
+        }
     }
 
     /// [`REVIEW`] with `choices` to accept it.
@@ -504,6 +715,23 @@ mod tests {
     fn a_choice_starts_in_lower_case() {
         const CHOICES: &[Choice<u8>] = &[choice("Commit")];
         test_support::assert_typable(&review_of(CHOICES));
+    }
+
+    #[test]
+    fn a_review_where_n_picks_one_of_its_choices_is_typable() {
+        test_support::assert_typable(&declining_with(2));
+    }
+
+    #[test]
+    #[should_panic(expected = "`n` picks the choice `y` picks")]
+    fn n_cant_pick_what_y_picks() {
+        test_support::assert_typable(&declining_with(1));
+    }
+
+    #[test]
+    #[should_panic(expected = "`n` picks a choice the review doesn't have")]
+    fn n_cant_pick_a_choice_the_review_lacks() {
+        test_support::assert_typable(&declining_with(9));
     }
 
     #[test]

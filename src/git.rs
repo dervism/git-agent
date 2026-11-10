@@ -18,7 +18,7 @@ use std::fs;
 use std::hash::{BuildHasher, Hasher};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Command, ExitStatus, Stdio};
 use worktree::TempWorktree;
 
 /// Which changes the message describes, and therefore what gets committed.
@@ -1334,20 +1334,13 @@ impl Repo {
         fs::write(&path, format!("{message}\n"))
             .with_context(|| format!("failed to write {}", path.display()))?;
 
-        let output = self
-            .commit_command(&path, scope, extra_args, leave_out)
-            .stdout(Stdio::piped())
-            .spawn()
-            .context("failed to run git commit")?
-            .wait_with_output()
-            .context("failed to run git commit")?;
-        String::from_utf8_lossy(&output.stdout)
-            .lines()
-            .map(without_styles)
-            .for_each(ui::info);
-        if !output.status.success() {
+        let command = self.commit_command(&path, scope, extra_args, leave_out);
+        let run = run_commit(command, Stdio::inherit())?;
+        run.said.iter().for_each(ui::info);
+        if !run.status.success() {
             bail!(
-                "git commit failed; the message was saved, reuse it with:\n  git commit --file {}",
+                "git commit failed ({}); the message was saved, reuse it with:\n  git commit --file {}",
+                run.status,
                 path.display()
             );
         }
@@ -1573,6 +1566,34 @@ impl Repo {
             ),
         }
     }
+}
+
+/// How a `git commit` ended, and the lines it wrote to stdout without their styles: its summary of
+/// the commit, or why it made none.
+struct CommitRun {
+    status: ExitStatus,
+    said: Vec<String>,
+}
+
+/// Runs `command`, a `git commit`, with `stderr` for git's errors and the hooks' output. git's
+/// stdout is a pipe that is read whole, so a reader of git-agent's output that has gone away
+/// can't kill git once the commit exists.
+fn run_commit(mut command: Command, stderr: Stdio) -> Result<CommitRun> {
+    let output = command
+        .stdout(Stdio::piped())
+        .stderr(stderr)
+        .spawn()
+        .context("failed to run git commit")?
+        .wait_with_output()
+        .context("failed to run git commit")?;
+    let said = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(without_styles)
+        .collect();
+    Ok(CommitRun {
+        status: output.status,
+        said,
+    })
 }
 
 /// Turns hooks off for the commands git-agent runs on its own behalf, such as
@@ -1955,16 +1976,6 @@ pub mod test_support {
         run(dir, &["config", "core.hooksPath", "hooks"]);
     }
 
-    /// The command that runs the test `name` of this test binary alone, in a process of its
-    /// own, with `variable` set: such a test is ignored, and does nothing without it.
-    pub fn test_alone(name: &str, variable: &str) -> Command {
-        let mut command = Command::new(std::env::current_exe().unwrap());
-        command
-            .args(["--ignored", "--exact", "--nocapture", name])
-            .env(variable, "1");
-        command
-    }
-
     /// Keeps the user's global settings (signing, hooks) out of the tests.
     pub fn isolate(dir: &Path) {
         run(dir, &["config", "user.name", "Test"]);
@@ -2055,7 +2066,7 @@ pub mod test_support {
 
 #[cfg(test)]
 mod tests {
-    use super::test_support::{add_remote, commit_elsewhere, hook, isolate, test_alone};
+    use super::test_support::{add_remote, commit_elsewhere, hook, isolate};
     use super::*;
     use tempfile::TempDir;
 
@@ -2857,83 +2868,105 @@ mod tests {
         assert!(mark.exists());
     }
 
-    const COMMIT_HELPER: &str = "GIT_AGENT_TEST_COMMIT_HELPER";
+    /// The `git commit` of `scope` in `repo` with `message`, as `Repo::commit` builds it, in the
+    /// C locale, so that git says what the tests expect.
+    fn commit_of(repo: &Repo, scope: Scope, message: &str) -> Command {
+        let file = repo.git_path("TEST_MESSAGE").unwrap();
+        fs::write(&file, format!("{message}\n")).unwrap();
+        let mut command = repo.commit_command(&file, scope, &[], &[]);
+        command.env("LC_ALL", "C");
+        command
+    }
 
-    /// Not a test by itself: `shows_git_s_and_the_hooks_output_on_stderr` runs it in a process
-    /// of its own and reads what it writes. A hook stops one commit, git makes the next, then
-    /// finds nothing to commit, with its colors forced on.
+    /// Runs `command` as `Repo::commit` does, with a pipe for git's stderr that a thread reads as
+    /// git writes, so that a hook that prints a lot can't make git wait, and gives how git ended
+    /// and what it wrote to stderr.
+    fn run_with_output(command: Command) -> (CommitRun, String) {
+        let (reader, writer) = std::io::pipe().unwrap();
+        let stderr = std::thread::spawn(move || std::io::read_to_string(reader).unwrap());
+        let run = run_commit(command, Stdio::from(writer)).unwrap();
+        (run, stderr.join().unwrap())
+    }
+
+    /// What a hook prints goes to git's stderr, which is the user's, so they see why it stopped
+    /// the commit; none of it is taken for git's summary.
     #[cfg(unix)]
     #[test]
-    #[ignore = "runs only as a helper of another test"]
-    fn commit_helper() {
-        if std::env::var_os(COMMIT_HELPER).is_none() {
-            return;
-        }
+    fn leaves_what_a_hook_prints_to_git_s_stderr() {
         let (dir, repo) = setup();
-        run(
-            dir.path(),
-            &["config", "status.showUntrackedFiles", "normal"],
-        );
         let lint = "echo 'lint: to stdout'\necho 'lint: to stderr' >&2\nexit 1\n";
         hook(dir.path(), "pre-commit", lint);
         fs::write(dir.path().join("lib.rs"), "fn b() {}\n").unwrap();
-        assert!(repo.commit("feat: b", Scope::Tracked, &[], &[]).is_err());
-        hook(dir.path(), "pre-commit", "exit 0\n");
-        repo.commit("feat: b", Scope::Tracked, &[], &[]).unwrap();
-        run(dir.path(), &["config", "color.status", "always"]);
-        assert!(repo.commit("feat: c", Scope::Staged, &[], &[]).is_err());
-    }
 
-    /// With the reader of stderr gone too, as with `2>&1 | head`, nothing kills git once it has
-    /// made the commit, so the commit isn't reported as failed.
-    #[cfg(unix)]
-    #[test]
-    fn commits_when_the_reader_of_stderr_has_gone_away() {
-        let mut child = test_alone("git::tests::commit_helper", COMMIT_HELPER)
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap();
-        drop(child.stderr.take());
+        let (run, stderr) = run_with_output(commit_of(&repo, Scope::Tracked, "feat: b"));
 
-        assert!(child.wait().unwrap().success());
-    }
-
-    /// What git and the hooks print when committing reaches the user on git-agent's stderr,
-    /// git's summary of the commit included, and none of it goes to stdout, where a reader
-    /// that's gone would kill git after the commit exists.
-    #[cfg(unix)]
-    #[test]
-    fn shows_git_s_and_the_hooks_output_on_stderr() {
-        let child = test_alone("git::tests::commit_helper", COMMIT_HELPER)
-            .env("LC_ALL", "C")
-            .output()
-            .unwrap();
-
-        let stdout = String::from_utf8_lossy(&child.stdout);
-        let stderr = String::from_utf8_lossy(&child.stderr);
-        assert!(child.status.success(), "{stdout}{stderr}");
-        assert!(stdout.contains("1 passed"), "{stdout}");
-        assert!(
-            !stdout.contains("lint:") && !stdout.contains("feat: b"),
-            "{stdout}"
-        );
+        assert!(!run.status.success());
+        assert!(run.said.is_empty(), "{:?}", run.said);
         assert!(
             stderr.contains("lint: to stdout\nlint: to stderr\n"),
             "{stderr}"
         );
-        let summary = stderr
-            .lines()
-            .skip_while(|line| !(line.starts_with("[main ") && line.ends_with("] feat: b")))
-            .take(2)
-            .collect::<Vec<_>>();
-        assert_eq!(summary.len(), 2, "{stderr}");
-        assert_eq!(summary[1], " 1 file changed, 1 insertion(+), 1 deletion(-)");
-        assert!(stderr.contains("\nnothing added to commit"), "{stderr}");
-        assert!(
-            stderr.contains("\n\thooks/\n"),
-            "git's red stays out: {stderr}"
+    }
+
+    /// git's summary of the commit it made is passed on, line by line, and not left to git's
+    /// stdout.
+    #[test]
+    fn passes_on_git_s_summary_of_the_commit() {
+        let (dir, repo) = setup();
+        fs::write(dir.path().join("lib.rs"), "fn b() {}\n").unwrap();
+
+        let (made, stderr) = run_with_output(commit_of(&repo, Scope::Tracked, "feat: b"));
+
+        assert!(made.status.success(), "{}: {stderr}", made.status);
+        let short = run(dir.path(), &["rev-parse", "--short", "HEAD"]);
+        let counts = " 1 file changed, 1 insertion(+), 1 deletion(-)";
+        assert_eq!(
+            made.said,
+            [
+                format!("[main {}] feat: b", short.trim()),
+                counts.to_owned()
+            ]
         );
+    }
+
+    /// With git's colors forced on, what it says about nothing to commit is passed on without
+    /// them.
+    #[test]
+    fn passes_on_what_git_says_without_its_colors() {
+        let (dir, repo) = setup();
+        let dir = dir.path();
+        run(dir, &["config", "status.showUntrackedFiles", "normal"]);
+        run(dir, &["config", "color.status", "always"]);
+        fs::write(dir.join("new.txt"), "new\n").unwrap();
+
+        let (run, _) = run_with_output(commit_of(&repo, Scope::Staged, "c"));
+
+        assert!(!run.status.success());
+        assert!(
+            run.said.iter().any(|line| line == "\tnew.txt"),
+            "{:?}",
+            run.said
+        );
+        let said = run.said.join("\n");
+        assert!(said.contains("nothing added to commit"), "{said}");
+        assert!(!said.contains('\x1b'), "{said}");
+    }
+
+    /// With the reader of git's stderr gone, as with `2>&1 | head`, nothing kills git once it has
+    /// made the commit, so the commit isn't reported as failed.
+    #[test]
+    fn commits_when_the_reader_of_git_s_stderr_has_gone_away() {
+        let (dir, repo) = setup();
+        fs::write(dir.path().join("lib.rs"), "fn b() {}\n").unwrap();
+        let (reader, writer) = std::io::pipe().unwrap();
+        drop(reader);
+
+        let command = commit_of(&repo, Scope::Tracked, "feat: b");
+        let made = run_commit(command, Stdio::from(writer)).unwrap();
+
+        assert!(made.status.success(), "{}", made.status);
+        let subject = run(dir.path(), &["log", "-1", "--format=%s"]);
+        assert_eq!(subject.trim(), "feat: b");
     }
 
     #[test]

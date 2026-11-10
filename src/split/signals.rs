@@ -102,7 +102,7 @@ pub fn end_on_stop_signals() {
 
 #[cfg(test)]
 mod tests {
-    use crate::git::test_support::{isolated_repo, test_alone};
+    use crate::git::test_support::isolated_repo;
     use crate::git::worktree::TempWorktree;
     use crate::split::check::check_trees;
     use crate::split::command::BuildCheck;
@@ -142,7 +142,26 @@ mod tests {
         std::thread::sleep(Duration::from_secs(30));
     }
 
+    /// The command that runs the test `name` of this test binary alone, in a process of its own,
+    /// with `variable` set: such a test is ignored, and does nothing without it. On macOS,
+    /// Gatekeeper can stall a copy of a freshly built test binary at its start, so a test that
+    /// uses this is skipped there.
+    fn test_alone(name: &str, variable: &str) -> Command {
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
+            .args(["--ignored", "--exact", "--nocapture", name])
+            .env(variable, "1");
+        command
+    }
+
+    /// Signals reach a whole program, so this runs `helper` in a process of its own: a copy of
+    /// the test binary. Gatekeeper on macOS can stall such a copy at its start, so it runs on
+    /// Linux, as CI does, and not on macOS.
     #[test]
+    #[cfg_attr(
+        target_os = "macos",
+        ignore = "starts a copy of the test binary, which Gatekeeper on macOS can stall"
+    )]
     fn signals_end_the_program_after_a_check_while_it_waits() {
         for (signal, code) in [("INT", 130), ("TERM", 143)] {
             let mut child = test_alone("split::signals::tests::helper", HELPER_VARIABLE)

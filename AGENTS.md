@@ -131,7 +131,14 @@ in a test directory from walking up into this repository.
 The tests are unit tests, in a `mod tests` at the end of the module they test. Tests that
 need git create throwaway repositories and run the real `git`. None of them need a model
 server. `api_keys::tests::keychain_round_trip` is ignored, because it needs the macOS
-Keychain.
+Keychain. `split::signals::tests::signals_end_the_program_after_a_check_while_it_waits` is
+ignored on macOS only, because it starts a copy of the test binary, which Gatekeeper can stall
+there; CI runs it on Linux.
+
+On macOS, Gatekeeper assesses each freshly built program a test run starts, such as the test
+binary and the hook scripts the tests write. Under load that can stall the machine. Add the app
+you run `cargo` from to System Settings › Privacy & Security › Developer Tools, and restart it, so
+that Gatekeeper leaves what it runs alone.
 
 These checks must pass before a piece of work is done. The release script runs the same
 ones:

@@ -371,30 +371,71 @@ pub struct SecretLine {
 /// The lines of `lines` that hold secrets, scanned with the rules a diff's lines get, a private
 /// key's block across lines included.
 pub fn secret_lines(lines: impl IntoIterator<Item = String>) -> Vec<SecretLine> {
-    let mut scanner = Scanner::default();
+    let mut scan = LineScan::default();
     lines
         .into_iter()
         .enumerate()
         .fold(Vec::new(), |mut found: Vec<SecretLine>, (index, text)| {
-            let mut kinds = Vec::new();
-            match scanner.scan(&text, &mut kinds) {
-                // Only the later data lines of a private key are left out, and they belong to
-                // the key found on the line before.
-                None => {
+            match scan.line(&text) {
+                Held::MoreOfAKey => {
                     if let Some(key) = found.last_mut() {
                         key.text.push('\n');
                         key.text.push_str(&text);
                     }
                 }
-                Some(_) if !kinds.is_empty() => found.push(SecretLine {
+                Held::Secrets(kinds) => found.push(SecretLine {
                     number: index + 1,
                     text,
                     kinds,
                 }),
-                Some(_) => {}
+                Held::Nothing => {}
             }
             found
         })
+}
+
+/// What a line holds, as far as secrets go, when lines are scanned one after another.
+#[derive(Debug, PartialEq)]
+pub enum Held {
+    /// What the secrets on it look like.
+    Secrets(Vec<String>),
+    /// More of the data of a private key, which belongs to the line the key's data began on.
+    MoreOfAKey,
+    Nothing,
+}
+
+/// Scans lines one after another, as [`secret_lines`] does, carrying a private key's block
+/// across them.
+#[derive(Default)]
+pub struct LineScan(Scanner);
+
+impl LineScan {
+    /// What `line`, the next line, holds.
+    pub fn line(&mut self, line: &str) -> Held {
+        let mut kinds = Vec::new();
+        match self.0.scan(line, &mut kinds) {
+            None => Held::MoreOfAKey,
+            Some(_) if kinds.is_empty() => Held::Nothing,
+            Some(_) => Held::Secrets(kinds),
+        }
+    }
+
+    /// Takes up again after a line too long to scan whole, which ends with `tail`: a private
+    /// key's block can't go on through such a line, and one starts after it if `tail` ends with
+    /// a key's BEGIN line.
+    pub fn after_long_line(&mut self, tail: &str) {
+        self.0 = Scanner {
+            in_key: starts_key_block(&without_hidden(tail).text),
+            key_replaced: false,
+        };
+    }
+}
+
+/// What the secrets in `text`, scanned as a line on its own, look like.
+pub fn kinds_in(text: &str) -> Vec<String> {
+    let mut kinds = Vec::new();
+    Scanner::default().scan(text, &mut kinds);
+    kinds
 }
 
 /// Replaces the secrets in plain text, such as a commit message. Findings name

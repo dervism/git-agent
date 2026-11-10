@@ -5,6 +5,9 @@
 //! text is only shown, and removed from a model's reply, so that what the user reviews is
 //! what gets committed. Letters of any script and emoji stay as they are.
 
+use regex_lite::Regex;
+use std::sync::LazyLock;
+
 /// The escape letters git uses, with the bytes they stand for.
 pub const NAMED_ESCAPES: [(u8, u8); 7] = [
     (b'a', 0x07),
@@ -161,6 +164,14 @@ fn escape(character: char, out: &mut String) {
             None => out.push_str(&format!("\\{byte:03o}")),
         }
     }
+}
+
+/// `text` without the escape sequences that only color or style it, such as git's `\x1b[31m`
+/// and `\x1b[m` when its colors are forced on. Other escape sequences stay, for [`escaped`].
+pub fn without_styles(text: &str) -> String {
+    static STYLE: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"\x1b\[[0-9;]*m").expect("a valid pattern"));
+    STYLE.replace_all(text, "").into_owned()
 }
 
 /// Trims trailing whitespace from every line and blank lines around the text.
@@ -346,5 +357,31 @@ mod tests {
         assert_eq!(normalize("  kept indent\n"), "  kept indent");
         assert_eq!(normalize("a\r\nb"), "a\nb");
         assert_eq!(normalize(""), "");
+    }
+
+    #[test]
+    fn takes_out_the_sequences_that_only_style_text() {
+        let red = "\x1b[31mhooks/\x1b[m";
+        assert_eq!(without_styles(red), "hooks/");
+        assert_eq!(without_styles("\x1b[1;32mok\x1b[0m done"), "ok done");
+        assert_eq!(
+            without_styles("[main 1a2b3c4] feat: b"),
+            "[main 1a2b3c4] feat: b"
+        );
+        assert_eq!(without_styles(""), "");
+    }
+
+    /// Only styles go: a title, a cursor move or a cut-off sequence stays for `escaped`.
+    #[test]
+    fn leaves_other_escape_sequences_to_be_escaped() {
+        for kept in [
+            "\x1b]0;title\x07",
+            "\x1b[2J",
+            "\x1b[31",
+            "\x1b[",
+            "\x1b[3;1Hx",
+        ] {
+            assert_eq!(without_styles(kept), kept);
+        }
     }
 }

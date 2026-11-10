@@ -6,7 +6,7 @@ pub mod lossless;
 pub mod names;
 pub mod worktree;
 
-use crate::safe_text::one_line;
+use crate::safe_text::{one_line, without_styles};
 use crate::temp::PrivateDir;
 use crate::ui;
 use anyhow::{Context, Result, anyhow, bail};
@@ -1318,10 +1318,11 @@ impl Repo {
     }
 
     /// Commits with `message`. If git fails (e.g. a hook rejects the commit), the message is
-    /// left on disk so it isn't lost. git writes its summary of the commit to git-agent's
-    /// stderr, where the user reads status: on stdout, with the reader of git-agent's output
-    /// gone, that write would kill git after the commit exists, and a commit that was made
-    /// would be reported as failed.
+    /// left on disk so it isn't lost. git's stdout, with its summary of the commit, is passed
+    /// on to the user's stderr through `ui`, which doesn't mind a reader that has gone away:
+    /// written by git itself, with that reader gone, the summary would kill git after the
+    /// commit exists, and a commit that was made would be reported as failed. git's own stderr
+    /// and the hooks' output still go straight to the user, as they come.
     pub fn commit(
         &self,
         message: &str,
@@ -1333,12 +1334,18 @@ impl Repo {
         fs::write(&path, format!("{message}\n"))
             .with_context(|| format!("failed to write {}", path.display()))?;
 
-        let status = self
+        let output = self
             .commit_command(&path, scope, extra_args, leave_out)
-            .stdout(ui::child_stdout_on_stderr()?)
-            .status()
+            .stdout(Stdio::piped())
+            .spawn()
+            .context("failed to run git commit")?
+            .wait_with_output()
             .context("failed to run git commit")?;
-        if !status.success() {
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .map(without_styles)
+            .for_each(ui::info);
+        if !output.status.success() {
             bail!(
                 "git commit failed; the message was saved, reuse it with:\n  git commit --file {}",
                 path.display()
@@ -1463,7 +1470,9 @@ impl Repo {
     /// default remote and its upstream is set, like `git push --set-upstream`.
     pub fn push(&self) -> Result<()> {
         let status = self
-            .push_command(ui::child_stdout_on_stderr()?)?
+            .push_command(
+                ui::child_stdout_on_stderr().context("failed to give git push a stdout")?,
+            )?
             .status()
             .context("failed to run git push")?;
         if !status.success() {
@@ -2851,7 +2860,8 @@ mod tests {
     const COMMIT_HELPER: &str = "GIT_AGENT_TEST_COMMIT_HELPER";
 
     /// Not a test by itself: `shows_git_s_and_the_hooks_output_on_stderr` runs it in a process
-    /// of its own and reads what it writes. A hook stops one commit, then git makes the next.
+    /// of its own and reads what it writes. A hook stops one commit, git makes the next, then
+    /// finds nothing to commit, with its colors forced on.
     #[cfg(unix)]
     #[test]
     #[ignore = "runs only as a helper of another test"]
@@ -2860,12 +2870,33 @@ mod tests {
             return;
         }
         let (dir, repo) = setup();
+        run(
+            dir.path(),
+            &["config", "status.showUntrackedFiles", "normal"],
+        );
         let lint = "echo 'lint: to stdout'\necho 'lint: to stderr' >&2\nexit 1\n";
         hook(dir.path(), "pre-commit", lint);
         fs::write(dir.path().join("lib.rs"), "fn b() {}\n").unwrap();
         assert!(repo.commit("feat: b", Scope::Tracked, &[], &[]).is_err());
         hook(dir.path(), "pre-commit", "exit 0\n");
         repo.commit("feat: b", Scope::Tracked, &[], &[]).unwrap();
+        run(dir.path(), &["config", "color.status", "always"]);
+        assert!(repo.commit("feat: c", Scope::Staged, &[], &[]).is_err());
+    }
+
+    /// With the reader of stderr gone too, as with `2>&1 | head`, nothing kills git once it has
+    /// made the commit, so the commit isn't reported as failed.
+    #[cfg(unix)]
+    #[test]
+    fn commits_when_the_reader_of_stderr_has_gone_away() {
+        let mut child = test_alone("git::tests::commit_helper", COMMIT_HELPER)
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        drop(child.stderr.take());
+
+        assert!(child.wait().unwrap().success());
     }
 
     /// What git and the hooks print when committing reaches the user on git-agent's stderr,
@@ -2898,6 +2929,11 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(summary.len(), 2, "{stderr}");
         assert_eq!(summary[1], " 1 file changed, 1 insertion(+), 1 deletion(-)");
+        assert!(stderr.contains("\nnothing added to commit"), "{stderr}");
+        assert!(
+            stderr.contains("\n\thooks/\n"),
+            "git's red stays out: {stderr}"
+        );
     }
 
     #[test]

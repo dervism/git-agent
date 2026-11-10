@@ -177,8 +177,9 @@ What that means for the commands that change the repository:
   so if the reader has gone away by then, it changes nothing.
 
 What git prints when it commits or pushes, such as its summary of a commit, goes to stderr
-with git-agent's messages, so the reader going away can't stop git halfway. A push or a pull
-request that was under way when the reader went away still finishes, and git-agent says so.
+with git-agent's messages, so a program that stops reading stdout can't stop git halfway. A
+push or a pull request that was under way when the reader went away still finishes, and
+git-agent says so.
 
 ## Starting a branch
 

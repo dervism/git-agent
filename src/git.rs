@@ -10,9 +10,9 @@ use crate::safe_text::{one_line, without_styles};
 use crate::temp::PrivateDir;
 use crate::ui;
 use anyhow::{Context, Result, anyhow, bail};
-use blob::Blob;
-use std::collections::HashSet;
+use blob::{Blob, BlobBatch};
 use std::collections::hash_map::RandomState;
+use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
 use std::fs;
 use std::hash::{BuildHasher, Hasher};
@@ -939,13 +939,53 @@ impl Repo {
         Ok(line.split_whitespace().skip(1).map(str::to_owned).collect())
     }
 
-    /// The size in bytes of the object `hash`, as it is rather than as a replacement shows it.
-    pub fn object_size(&self, hash: &str) -> Result<u64> {
-        let hash = object_hash(hash)?;
-        let size = self.git(&["--no-replace-objects", "cat-file", "-s", hash])?;
-        size.trim()
-            .parse()
-            .with_context(|| format!("git gave {size:?} as the size of {hash}"))
+    /// The sizes in bytes of the blobs `hashes`, as they are rather than as a replacement shows
+    /// them, read by one `git cat-file`. Fails on one that is missing or isn't a blob.
+    pub fn blob_sizes(&self, hashes: &[String]) -> Result<HashMap<String, u64>> {
+        let input: String = hashes
+            .iter()
+            .map(|hash| object_hash(hash).map(|hash| format!("{hash}\n")))
+            .collect::<Result<_>>()?;
+        let args = ["--no-replace-objects", "cat-file", "--batch-check"];
+        let output = self.git_with_input_and_output(&args, input.as_bytes(), &[0])?;
+        let output = String::from_utf8_lossy(&output);
+        let headers: Vec<&str> = output.lines().collect();
+        anyhow::ensure!(
+            headers.len() == hashes.len(),
+            "git gave {} sizes for {} blobs",
+            headers.len(),
+            hashes.len()
+        );
+        hashes
+            .iter()
+            .zip(headers)
+            .map(|(hash, header)| {
+                let size = blob::size_in(hash, header)
+                    .with_context(|| format!("git couldn't read the blob {hash}: {header}"))?;
+                Ok((hash.clone(), size))
+            })
+            .collect()
+    }
+
+    /// A reader of whole blobs, one after another through one `git cat-file`, as they are rather
+    /// than as a replacement shows them.
+    pub fn blob_batch(&self) -> Result<BlobBatch> {
+        let mark = random_hex();
+        let format = format!("--batch=%(objectname) %(objecttype) %(objectsize) {mark}");
+        let child = self
+            .command(&[
+                "-c",
+                "core.bigFileThreshold=16m",
+                "--no-replace-objects",
+                "cat-file",
+                &format,
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .context("failed to run git; is it installed?")?;
+        Ok(BlobBatch::new(child, mark)?)
     }
 
     /// The content of the blob `hash`, as it is rather than as a replacement shows it, read as
@@ -2981,6 +3021,101 @@ mod tests {
         assert_eq!(fs::read_to_string(saved).unwrap(), "feat: x\n");
     }
 
+    /// Stores `bytes` in `dir`'s repository as a blob, and returns its hash.
+    fn stored(dir: &Path, bytes: &[u8]) -> String {
+        fs::write(dir.join("blob.tmp"), bytes).unwrap();
+        let hash = run(dir, &["hash-object", "-w", "--", "blob.tmp"]);
+        fs::remove_file(dir.join("blob.tmp")).unwrap();
+        hash.trim().to_owned()
+    }
+
+    #[test]
+    fn reads_the_sizes_of_many_blobs_with_one_git() {
+        let (dir, repo) = setup();
+        let contents = [&b"one\n"[..], b"", b"\0two\nlines\0"];
+        let blobs = contents.map(|bytes| stored(dir.path(), bytes));
+
+        let sizes = repo.blob_sizes(&blobs).unwrap();
+
+        assert_eq!(sizes.len(), 3);
+        let expected = contents.map(|bytes| bytes.len() as u64);
+        assert_eq!(blobs.map(|hash| sizes[&hash]), expected);
+        assert!(repo.blob_sizes(&[]).unwrap().is_empty());
+    }
+
+    /// A blob git doesn't have, an object that isn't a blob, or a word that isn't a hash fails,
+    /// rather than pass for an empty blob.
+    #[test]
+    fn fails_to_size_what_isnt_a_blob() {
+        let (dir, repo) = setup();
+        let blob = stored(dir.path(), b"one\n");
+        let tree = run(dir.path(), &["rev-parse", "HEAD^{tree}"])
+            .trim()
+            .to_owned();
+        for wrong in ["1".repeat(40), tree, "--batch".to_owned()] {
+            let error = repo.blob_sizes(&[blob.clone(), wrong.clone()]).unwrap_err();
+            assert!(error.to_string().contains(&wrong), "{error}");
+        }
+    }
+
+    #[test]
+    fn reads_whole_blobs_one_after_another_from_one_git() {
+        let (dir, repo) = setup();
+        let contents = [&b"\0binary\nwith\nline ends\n\0"[..], b"", b"text\n"];
+        let blobs = contents.map(|bytes| stored(dir.path(), bytes));
+        let mut batch = repo.blob_batch().unwrap();
+
+        for (hash, bytes) in blobs.iter().zip(contents).chain(blobs.iter().zip(contents)) {
+            assert_eq!(batch.read(hash, bytes.len() as u64).unwrap(), bytes);
+        }
+    }
+
+    /// The batch fails on a blob it can't read, and on a size other than the one git gives, so
+    /// it never holds more than it was told.
+    #[test]
+    fn fails_to_read_a_blob_git_lacks_or_of_another_size() {
+        let (dir, repo) = setup();
+        let blob = stored(dir.path(), b"text\n");
+        let batch = || repo.blob_batch().unwrap();
+
+        assert!(batch().read(&"1".repeat(40), 4).is_err());
+        assert!(batch().read("HEAD", 4).is_err());
+        let error = batch().read(&blob, 1 << 40).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("not 1099511627776"),
+            "{error:#}"
+        );
+    }
+
+    /// git takes a 64-digit name in a repository of 40-digit hashes, or a hash in capitals, for a
+    /// ref's name, and answers with what that names: such an answer isn't taken for the hash.
+    #[test]
+    fn fails_on_a_hash_git_takes_for_a_name() {
+        let dir = TempDir::new().unwrap();
+        run(
+            dir.path(),
+            &[
+                "init",
+                "-q",
+                "--object-format=sha1",
+                "--initial-branch",
+                "main",
+            ],
+        );
+        isolate(dir.path());
+        let repo = Repo::open(dir.path()).unwrap();
+        let blob = stored(dir.path(), b"text\n");
+        let long = "a".repeat(64);
+        run(dir.path(), &["tag", &long, &blob]);
+        for name in [long, blob.to_uppercase()] {
+            assert!(
+                repo.blob_sizes(std::slice::from_ref(&name)).is_err(),
+                "{name}"
+            );
+            assert!(repo.blob_batch().unwrap().read(&name, 5).is_err(), "{name}");
+        }
+    }
+
     fn names(list: &[&str]) -> Vec<String> {
         list.iter().map(|name| name.to_string()).collect()
     }
@@ -3500,14 +3635,18 @@ mod tests {
         std::io::Read::read_to_end(&mut repo.open_blob(hash.trim()).unwrap(), &mut content)
             .unwrap();
         assert_eq!(content, b"a\0b\n");
-        assert_eq!(repo.object_size(hash.trim()).unwrap(), 4);
+        let hash = hash.trim().to_owned();
+        assert_eq!(
+            repo.blob_sizes(std::slice::from_ref(&hash)).unwrap()[&hash],
+            4
+        );
 
         let missing = "1".repeat(40);
         let mut blob = repo.open_blob(&missing).unwrap();
         assert!(std::io::Read::read_to_end(&mut blob, &mut Vec::new()).is_err());
-        assert!(repo.object_size(&missing).is_err());
+        assert!(repo.blob_sizes(std::slice::from_ref(&missing)).is_err());
         assert!(repo.open_blob("HEAD").is_err());
-        assert!(repo.object_size(&"a".repeat(41)).is_err());
+        assert!(repo.blob_sizes(&["a".repeat(41)]).is_err());
     }
 
     /// Sets `textconv`, a shell command given the file, as the textconv driver for `*.txt`.

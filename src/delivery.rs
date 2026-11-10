@@ -242,6 +242,7 @@ mod tests {
     #[cfg(unix)]
     use crate::git::test_support::hook;
     use crate::git::test_support::{add_remote, commit_elsewhere, isolated_repo, run};
+    use crate::secrets::test_support::aws_key;
     use std::fs;
     use std::path::Path;
 
@@ -312,10 +313,6 @@ mod tests {
         );
     }
 
-    fn key() -> String {
-        format!("AKIA{}", "Q".repeat(16))
-    }
-
     /// Commits what's staged, or all tracked changes, with `message`, checked as `on_secrets` says.
     fn commit_as(repo: &Repo, scope: Scope, message: &str, on_secrets: OnSecrets) -> Result<()> {
         let new_commit = NewCommit {
@@ -347,7 +344,10 @@ mod tests {
 
     /// A hook script that writes a key to `deploy.env` and stages it.
     fn stage_a_key() -> String {
-        format!("echo 'aws {}' > deploy.env\ngit add deploy.env\n", key())
+        format!(
+            "echo 'aws {}' > deploy.env\ngit add deploy.env\n",
+            aws_key()
+        )
     }
 
     /// The files staged in `dir`.
@@ -448,7 +448,7 @@ mod tests {
         let (dir, repo) = isolated_repo();
         let dir = dir.path();
         let moves = moves_of_head(dir);
-        fs::write(dir.join("lib.rs"), format!("// aws {}\n", key())).unwrap();
+        fs::write(dir.join("lib.rs"), format!("// aws {}\n", aws_key())).unwrap();
 
         let written = commit_as(&repo, Scope::Tracked, "fix: a", OnSecrets::Reject).unwrap_err();
 
@@ -457,7 +457,7 @@ mod tests {
             "{written}"
         );
         fs::write(dir.join("lib.rs"), "fn b() {}\n").unwrap();
-        fs::write(dir.join("deploy.env"), format!("aws {}\n", key())).unwrap();
+        fs::write(dir.join("deploy.env"), format!("aws {}\n", aws_key())).unwrap();
         run(dir, &["add", "deploy.env"]);
         let staged = commit_as(&repo, Scope::Tracked, "fix: b", OnSecrets::Reject).unwrap_err();
         assert!(
@@ -475,7 +475,7 @@ mod tests {
         run(dir.path(), &["add", "lib.rs"]);
         let before = head(dir.path());
         let moves = moves_of_head(dir.path());
-        let message = format!("fix: b\n\nThe key is {}.", key());
+        let message = format!("fix: b\n\nThe key is {}.", aws_key());
 
         let error = commit_as(&repo, Scope::Staged, &message, OnSecrets::Reject).unwrap_err();
 
@@ -584,7 +584,7 @@ mod tests {
         run(dir, &["add", "f.txt"]);
         run(dir, &["commit", "-q", "-m", "feature work"]);
         run(dir, &["checkout", "-q", "main"]);
-        fs::write(dir.join("fixture.env"), format!("aws {}\n", key())).unwrap();
+        fs::write(dir.join("fixture.env"), format!("aws {}\n", aws_key())).unwrap();
         run(dir, &["add", "fixture.env"]);
         run(dir, &["commit", "-q", "-m", "add a fixture"]);
         run(dir, &["rm", "-q", "fixture.env"]);
@@ -636,7 +636,7 @@ mod tests {
         fs::write(dir.path().join("lib.rs"), "fn b() {}\n").unwrap();
         run(dir.path(), &["add", "lib.rs"]);
         let moves = moves_of_head(dir.path());
-        let git_args = [format!("--trailer=Token: {}", key())];
+        let git_args = [format!("--trailer=Token: {}", aws_key())];
         let new_commit = NewCommit {
             message: "fix: b",
             scope: Scope::Staged,

@@ -1,6 +1,13 @@
 //! git's diff text: cutting it into one part per file, and taking the lines out of a file's
 //! header that only repeat what its first line says or name blobs.
 
+/// Whether `line` starts a file's part of a diff, a merge's combined diff included.
+pub fn is_file_header(line: &str) -> bool {
+    ["diff --git ", "diff --cc ", "diff --combined "]
+        .iter()
+        .any(|start| line.starts_with(start))
+}
+
 /// Splits a diff into one part per file. Each part starts with "diff --git".
 pub fn split_files(diff: &str) -> Vec<&str> {
     let mut starts: Vec<usize> = diff

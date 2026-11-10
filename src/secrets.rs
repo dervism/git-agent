@@ -16,7 +16,7 @@ use crate::git::{Repo, Scope};
 use crate::ui;
 use anyhow::{Result, bail};
 use contents::{MOST_BINARY_BYTES, Scanned, Unchecked};
-use publication::Published;
+use publication::Found;
 use redact::{Change, Finding};
 
 /// How to make a check pass when its findings aren't secrets.
@@ -173,21 +173,21 @@ pub fn check_outgoing(repo: &Repo, on_secrets: OnSecrets) -> Result<()> {
 
 /// The secrets in every file of what a commit of `scope` will hold.
 fn found_in_changes(repo: &Repo, scope: Scope) -> Result<Scanned> {
-    let published = repo.changes_to_publish(scope, publication::read_diff)?;
-    with_binary_files(repo, published)
+    let found = repo.changes_to_publish(scope, publication::read_diff)?;
+    with_binary_files(repo, found)
 }
 
 /// The secrets in the messages and every file of the commits `range` publishes.
 fn found_in_commits(repo: &Repo, range: &[&str]) -> Result<Scanned> {
-    let published = repo.published_commits(range, publication::read_log)?;
-    with_binary_files(repo, published)
+    let found = repo.published_commits(range, publication::read_log)?;
+    with_binary_files(repo, found)
 }
 
-/// What `published` holds: the secrets in its lines, then those in the whole content of its
-/// binary files.
-fn with_binary_files(repo: &Repo, published: Published) -> Result<Scanned> {
-    let whole = contents::scan(repo, &published.binary, MOST_BINARY_BYTES)?;
-    let findings = published.findings.into_iter().chain(whole.findings);
+/// What a read of a publication `found`: the secrets in its lines, then those in the whole
+/// content of its binary files.
+fn with_binary_files(repo: &Repo, found: Found) -> Result<Scanned> {
+    let whole = contents::scan(repo, &found.binary, MOST_BINARY_BYTES)?;
+    let findings = found.findings.into_iter().chain(whole.findings);
     Ok(Scanned {
         findings: findings.collect(),
         unchecked: whole.unchecked,
@@ -350,8 +350,28 @@ pub fn list_findings(findings: &[&Finding]) -> String {
     lines.join("\n")
 }
 
+/// What the tests of the secret checks share.
+#[cfg(test)]
+pub mod test_support {
+    /// An AWS access key's shape, built at run time so that the source holds no key.
+    pub fn aws_key() -> String {
+        format!("AKIA{}", "Q".repeat(16))
+    }
+
+    /// A GitHub token's shape, built at run time.
+    pub fn github_token() -> String {
+        let noise: String = "q7Rk2LmZ9vXa4TbN8cWp3HdY6sJf5GeU"
+            .chars()
+            .cycle()
+            .take(36)
+            .collect();
+        format!("ghp_{noise}")
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use super::test_support::aws_key;
     use super::*;
     use crate::config::DEFAULT_EXCLUDE;
     use crate::git::test_support::{isolated_repo, move_pointer, run, with_submodule};
@@ -372,10 +392,6 @@ mod tests {
             change,
             kind: "GitHub token".to_owned(),
         }
-    }
-
-    fn key() -> String {
-        format!("AKIA{}", "Q".repeat(16))
     }
 
     /// Writes `text` to `path` in `dir` and stages it.
@@ -604,9 +620,9 @@ mod tests {
             (&own, "vendor/keys.json"),
         ] {
             let (dir, repo) = isolated_repo();
-            stage(dir.path(), path, &format!("aws {}\n", key()));
+            stage(dir.path(), path, &format!("aws {}\n", aws_key()));
             let (_, for_model) = repo.changes(exclude).unwrap().unwrap();
-            assert!(!for_model.diff.contains(&key()), "{}", for_model.diff);
+            assert!(!for_model.diff.contains(&aws_key()), "{}", for_model.diff);
 
             let refusal = refusal_of(check_staged(&repo, Scope::Staged));
 
@@ -624,9 +640,13 @@ mod tests {
     fn reads_the_staged_and_unstaged_changes_a_commit_of_all_changes_holds() {
         let (dir, repo) = isolated_repo();
         let dir = dir.path();
-        commit_file(dir, &format!("aws {}\n", key()), "add the deploy settings");
-        stage(dir, "lib.rs", &format!("// aws {}\n", key()));
-        fs::write(dir.join("draft.env"), format!("aws {}\n", key())).unwrap();
+        commit_file(
+            dir,
+            &format!("aws {}\n", aws_key()),
+            "add the deploy settings",
+        );
+        stage(dir, "lib.rs", &format!("// aws {}\n", aws_key()));
+        fs::write(dir.join("draft.env"), format!("aws {}\n", aws_key())).unwrap();
         let expected = refused(&["   lib.rs:1  AWS access key"]);
         assert_eq!(refusal_of(check_staged(&repo, Scope::Tracked)), expected);
         assert_eq!(refusal_of(check_staged(&repo, Scope::Staged)), expected);
@@ -644,8 +664,12 @@ mod tests {
         let dir = dir.path();
         commit_at(dir, "notes/plan.txt", "plan\n", "add a plan");
         run(dir, &["config", "diff.relative", "true"]);
-        let hash = commit_file(dir, &format!("aws {}\n", key()), "add the deploy settings");
-        stage(dir, "lib.rs", &format!("// aws {}\n", key()));
+        let hash = commit_file(
+            dir,
+            &format!("aws {}\n", aws_key()),
+            "add the deploy settings",
+        );
+        stage(dir, "lib.rs", &format!("// aws {}\n", aws_key()));
         let repo = Repo::open(dir.join("notes")).unwrap();
         let range = ["HEAD~1..HEAD"];
 
@@ -666,7 +690,7 @@ mod tests {
     #[test]
     fn reads_the_changes_of_a_first_commit() {
         let (dir, repo) = unborn_repo();
-        stage(dir.path(), "deploy.env", &format!("aws {}\n", key()));
+        stage(dir.path(), "deploy.env", &format!("aws {}\n", aws_key()));
         let expected = refused(&["   deploy.env:1  AWS access key"]);
         assert_eq!(refusal_of(check_staged(&repo, Scope::Staged)), expected);
         assert_eq!(refusal_of(check_staged(&repo, Scope::Tracked)), expected);
@@ -697,7 +721,7 @@ mod tests {
         let dir = dir.path();
         commit_at(dir, "notes/ø.env", "a\n\nb\n", "add notes");
         hide_from_plain_reads(dir);
-        stage(dir, "notes/ø.env", &format!("a\n\nb\naws {}\n", key()));
+        stage(dir, "notes/ø.env", &format!("a\n\nb\naws {}\n", aws_key()));
 
         let refusal = refusal_of(check_staged(&repo, Scope::Staged));
 
@@ -710,7 +734,7 @@ mod tests {
         let dir = dir.path();
         commit_at(dir, "notes/ø.env", "a\n\nb\n", "add notes");
         hide_from_plain_reads(dir);
-        let text = format!("a\n\nb\naws {}\n", key());
+        let text = format!("a\n\nb\naws {}\n", aws_key());
         let hash = commit_at(dir, "notes/ø.env", &text, "more notes");
         let check = check_commits(&repo, &["HEAD~1..HEAD"], OnSecrets::Reject, &[], &WORDING);
 
@@ -725,7 +749,7 @@ mod tests {
     fn reads_the_changes_against_head_as_it_is() {
         let (dir, repo) = isolated_repo();
         let dir = dir.path();
-        let line = format!("aws {}\n", key());
+        let line = format!("aws {}\n", aws_key());
         let stand_in = commit_file(dir, &line, "a commit HEAD is replaced with");
         run(dir, &["reset", "-q", "--hard", "HEAD~1"]);
         run(dir, &["replace", "-f", "HEAD", &stand_in]);
@@ -744,7 +768,7 @@ mod tests {
         let (dir, repo) = isolated_repo();
         commit_file(
             dir.path(),
-            &format!("aws {}\n", key()),
+            &format!("aws {}\n", aws_key()),
             "add the deploy settings",
         );
         run(dir.path(), &["config", "diff.renames", "false"]);
@@ -758,7 +782,7 @@ mod tests {
         let (dir, repo) = isolated_repo();
         let hash = commit_file(
             dir.path(),
-            &format!("aws {}\n", key()),
+            &format!("aws {}\n", aws_key()),
             "add the deploy settings",
         );
 
@@ -779,7 +803,7 @@ mod tests {
     #[test]
     fn refuses_a_key_in_a_message_after_a_separator_byte() {
         let (dir, repo) = isolated_repo();
-        let message = format!("tidy up\n\n\u{1f}aws {}", key());
+        let message = format!("tidy up\n\n\u{1f}aws {}", aws_key());
         let hash = commit_file(dir.path(), "plain\n", &message);
 
         let error = check_outgoing(&repo, OnSecrets::Reject).unwrap_err();
@@ -793,11 +817,16 @@ mod tests {
     #[test]
     fn refuses_a_key_in_a_commit_of_lockfiles_only() {
         let (dir, repo) = isolated_repo();
-        let in_message = commit_at(dir.path(), "Cargo.lock", "v1\n", &format!("aws {}", key()));
+        let in_message = commit_at(
+            dir.path(),
+            "Cargo.lock",
+            "v1\n",
+            &format!("aws {}", aws_key()),
+        );
         let in_file = commit_at(
             dir.path(),
             "Cargo.lock",
-            &format!("aws {}\n", key()),
+            &format!("aws {}\n", aws_key()),
             "bump",
         );
         let refusal = refusal_of(check_commits(
@@ -825,7 +854,7 @@ mod tests {
         run(dir, &["checkout", "-q", "main"]);
         commit_at(dir, "main.txt", "main\n", "work on main");
         run(dir, &["merge", "-q", "--no-ff", "--no-commit", "side"]);
-        let merge = commit_file(dir, &format!("aws {}\n", key()), "merge the side");
+        let merge = commit_file(dir, &format!("aws {}\n", aws_key()), "merge the side");
 
         let error = check_outgoing(&repo, OnSecrets::Reject).unwrap_err();
 
@@ -839,13 +868,17 @@ mod tests {
     fn reads_the_commits_a_push_sends_whatever_the_users_settings() {
         let (dir, repo) = unborn_repo();
         let dir = dir.path();
-        let first = commit_file(dir, &format!("aws {}\n", key()), "add the deploy settings");
+        let first = commit_file(
+            dir,
+            &format!("aws {}\n", aws_key()),
+            "add the deploy settings",
+        );
         run(dir, &["config", "log.showRoot", "false"]);
         let shown = format!("commit {first} deploy.env:1  AWS access key");
         let error = check_outgoing(&repo, OnSecrets::Reject).unwrap_err();
         assert!(error.to_string().contains(&shown), "{error}");
 
-        let second = commit_file(dir, &format!("aws {}\nmore\n", key()), "more");
+        let second = commit_file(dir, &format!("aws {}\nmore\n", aws_key()), "more");
         let empty = repo.empty_tree().unwrap();
         let stand_in = run(dir, &["commit-tree", "-m", "plain", &empty]);
         run(dir, &["replace", "-f", &first, stand_in.trim()]);
@@ -863,7 +896,7 @@ mod tests {
         let (dir, repo) = isolated_repo();
         commit_file(
             dir.path(),
-            &format!("aws {}\n", key()),
+            &format!("aws {}\n", aws_key()),
             "add the deploy settings",
         );
         run(dir.path(), &["checkout", "-q", "-b", "feature"]);
@@ -877,7 +910,11 @@ mod tests {
     #[test]
     fn only_warns_about_commits_whatever_the_setting() {
         let (dir, repo) = isolated_repo();
-        let hash = commit_file(dir.path(), &format!("aws {}\n", key()), "add the settings");
+        let hash = commit_file(
+            dir.path(),
+            &format!("aws {}\n", aws_key()),
+            "add the settings",
+        );
         let shown = format!("going on:\n   commit {hash} deploy.env:1  AWS access key");
 
         let found = found_in_commits(&repo, &["HEAD"]).unwrap().findings;
@@ -895,7 +932,11 @@ mod tests {
     #[test]
     fn lets_the_push_through_when_set_to_warn() {
         let (dir, repo) = isolated_repo();
-        let hash = commit_file(dir.path(), &format!("aws {}\n", key()), "add the settings");
+        let hash = commit_file(
+            dir.path(),
+            &format!("aws {}\n", aws_key()),
+            "add the settings",
+        );
         let shown = format!(
             "pushing commits that add what look like secrets:\n   commit {hash} deploy.env:1  \
              AWS access key"
@@ -915,8 +956,12 @@ mod tests {
     #[test]
     fn lists_every_commit_a_push_sends_that_adds_a_secret() {
         let (dir, repo) = isolated_repo();
-        let older = commit_file(dir.path(), &format!("aws {}\n", key()), "add the settings");
-        let both = format!("aws {}\naws AKIA{}\n", key(), "R".repeat(16));
+        let older = commit_file(
+            dir.path(),
+            &format!("aws {}\n", aws_key()),
+            "add the settings",
+        );
+        let both = format!("aws {}\naws AKIA{}\n", aws_key(), "R".repeat(16));
         stage(dir.path(), "deploy.env", &both);
         check_changes(&repo, Scope::Staged, OnSecrets::Warn, &[], &WORDING).unwrap();
         let newer = commit_file(dir.path(), &both, "add another key");
@@ -936,7 +981,11 @@ mod tests {
         let (dir, repo) = isolated_repo();
         let dir = dir.path();
         run(dir, &["checkout", "-q", "-b", "side"]);
-        commit_file(dir, &format!("aws {}\n", key()), "add the deploy settings");
+        commit_file(
+            dir,
+            &format!("aws {}\n", aws_key()),
+            "add the deploy settings",
+        );
         run(dir, &["update-ref", "refs/remotes/origin/side", "HEAD"]);
         run(dir, &["checkout", "-q", "main"]);
         commit_at(dir, "main.txt", "main\n", "work on main");
@@ -956,7 +1005,7 @@ mod tests {
         commit_at(
             library.path(),
             "k.env",
-            &format!("aws {}\n", key()),
+            &format!("aws {}\n", aws_key()),
             "add a key",
         );
         let moved = run(library.path(), &["rev-parse", "HEAD"]);
@@ -978,7 +1027,11 @@ mod tests {
         let (dir, repo) = isolated_repo();
         let dir = dir.path();
         let first = run(dir, &["rev-parse", "HEAD"]);
-        let hash = commit_file(dir, &format!("aws {}\n", key()), "add the deploy settings");
+        let hash = commit_file(
+            dir,
+            &format!("aws {}\n", aws_key()),
+            "add the deploy settings",
+        );
         let second = run(dir, &["rev-parse", "HEAD"]);
         run(
             dir,
@@ -1000,7 +1053,7 @@ mod tests {
         let (dir, repo) = isolated_repo();
         commit_file(
             dir.path(),
-            &format!("aws {}\n", key()),
+            &format!("aws {}\n", aws_key()),
             "add the deploy settings",
         );
         run(
@@ -1020,7 +1073,11 @@ mod tests {
     fn refuses_a_key_in_a_file_marked_not_to_be_diffed() {
         let (dir, repo) = isolated_repo();
         stage(dir.path(), ".gitattributes", "*.env -diff\n");
-        stage(dir.path(), "app.env", &format!("DEBUG=1\naws {}\n", key()));
+        stage(
+            dir.path(),
+            "app.env",
+            &format!("DEBUG=1\naws {}\n", aws_key()),
+        );
         assert!(run(dir.path(), &["diff", "--cached"]).contains("Binary files"));
 
         let refusal = refusal_of(check_staged(&repo, Scope::Staged));
@@ -1035,7 +1092,7 @@ mod tests {
         let (dir, repo) = isolated_repo();
         let dir = dir.path();
         commit_at(dir, "data.bin", "\0old\0", "add the data");
-        fs::write(dir.join("data.bin"), format!("\0aws {}\0", key())).unwrap();
+        fs::write(dir.join("data.bin"), format!("\0aws {}\0", aws_key())).unwrap();
         let expected = refused(&["   data.bin  AWS access key"]);
 
         assert!(check_staged(&repo, Scope::Staged).is_ok());
@@ -1052,7 +1109,7 @@ mod tests {
         let (dir, repo) = isolated_repo();
         let outside = TempDir::new().unwrap();
         let target = outside.path().join("keys.bin");
-        fs::write(&target, format!("\0aws {}\0", key())).unwrap();
+        fs::write(&target, format!("\0aws {}\0", aws_key())).unwrap();
         std::os::unix::fs::symlink(&target, dir.path().join("link")).unwrap();
         run(dir.path(), &["add", "link"]);
 
@@ -1067,7 +1124,7 @@ mod tests {
     #[test]
     fn lists_a_binary_file_over_sixteen_mib_and_lets_it_through() {
         let (dir, repo) = isolated_repo();
-        let mut bytes = format!("\0aws {}\0", key()).into_bytes();
+        let mut bytes = format!("\0aws {}\0", aws_key()).into_bytes();
         bytes.resize(usize::try_from(MOST_BINARY_BYTES).unwrap() + 1, 0);
         fs::write(dir.path().join("big.bin"), &bytes).unwrap();
         run(dir.path(), &["add", "big.bin"]);
@@ -1120,7 +1177,7 @@ mod tests {
         run(dir, &["checkout", "-q", "main"]);
         commit_at(dir, "data.bin", "\0main\0", "change it on main");
         run(dir, &["merge", "-q", "--no-commit", "-X", "ours", "side"]);
-        let merge = commit_at(dir, "data.bin", &format!("\0aws {}\0", key()), "merge");
+        let merge = commit_at(dir, "data.bin", &format!("\0aws {}\0", aws_key()), "merge");
 
         let error = check_outgoing(&repo, OnSecrets::Reject).unwrap_err();
 
@@ -1133,7 +1190,7 @@ mod tests {
     fn lets_through_a_binary_file_that_keeps_a_published_key() {
         let (dir, repo) = isolated_repo();
         let dir = dir.path();
-        let line = format!("aws {}", key());
+        let line = format!("aws {}", aws_key());
         commit_at(dir, "data.bin", &format!("\0{line}\0"), "add the data");
         run(dir, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
         let hash = commit_at(dir, "data.bin", &format!("\0more\0{line}\0"), "add more");
@@ -1161,8 +1218,8 @@ mod tests {
         let dir = dir.path();
         stage(dir, ".gitattributes", "*.cfg binary\n*.ini diff=opaque\n");
         run(dir, &["config", "diff.opaque.binary", "true"]);
-        stage(dir, "app.cfg", &format!("aws {}\n", key()));
-        stage(dir, "app.ini", &format!("x = 1\naws {}\n", key()));
+        stage(dir, "app.cfg", &format!("aws {}\n", aws_key()));
+        stage(dir, "app.ini", &format!("x = 1\naws {}\n", aws_key()));
         assert_eq!(
             run(dir, &["diff", "--cached"])
                 .matches("Binary files")
@@ -1184,7 +1241,7 @@ mod tests {
     fn compares_a_renamed_binary_file_with_its_old_content() {
         let (dir, repo) = isolated_repo();
         let dir = dir.path();
-        let line = format!("aws {}", key());
+        let line = format!("aws {}", aws_key());
         let padding = "\0padding that keeps the files alike".repeat(20);
         commit_at(
             dir,

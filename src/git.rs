@@ -1824,7 +1824,14 @@ fn without_dirty_submodule(file: &str) -> Option<String> {
 /// bytes, but not the value, so it can't forge a record or a field.
 pub struct LogMarks {
     value: String,
+    record: String,
+    field: String,
 }
+
+/// What the read of a log says when a commit in it has no hash, as when its marks didn't come
+/// out as written.
+pub const UNREADABLE_LOG: &str =
+    "git-agent couldn't read git's list of commits: a commit in it has no hash";
 
 /// What a line of a log in [`LogMarks::stream_format`] is.
 #[derive(Debug, PartialEq)]
@@ -1846,7 +1853,7 @@ pub struct MarkedLog {
 impl MarkedLog {
     /// Each record, split at its field marks into at most `fields` parts.
     pub fn records(&self, fields: usize) -> Vec<Vec<&str>> {
-        let (record, field) = (self.marks.record(), self.marks.field());
+        let LogMarks { record, field, .. } = &self.marks;
         self.text
             .split(record.as_str())
             .map(|text| text.splitn(fields, field.as_str()).collect())
@@ -1864,9 +1871,7 @@ impl MarkedLog {
                 let mut parts = parts.into_iter();
                 let hash = parts.next().unwrap_or_default().trim();
                 if !is_commit_hash(hash) {
-                    bail!(
-                        "git-agent couldn't read git's list of commits: a commit in it has no hash"
-                    );
+                    bail!(UNREADABLE_LOG);
                 }
                 Ok(CommitPatch {
                     hash: hash.to_owned(),
@@ -1895,37 +1900,40 @@ impl MarkedLog {
 
 impl LogMarks {
     fn new() -> Self {
-        Self {
-            value: random_hex(),
-        }
+        Self::with_value(random_hex())
     }
 
     /// git's separators as they are, without a value, as tests write them.
     #[cfg(test)]
     pub fn plain() -> Self {
+        Self::with_value(String::new())
+    }
+
+    fn with_value(value: String) -> Self {
         Self {
-            value: String::new(),
+            record: format!("\u{1e}{value}"),
+            field: format!("\u{1f}{value}"),
+            value,
         }
     }
 
-    /// What `line`, a line of a log in [`LogMarks::stream_format`], is. Fails on a commit's
-    /// line without a commit's hash, as when the marks didn't come out as written, rather than
-    /// read a commit as none.
+    /// What `line`, a line of a log in [`LogMarks::stream_format`], or the start of a long one,
+    /// is. Fails on a commit's line without a commit's hash, as when the marks didn't come out
+    /// as written, rather than read a commit as none.
     pub fn line(&self, line: &[u8]) -> Result<LogLine> {
         let line = line.strip_suffix(b"\n").unwrap_or(line);
-        match line.first() {
-            Some(0x1e) if line.starts_with(self.record().as_bytes()) => {
-                let hash = std::str::from_utf8(&line[self.record().len()..])
-                    .ok()
-                    .filter(|hash| is_commit_hash(hash))
-                    .context(
-                        "git-agent couldn't read git's list of commits: a commit in it has no hash",
-                    )?;
-                Ok(LogLine::Commit(hash.to_owned()))
-            }
-            Some(0x1f) if line == self.field().as_bytes() => Ok(LogLine::MessageEnd),
-            _ => Ok(LogLine::Text),
+        if let Some(hash) = line.strip_prefix(self.record.as_bytes()) {
+            let hash = std::str::from_utf8(hash)
+                .ok()
+                .filter(|hash| is_commit_hash(hash))
+                .context(UNREADABLE_LOG)?;
+            return Ok(LogLine::Commit(hash.to_owned()));
         }
+        Ok(if line == self.field.as_bytes() {
+            LogLine::MessageEnd
+        } else {
+            LogLine::Text
+        })
     }
 
     /// The `--format` of a commit's hash and message for a log read a line at a time: each mark
@@ -1936,14 +1944,6 @@ impl LogMarks {
             self.record_format(),
             self.field_format()
         )
-    }
-
-    fn record(&self) -> String {
-        format!("\u{1e}{}", self.value)
-    }
-
-    fn field(&self) -> String {
-        format!("\u{1f}{}", self.value)
     }
 
     /// The record's mark as `git log --format` writes it.
@@ -1997,8 +1997,8 @@ fn readable<'a>(args: &[&'a str]) -> Vec<&'a str> {
 }
 
 /// Runs `command`, git with `args`, and gives `read` its stdout as git writes it, failing with
-/// its stderr when git fails. git is stopped when `read` fails, and what `read` leaves of the
-/// output is read to the end, so that git can finish.
+/// its stderr when git fails, before or after `read` does. git is stopped when `read` fails
+/// first, and what `read` leaves of the output is read to the end, so that git can finish.
 fn stream_of<T>(
     mut command: Command,
     args: &[&str],
@@ -2019,21 +2019,28 @@ fn stream_of<T>(
             stderr.read_to_end(&mut said).map(|_| said)
         });
         let mut output = BufReader::new(stdout);
-        let read = read(&mut output).and_then(|read| {
+        let outcome = read(&mut output).and_then(|read| {
             io::copy(&mut output, &mut io::sink())?;
             Ok(read)
         });
-        let stopped = read.is_err() && child.kill().is_ok();
+        drop(output);
+        let git_failed_first =
+            outcome.is_err() && matches!(child.try_wait(), Ok(Some(status)) if !status.success());
+        let stopped = outcome.is_err() && !git_failed_first && child.kill().is_ok();
         let status = child.wait().context("failed to wait for git")?;
         let said = said.join().ok().and_then(Result::ok).unwrap_or_default();
-        if !status.success() && !stopped {
-            bail!(
+        let failed = (!status.success() && !stopped).then(|| {
+            format!(
                 "`git {}` failed: {}",
                 args.join(" "),
                 String::from_utf8_lossy(&said).trim()
-            );
+            )
+        });
+        match (outcome, failed) {
+            (Err(error), Some(failed)) => Err(error.context(failed)),
+            (Ok(_), Some(failed)) => Err(anyhow!(failed)),
+            (outcome, None) => outcome,
         }
-        read
     })
 }
 
@@ -2238,12 +2245,70 @@ mod tests {
         .unwrap()
     }
 
+    /// git is stopped when a reader of a large output fails at once, and the output is read to
+    /// the end when a reader stops early, so that neither waits on git for good.
+    #[test]
+    fn stops_or_drains_git_whatever_the_reader_leaves() {
+        let (dir, repo) = isolated_repo();
+        fs::write(dir.path().join("big.txt"), "line\n".repeat(400_000)).unwrap();
+        run(dir.path(), &["add", "big.txt"]);
+        run(dir.path(), &["commit", "-qm", "add big"]);
+        let (sent, got) = std::sync::mpsc::channel();
+
+        std::thread::spawn(move || {
+            let stopped = repo.published_commits(&["HEAD"], |_, _| -> Result<()> { bail!("stop") });
+            let left = repo.published_commits(&["HEAD"], |_, _| Ok(()));
+            sent.send((stopped.is_err(), left.is_ok())).unwrap();
+        });
+
+        let done = got.recv_timeout(std::time::Duration::from_secs(60));
+        assert_eq!(
+            done.expect("git was neither stopped nor drained"),
+            (true, true)
+        );
+    }
+
+    /// git is stopped when the reader fails while git is still busy and writes nothing, rather
+    /// than waited for.
+    #[test]
+    fn stops_git_still_busy_when_the_reader_fails() {
+        let (sent, got) = std::sync::mpsc::channel();
+
+        std::thread::spawn(move || {
+            let mut command = Command::new("sh");
+            command.args(["-c", "exec sleep 30"]);
+            let outcome = stream_of(command, &["log"], |_| -> Result<()> { bail!("stop") });
+            sent.send(outcome.map_err(|error| error.to_string()))
+                .unwrap();
+        });
+
+        let outcome = got.recv_timeout(std::time::Duration::from_secs(10));
+        assert_eq!(outcome.expect("git was waited for"), Err("stop".to_owned()));
+    }
+
+    /// When git has failed by the time the reader fails, git's error comes first, with the
+    /// reader's under it.
+    #[test]
+    fn reports_git_failing_before_the_reader() {
+        let mut command = Command::new("sh");
+        command.args(["-c", "printf partial; echo broken >&2; exit 3"]);
+
+        let error = stream_of(command, &["log"], |output| -> Result<()> {
+            io::copy(output, &mut io::sink())?;
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            bail!("cut short")
+        })
+        .unwrap_err();
+
+        assert_eq!(format!("{error:#}"), "`git log` failed: broken: cut short");
+    }
+
     /// Each mark of a log read a line at a time is a line of its own: a commit's, with its hash,
     /// and the end of its message. A commit's line without a hash fails the read.
     #[test]
     fn tells_the_lines_of_a_log_by_their_marks() {
         let marks = LogMarks::new();
-        let (record, field) = (marks.record(), marks.field());
+        let (record, field) = (&marks.record, &marks.field);
         let line = |text: &str| marks.line(text.as_bytes());
 
         assert_eq!(
@@ -2251,7 +2316,7 @@ mod tests {
             LogLine::Commit("1a2b3c4".to_owned())
         );
         assert_eq!(line(&format!("{field}\n")).unwrap(), LogLine::MessageEnd);
-        assert_eq!(line(&field).unwrap(), LogLine::MessageEnd);
+        assert_eq!(line(field).unwrap(), LogLine::MessageEnd);
         for text in [
             "feat: add b\n".to_owned(),
             "\u{1e}1a2b3c4\n".to_owned(),

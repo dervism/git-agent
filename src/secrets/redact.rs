@@ -7,6 +7,7 @@
 //! `your-api-key` and references such as `${TOKEN}` are left alone, and so are
 //! secrets in formats none of the rules know.
 
+use crate::git::diff::is_file_header;
 use crate::git::names;
 use crate::safe_text::without_hidden;
 use regex_lite::Regex;
@@ -237,53 +238,41 @@ fn scan_diff(diff: &str, mut keep: impl FnMut(&str)) -> Vec<Finding> {
     let mut scan = DiffScan::default();
     for line in diff.split_inclusive('\n') {
         match scan.line(line) {
-            Kept::As(line) => keep(line),
+            Kept::Outside(line) => keep(line),
             Kept::Scanned { markers, content } => {
                 keep(markers);
                 keep(&content);
             }
-            Kept::Out => {}
+            Kept::Dropped => {}
         }
     }
     scan.findings()
 }
 
-/// Whether `line` starts a file's part of a diff, a merge's combined diff included.
-pub fn is_file_header(line: &str) -> bool {
-    ["diff --git ", "diff --cc ", "diff --combined "]
-        .iter()
-        .any(|start| line.starts_with(start))
-}
-
 /// A line of a diff as scanning it leaves it.
 pub enum Kept<'l> {
     /// A line outside the hunks, as it was.
-    As(&'l str),
+    Outside(&'l str),
     /// A hunk's line: its markers, and its content with its secrets replaced.
     Scanned { markers: &'l str, content: String },
     /// A line of a private key's data that the key's one [`REDACTED`] line already stands for.
-    Out,
+    Dropped,
 }
 
-/// What a line of a diff too long to scan whole is, as [`DiffScan::long_line`] tells from its
-/// start.
-#[derive(Debug, PartialEq)]
-pub enum LongLineIs {
-    /// A line outside the hunks, which needs no more reading than its start.
-    Other,
-    /// More of a private key's data, which the key's finding already covers.
-    KeyData,
-    /// A hunk's line to scan in windows, from after its markers, and to give back to
-    /// [`DiffScan::long_text`].
-    Text(LongText),
-}
-
-/// A hunk's line too long to scan whole: how many bytes its markers take, and where it is.
-#[derive(Debug, PartialEq)]
+/// A hunk's line too long to scan whole, from its start until its windows have been scanned:
+/// how many bytes its markers take, where it is, and what it is to a private key's block.
 pub struct LongText {
     pub markers: usize,
     change: Change,
     number: usize,
+    line: LongLineScan,
+}
+
+impl LongText {
+    /// Takes the next piece of the line, after its markers.
+    pub fn feed(&mut self, piece: &[u8]) {
+        self.line.feed(piece);
+    }
 }
 
 /// Scans a diff's lines one after another, keeping track of the file, the hunk and a private
@@ -310,36 +299,33 @@ impl DiffScan {
             let mut kinds = Vec::new();
             let content = self.scanner.scan(&line[markers.len()..], &mut kinds);
             self.found(change, number, kinds);
-            return content.map_or(Kept::Out, |content| Kept::Scanned { markers, content });
+            return content.map_or(Kept::Dropped, |content| Kept::Scanned { markers, content });
         }
-        Kept::As(line)
+        Kept::Outside(line)
     }
 
-    /// Takes the next line, too long to scan whole, which starts with `start`, and says what
-    /// is left to do with it.
-    pub fn long_line(&mut self, start: &str) -> LongLineIs {
+    /// Takes the next line, too long to scan whole, which starts with `start`. A hunk's line
+    /// comes back to be scanned in windows from after its markers, fed to its [`LongText`], and
+    /// given to [`DiffScan::long_text`]; any other line needs nothing more than its start.
+    pub fn long_line(&mut self, start: &str) -> Option<LongText> {
         let Some((markers, change, number)) = self.take(start) else {
             self.line(start);
-            return LongLineIs::Other;
+            return None;
         };
-        match self.scanner.long_line(&start[markers.len()..]) {
-            Some(kinds) => {
-                self.found(change, number, kinds);
-                LongLineIs::KeyData
-            }
-            None => LongLineIs::Text(LongText {
-                markers: markers.len(),
-                change,
-                number,
-            }),
-        }
+        Some(LongText {
+            markers: markers.len(),
+            change,
+            number,
+            line: self.scanner.start_long_line(&start[markers.len()..]),
+        })
     }
 
     /// Takes what the windows of `text` hold: the secrets that look like `kinds`, and the line's
     /// end, `tail`, after which a private key's block may begin.
     pub fn long_text(&mut self, text: LongText, kinds: Vec<String>, tail: &str) {
-        self.found(text.change, text.number, kinds);
-        self.scanner.after_long_line(tail);
+        if let Some(kinds) = self.scanner.end_long_line(text.line, kinds, tail) {
+            self.found(text.change, text.number, kinds);
+        }
     }
 
     /// The findings so far.
@@ -515,25 +501,88 @@ impl LineScan {
         }
     }
 
-    /// What the next line, too long to scan whole, which starts with `start`, holds of a private
-    /// key, when it's the key's data: the key, where its data starts, or more of it. `None` for
-    /// any other line, which is to be scanned in windows and then given to
-    /// [`LineScan::after_long_line`].
-    pub fn long_line(&mut self, start: &str) -> Option<Held> {
-        self.0.long_line(start).map(|kinds| {
-            if kinds.is_empty() {
-                Held::MoreOfAKey
-            } else {
-                Held::Secrets(kinds)
-            }
-        })
+    /// Starts on the next line, too long to scan whole, which starts with `start`: it's to be
+    /// scanned in windows, its pieces fed to the [`LongLineScan`], and given to
+    /// [`LineScan::end_long_line`].
+    pub fn start_long_line(&self, start: &str) -> LongLineScan {
+        self.0.start_long_line(start)
     }
 
-    /// Takes up again after a line too long to scan whole, which ends with `tail`: a private
-    /// key's block ends at such a line, and one starts after it if `tail` ends with a key's
-    /// BEGIN line.
-    pub fn after_long_line(&mut self, tail: &str) {
-        self.0.after_long_line(tail);
+    /// What the long line `line` holds, now that its windows found secrets that look like
+    /// `kinds`, and it ended with `tail`.
+    pub fn end_long_line(&mut self, line: LongLineScan, kinds: Vec<String>, tail: &str) -> Held {
+        match self.0.end_long_line(line, kinds, tail) {
+            None => Held::MoreOfAKey,
+            Some(kinds) if kinds.is_empty() => Held::Nothing,
+            Some(kinds) => Held::Secrets(kinds),
+        }
+    }
+}
+
+/// A line too long to scan whole, read a piece at a time: whether the line before left a private
+/// key's block open, whether this one is a header of the key's, and whether all of it is the
+/// key's data, which only the whole line can tell.
+pub struct LongLineScan {
+    in_key: bool,
+    header: bool,
+    data: KeyData,
+}
+
+impl LongLineScan {
+    /// Takes the next piece of the line.
+    pub fn feed(&mut self, piece: &[u8]) {
+        if self.in_key {
+            self.data
+                .feed(&without_hidden(&String::from_utf8_lossy(piece)).text);
+        }
+    }
+}
+
+/// Whether text fed a piece at a time is a private key's data, as [`is_key_data`] tells a whole
+/// line: base64, with what [`strip_code`] takes off its ends around it, and nothing else.
+#[derive(Default, Clone, Copy, Debug, PartialEq)]
+enum KeyData {
+    /// Before the data, among what code puts in front of it.
+    #[default]
+    Before,
+    /// Before the data, after a backslash, which only `n` can follow there.
+    BeforeBackslash,
+    Data,
+    /// After the data, among what code puts after it.
+    After,
+    /// After the data, after a backslash.
+    AfterBackslash,
+    /// Not a key's data.
+    Not,
+}
+
+impl KeyData {
+    fn feed(&mut self, text: &str) {
+        *self = text.chars().fold(*self, KeyData::next);
+    }
+
+    fn next(self, character: char) -> Self {
+        let code = character.is_whitespace() || "\"'`,;+".contains(character);
+        let data = character.is_ascii_alphanumeric() || "+/=".contains(character);
+        match (self, character) {
+            (KeyData::Before, '\\') => KeyData::BeforeBackslash,
+            (KeyData::BeforeBackslash, 'n') => KeyData::Before,
+            (KeyData::Before, _) if code => KeyData::Before,
+            (KeyData::Before | KeyData::Data, _) if data => KeyData::Data,
+            (KeyData::Data | KeyData::After | KeyData::AfterBackslash, '\\') => {
+                KeyData::AfterBackslash
+            }
+            (KeyData::AfterBackslash, 'n') => KeyData::After,
+            (KeyData::Data | KeyData::After | KeyData::AfterBackslash, _) if code => KeyData::After,
+            _ => KeyData::Not,
+        }
+    }
+
+    fn is_key_data(self) -> bool {
+        matches!(
+            self,
+            KeyData::Data | KeyData::After | KeyData::AfterBackslash
+        )
     }
 }
 
@@ -580,14 +629,11 @@ struct Scanner {
 }
 
 impl Scanner {
-    /// The line with its secrets replaced, adding what they look like to
-    /// `kinds`. A private key's lines become one [`REDACTED`] line, so `None`
-    /// means the line is left out.
-    /// `line` with its secrets replaced, or `None` if it's part of a key already replaced.
-    /// The patterns see the line without hidden characters, since a secret with an
-    /// invisible character inside matches none. A line that held a secret goes on as
-    /// that visible text; any other line goes on as it was, so the model sees its hidden
-    /// characters escaped.
+    /// `line` with its secrets replaced, adding what they look like to `kinds`, or `None` if
+    /// it's part of a key already replaced: a private key's lines become one [`REDACTED`] line.
+    /// The patterns see the line without hidden characters, since a secret with an invisible
+    /// character inside matches none. A line that held a secret goes on as that visible text;
+    /// any other line goes on as it was, so the model sees its hidden characters escaped.
     fn scan(&mut self, line: &str, kinds: &mut Vec<String>) -> Option<String> {
         let visible = without_hidden(line);
         let found = kinds.len();
@@ -599,30 +645,41 @@ impl Scanner {
         })
     }
 
-    /// What the next line, too long to scan whole, which starts with `start`, holds of a private
-    /// key: inside a key's block, a line that starts as key data is more of the key's data, and
-    /// the key itself where the data starts, as [`Scanner::scan_visible`] takes a line of it.
-    /// `None` for any other line.
-    fn long_line(&mut self, start: &str) -> Option<Vec<String>> {
-        if !(self.in_key && is_key_data(&without_hidden(start).text)) {
-            return None;
+    /// Starts on the next line, too long to scan whole, which starts with `start`. Only the
+    /// start is needed to tell a key's header line, whose name comes first.
+    fn start_long_line(&self, start: &str) -> LongLineScan {
+        LongLineScan {
+            in_key: self.in_key,
+            header: self.in_key && is_key_header(&without_hidden(start).text),
+            data: KeyData::default(),
         }
-        let starts = !self.key_replaced;
-        self.key_replaced = true;
-        Some(if starts {
-            vec!["private key".to_owned()]
-        } else {
-            Vec::new()
-        })
     }
 
-    /// Takes up again after a line too long to scan whole, which ends with `tail`, as
-    /// [`LineScan::after_long_line`] says.
-    fn after_long_line(&mut self, tail: &str) {
-        *self = Scanner {
-            in_key: starts_key_block(&without_hidden(tail).text),
-            key_replaced: false,
-        };
+    /// What the long line `line` holds, now that its windows found secrets that look like
+    /// `kinds`, and it ended with `tail`, as [`Scanner::scan_visible`] takes a line: inside a
+    /// key's block, a line all of the key's data is the key, where its data starts, and is left
+    /// out (`None`) after that, whatever the windows found in it; any other line holds what the
+    /// windows found, ends the block unless it's a header of the key's, and starts one if
+    /// `tail` ends with a key's BEGIN line.
+    fn end_long_line(
+        &mut self,
+        line: LongLineScan,
+        kinds: Vec<String>,
+        tail: &str,
+    ) -> Option<Vec<String>> {
+        if line.in_key && line.data.is_key_data() {
+            if self.key_replaced {
+                return None;
+            }
+            self.key_replaced = true;
+            return Some(vec!["private key".to_owned()]);
+        }
+        self.in_key = line.header;
+        if starts_key_block(&without_hidden(tail).text) {
+            self.in_key = true;
+            self.key_replaced = false;
+        }
+        Some(kinds)
     }
 
     fn scan_visible(&mut self, line: &str, kinds: &mut Vec<String>) -> Option<String> {
@@ -1574,5 +1631,99 @@ mod tests {
             assert!(!kept.contains(&password), "{kept}");
             assert!(!kinds.is_empty(), "{line}");
         }
+    }
+
+    /// The key-data check fed a piece at a time agrees with [`is_key_data`] on the whole line, on
+    /// short lines of every character that matters to it, cut anywhere.
+    #[test]
+    fn tells_key_data_a_piece_at_a_time_as_a_whole_line_does() {
+        let alphabet: Vec<char> = "An+/=\\ \"',;`x\t".chars().collect();
+        let mut state = 0x2545_f491_4f6c_dd1d_u64;
+        let mut pick = |below: usize| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            usize::try_from(state % u64::try_from(below).unwrap()).unwrap()
+        };
+        for _ in 0..200_000 {
+            let length = pick(9);
+            let line: String = (0..length)
+                .map(|_| alphabet[pick(alphabet.len())])
+                .collect();
+            let cut = line
+                .char_indices()
+                .nth(pick(length + 1))
+                .map_or(line.len(), |(at, _)| at);
+            let mut data = KeyData::default();
+            data.feed(&line[..cut]);
+            data.feed(&line[cut..]);
+
+            assert_eq!(data.is_key_data(), is_key_data(&line), "{line:?}");
+        }
+    }
+
+    /// Takes a long line, of `pieces`, whose windows found `kinds`, the way the line readers do.
+    fn long(scan: &mut LineScan, pieces: &[&str], kinds: &[&str]) -> Held {
+        let mut line = scan.start_long_line(pieces[0]);
+        pieces.iter().for_each(|piece| line.feed(piece.as_bytes()));
+        let kinds = kinds.iter().map(ToString::to_string).collect();
+        scan.end_long_line(line, kinds, pieces[pieces.len() - 1])
+    }
+
+    /// In a private key's block, a long line all of key data is the key where its data starts,
+    /// and holds nothing more after that, whatever its windows found; one that isn't holds what
+    /// its windows found and ends the block, unless it's a header of the key's; and a block
+    /// begins after a long line whose end is a BEGIN line.
+    #[test]
+    fn takes_a_long_line_in_a_key_block_by_all_of_it() {
+        let begin = "-----BEGIN OPENSSH PRIVATE KEY-----";
+        let found = |kind: &str| Held::Secrets(vec![kind.to_owned()]);
+        let mut scan = LineScan::default();
+        scan.line(begin);
+        assert_eq!(
+            long(&mut scan, &["AAAA", "BBBB"], &["x"]),
+            found("private key")
+        );
+        assert_eq!(long(&mut scan, &["CCCC", "DDDD"], &["x"]), Held::MoreOfAKey);
+        assert_eq!(long(&mut scan, &["EEEE", " ghp"], &["y"]), found("y"));
+        assert_eq!(scan.line("FFFF"), Held::Nothing, "the block ended");
+
+        let mut scan = LineScan::default();
+        scan.line(begin);
+        assert_eq!(long(&mut scan, &["Comment: xx", "x x"], &[]), Held::Nothing);
+        assert_eq!(
+            scan.line("AAAA"),
+            found("private key"),
+            "a header keeps the block"
+        );
+
+        let mut scan = LineScan::default();
+        assert_eq!(long(&mut scan, &["AAAA", "BBBB"], &[]), Held::Nothing);
+        assert_eq!(long(&mut scan, &["x", begin], &[]), Held::Nothing);
+        assert_eq!(scan.line("AAAA"), found("private key"), "a block begins");
+    }
+
+    /// A diff's long line outside the hunks needs no more than its start, which still counts as a
+    /// file's header; a hunk's comes back with its markers, and what its windows find lands on its
+    /// number, the lines after it keeping theirs.
+    #[test]
+    fn takes_a_long_line_of_a_diff_by_where_it_is() {
+        let mut scan = DiffScan::default();
+
+        assert!(scan.long_line("diff --git a/x.env b/x.env").is_none());
+        scan.line("@@ -1,2 +1,3 @@\n");
+        scan.line(" same\n");
+        let text = scan.long_line("+added").expect("a hunk's line");
+        assert_eq!(text.markers, 1);
+        scan.long_text(text, vec!["AWS access key".to_owned()], "end");
+        scan.line(&format!("+{}\n", crate::secrets::test_support::aws_key()));
+
+        let found: Vec<(String, Option<usize>, Change)> = scan
+            .findings()
+            .into_iter()
+            .map(|finding| (finding.place, finding.line, finding.change))
+            .collect();
+        let at = |line| ("x.env".to_owned(), Some(line), Change::Added);
+        assert_eq!(found, [at(2), at(3)]);
     }
 }

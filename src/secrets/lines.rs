@@ -1,6 +1,6 @@
 //! Text read a line at a time in bounded memory. A line up to [`WINDOW`] bytes comes whole, and a
-//! longer one, such as a minified bundle's, is read in pieces, or scanned in windows that overlap,
-//! so that no more than a window or two of it is held at once.
+//! longer one, such as a minified bundle's, is scanned in windows that overlap, or skipped, so
+//! that no more than a window or two of it is held at once.
 
 use super::redact;
 use std::collections::BTreeMap;
@@ -18,8 +18,8 @@ pub const OVERLAP: usize = 64 * 1024;
 pub enum Line {
     /// A line of up to [`WINDOW`] bytes, with its line end if it has one.
     Whole(Vec<u8>),
-    /// The first [`WINDOW`] bytes of a longer line, whose rest [`Lines::scan_rest`] or
-    /// [`Lines::read_rest`] reads next.
+    /// The first [`WINDOW`] bytes of a longer line, whose rest [`Lines::scan_rest`] reads next,
+    /// or [`Lines::next_line`] skips.
     Long(Vec<u8>),
 }
 
@@ -32,17 +32,28 @@ pub struct LongLine {
 }
 
 /// The lines of the text a reader holds.
-pub struct Lines<R>(R);
+pub struct Lines<R> {
+    reader: R,
+    /// Whether the last line was long, and its rest hasn't been read.
+    unfinished: bool,
+}
 
 impl<R: BufRead> Lines<R> {
     pub fn new(reader: R) -> Self {
-        Self(reader)
+        Self {
+            reader,
+            unfinished: false,
+        }
     }
 
-    /// The next line, or `None` at the end of the text.
+    /// The next line, or `None` at the end of the text. The rest of a long line that wasn't
+    /// scanned is skipped first.
     pub fn next_line(&mut self) -> io::Result<Option<Line>> {
+        if std::mem::take(&mut self.unfinished) {
+            self.skip_rest()?;
+        }
         let mut start = Vec::new();
-        if (&mut self.0)
+        if (&mut self.reader)
             .take(WINDOW as u64)
             .read_until(b'\n', &mut start)?
             == 0
@@ -52,6 +63,7 @@ impl<R: BufRead> Lines<R> {
         Ok(Some(if start.len() < WINDOW || start.ends_with(b"\n") {
             Line::Whole(start)
         } else {
+            self.unfinished = true;
             Line::Long(start)
         }))
     }
@@ -64,6 +76,7 @@ impl<R: BufRead> Lines<R> {
         start: Vec<u8>,
         mut feed: impl FnMut(&[u8]),
     ) -> io::Result<LongLine> {
+        self.unfinished = false;
         feed(&start);
         let mut tally = Tally::default();
         let mut window = start;
@@ -89,26 +102,16 @@ impl<R: BufRead> Lines<R> {
         })
     }
 
-    /// Reads a long line, whose first bytes are `start` and whose rest comes next, without
-    /// scanning it: `feed` is given it, without its line end, a piece at a time.
-    pub fn read_rest(&mut self, start: &[u8], mut feed: impl FnMut(&[u8])) -> io::Result<()> {
-        feed(start);
-        loop {
-            let piece = self.piece(WINDOW)?;
-            if piece.bytes.is_empty() {
-                return Ok(());
-            }
-            feed(&piece.bytes);
-            if piece.last {
-                return Ok(());
-            }
-        }
+    /// Reads past the rest of a long line.
+    fn skip_rest(&mut self) -> io::Result<()> {
+        while !self.piece(WINDOW)?.last {}
+        Ok(())
     }
 
     /// Up to `most` more bytes of the line being read, without its line end.
     fn piece(&mut self, most: usize) -> io::Result<Piece> {
         let mut bytes = Vec::new();
-        (&mut self.0)
+        (&mut self.reader)
             .take(most as u64)
             .read_until(b'\n', &mut bytes)?;
         let ended = bytes.ends_with(b"\n");
@@ -196,7 +199,7 @@ pub mod test_support {
     pub fn line_with_keys(length: usize, at: &[usize]) -> Vec<u8> {
         let mut line = vec![b'x'; length];
         for start in at {
-            let key = format!(" AKIA{} ", "Q".repeat(16));
+            let key = format!(" {} ", crate::secrets::test_support::aws_key());
             line[*start..*start + key.len()].copy_from_slice(key.as_bytes());
         }
         line
@@ -244,11 +247,11 @@ mod tests {
             .collect();
         assert_eq!(ends, [Some(b'\n'), Some(b't')]);
         assert!(read.iter().all(|(_, scanned)| scanned.is_none()));
-        assert!(read_nothing(b""));
     }
 
-    fn read_nothing(text: &[u8]) -> bool {
-        Lines::new(Cursor::new(text)).next_line().unwrap().is_none()
+    #[test]
+    fn reads_no_line_from_no_text() {
+        assert_eq!(Lines::new(Cursor::new(b"")).next_line().unwrap(), None);
     }
 
     /// A line of a window's length, line end included, comes whole; one byte more and it's long,
@@ -290,26 +293,21 @@ mod tests {
         assert_eq!(read.len(), 1);
     }
 
-    /// Reading a long line without scanning it gives `feed` all of it, in pieces of a window at
-    /// most, and leaves the next line to read.
+    /// The rest of a long line that isn't scanned is skipped, however long, and the line after
+    /// it comes next, whole.
     #[test]
-    fn reads_the_rest_of_a_long_line_in_pieces() {
+    fn skips_the_rest_of_a_long_line_left_unscanned() {
         let line = line_with_keys(3 * WINDOW + 7, &[WINDOW]);
         let mut lines = Lines::new(Cursor::new([&line[..], b"\nnext"].concat()));
-        let Some(Line::Long(start)) = lines.next_line().unwrap() else {
-            panic!("the line is long");
-        };
-        let mut pieces = Vec::new();
 
-        lines
-            .read_rest(&start, |piece| pieces.push(piece.len()))
-            .unwrap();
+        let first = lines.next_line().unwrap();
 
-        assert_eq!(pieces, [WINDOW, WINDOW, WINDOW, 7]);
+        assert!(matches!(first, Some(Line::Long(start)) if start.len() == WINDOW));
         assert_eq!(
             lines.next_line().unwrap(),
             Some(Line::Whole(b"next".to_vec()))
         );
+        assert_eq!(lines.next_line().unwrap(), None);
     }
 
     /// What the scans of `windows`, between which each of `overlaps` lies, find, as a [`Tally`]

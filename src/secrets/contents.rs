@@ -5,7 +5,7 @@
 use super::lines::{Line, Lines};
 use super::redact::{self, Change, Finding, Held, LineScan, SecretLine};
 use crate::git::blob::BlobBatch;
-use crate::git::{Repo, names};
+use crate::git::{Repo, diff, names};
 use anyhow::{Context, Result, bail};
 use std::collections::hash_map::{DefaultHasher, RandomState};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -108,6 +108,7 @@ impl Fingerprints {
 }
 
 /// A fingerprint being fed, in its two halves.
+#[derive(Clone)]
 struct Fingerprinting([DefaultHasher; 2]);
 
 impl Fingerprinting {
@@ -135,7 +136,7 @@ impl BinaryFiles {
     /// Takes the next line of the diff, without its line end. A line too long to read whole
     /// can be given by its start, since only a line's start tells this anything.
     pub fn line(&mut self, line: &str) -> Result<()> {
-        if redact::is_file_header(line) {
+        if diff::is_file_header(line) {
             let place = names::of_diff(line);
             let done = std::mem::replace(
                 &mut self.section,
@@ -480,44 +481,41 @@ impl SecretLines<'_> {
     }
 
     /// Takes the line `number`, too long to scan whole, whose first bytes are `start` and whose
-    /// rest `lines` reads next. A private key's data is fingerprinted as it streams; any other
-    /// such line is scanned in windows, with a fingerprint of all of it.
+    /// rest `lines` reads next. It's scanned in windows and fingerprinted as it streams, both on
+    /// its own and as more of the key that waits, since only all of it tells whether it's more of
+    /// that key's data.
     fn long_line<R: BufRead>(
         &mut self,
         number: usize,
         start: Vec<u8>,
         lines: &mut Lines<R>,
     ) -> io::Result<()> {
-        match self.scan.long_line(&String::from_utf8_lossy(&start)) {
-            Some(Held::Secrets(kinds)) => {
-                let mut print = self.fingerprints.start();
-                lines.read_rest(&start, |piece| print.feed(piece))?;
-                self.keep(Some(Waiting {
-                    number,
-                    print,
-                    kinds,
-                }));
+        let mut line = self.scan.start_long_line(&String::from_utf8_lossy(&start));
+        let mut own = self.fingerprints.start();
+        let mut more = self.last.as_ref().map(|last| {
+            let mut print = last.print.clone();
+            print.feed(b"\n");
+            print
+        });
+        let long = lines.scan_rest(start, |piece| {
+            line.feed(piece);
+            own.feed(piece);
+            if let Some(more) = &mut more {
+                more.feed(piece);
             }
-            Some(_) => match &mut self.last {
-                Some(last) => {
-                    last.print.feed(b"\n");
-                    lines.read_rest(&start, |piece| last.print.feed(piece))?;
-                }
-                None => lines.read_rest(&start, |_| {})?,
-            },
-            None => {
-                let mut print = self.fingerprints.start();
-                let long = lines.scan_rest(start, |piece| print.feed(piece))?;
-                self.scan.after_long_line(&long.tail);
-                self.keep(None);
-                if !long.kinds.is_empty() {
-                    self.found.push(Secrets {
-                        number,
-                        fingerprint: print.finish(),
-                        kinds: long.kinds,
-                    });
+        })?;
+        match self.scan.end_long_line(line, long.kinds, &long.tail) {
+            Held::Secrets(kinds) => self.keep(Some(Waiting {
+                number,
+                print: own,
+                kinds,
+            })),
+            Held::MoreOfAKey => {
+                if let (Some(last), Some(more)) = (&mut self.last, more) {
+                    last.print = more;
                 }
             }
+            Held::Nothing => {}
         }
         Ok(())
     }
@@ -601,14 +599,11 @@ fn runs_of(characters: impl Iterator<Item = Option<u8>>) -> Vec<String> {
 mod tests {
     use super::super::lines::WINDOW;
     use super::super::lines::test_support::line_with_keys;
+    use super::super::test_support::{aws_key, github_token};
     use super::*;
     use crate::git::test_support::{isolated_repo, run};
     use std::fs;
     use std::path::Path;
-
-    fn key() -> String {
-        format!("AKIA{}", "Q".repeat(16))
-    }
 
     /// Writes `bytes` to `name` in `dir` and stores them as a blob, whose hash it returns.
     fn blob(dir: &Path, name: &str, bytes: &[u8]) -> String {
@@ -704,7 +699,7 @@ mod tests {
     /// Windows and .NET write text as UTF-16, with a NUL byte beside every ASCII character.
     #[test]
     fn takes_runs_of_utf_16_text_from_binary_content() {
-        let line = format!("AWS={}", key());
+        let line = format!("AWS={}", aws_key());
         let little = [&[0xff, 0xfe][..], &utf16(&line, true)].concat();
         assert_eq!(printable_runs(&little), std::slice::from_ref(&line));
         let odd = [&b"\0\x01\x02"[..], &utf16(&line, true), b"\0\0"].concat();
@@ -719,8 +714,16 @@ mod tests {
     fn reads_a_text_file_line_by_line_and_a_binary_one_by_its_printable_runs() {
         let (dir, repo) = isolated_repo();
         let dir = dir.path();
-        let text = blob(dir, "app.env", format!("A=1\nAWS={}\n", key()).as_bytes());
-        let binary = blob(dir, "data.bin", format!("\0\0aws {}\0", key()).as_bytes());
+        let text = blob(
+            dir,
+            "app.env",
+            format!("A=1\nAWS={}\n", aws_key()).as_bytes(),
+        );
+        let binary = blob(
+            dir,
+            "data.bin",
+            format!("\0\0aws {}\0", aws_key()).as_bytes(),
+        );
         let files = [file("app.env", &text, &[]), file("data.bin", &binary, &[])];
 
         let scanned = scan(&repo, &files, MOST_BINARY_BYTES).unwrap();
@@ -752,7 +755,7 @@ mod tests {
     fn counts_a_secret_as_added_only_when_no_parent_holds_it() {
         let (dir, repo) = isolated_repo();
         let dir = dir.path();
-        let line = format!("aws {}", key());
+        let line = format!("aws {}", aws_key());
         let old = blob(dir, "old.bin", format!("\0{line}\0").as_bytes());
         let other = blob(dir, "other.bin", b"\0nothing here\0");
         let new = blob(dir, "new.bin", format!("\0more\0{line}\0").as_bytes());
@@ -785,12 +788,12 @@ mod tests {
         let binary = blob(
             dir,
             "big.bin",
-            format!("\0aws {}\0{}", key(), "x".repeat(200)).as_bytes(),
+            format!("\0aws {}\0{}", aws_key(), "x".repeat(200)).as_bytes(),
         );
         let text = blob(
             dir,
             "big.env",
-            format!("{}\naws {}\n", "x".repeat(200), key()).as_bytes(),
+            format!("{}\naws {}\n", "x".repeat(200), aws_key()).as_bytes(),
         );
         let files = [file("big.bin", &binary, &[]), file("big.env", &text, &[])];
 
@@ -942,7 +945,7 @@ mod tests {
     fn reads_every_size_at_once_and_each_blob_once() {
         let (old, new, plain) = ("a".repeat(40), "b".repeat(40), "c".repeat(40));
         let (line, other) = (
-            format!("aws {}", key()),
+            format!("aws {}", aws_key()),
             format!("aws AKIA{}", "W".repeat(16)),
         );
         let (old_bytes, new_bytes) = (format!("\0{line}\0"), format!("\0{line}\0{other}\0"));
@@ -986,9 +989,9 @@ mod tests {
     #[test]
     fn streams_only_the_blobs_over_the_cap() {
         let (small, big_binary, big_text) = ("a".repeat(40), "b".repeat(40), "c".repeat(40));
-        let small_bytes = format!("\0aws {}\0", key());
-        let binary_bytes = format!("\0aws {}\0{}", key(), "x".repeat(200));
-        let text_bytes = format!("{}\naws {}\n", "x".repeat(200), key());
+        let small_bytes = format!("\0aws {}\0", aws_key());
+        let binary_bytes = format!("\0aws {}\0{}", aws_key(), "x".repeat(200));
+        let text_bytes = format!("{}\naws {}\n", "x".repeat(200), aws_key());
         let mut blobs = Counted::with(&[
             (&small, small_bytes.as_bytes()),
             (&big_binary, binary_bytes.as_bytes()),
@@ -1041,7 +1044,7 @@ mod tests {
     fn reads_a_blob_and_not_its_replacement() {
         let (dir, repo) = isolated_repo();
         let dir = dir.path();
-        let keyed = format!("\0aws {}\0", key());
+        let keyed = format!("\0aws {}\0", aws_key());
         let hidden = blob(dir, "keyed.bin", keyed.as_bytes());
         let plain = format!("\0{}\0", "x".repeat(keyed.len() - 2));
         let stand_in = blob(dir, "plain.bin", plain.as_bytes());
@@ -1075,7 +1078,7 @@ mod tests {
     #[test]
     fn forgets_each_blob_after_the_last_file_that_names_it() {
         let (one, two) = ("a".repeat(40), "b".repeat(40));
-        let line = format!("\0aws {}\0", key());
+        let line = format!("\0aws {}\0", aws_key());
         let mut blobs = Counted::with(&[(&one, line.as_bytes()), (&two, line.as_bytes())]);
         let files = [file("1.bin", &one, &[]), file("2.bin", &two, &[&one])];
         let mut contents = Contents::new(&mut blobs, &files, MOST_BINARY_BYTES).unwrap();
@@ -1097,7 +1100,11 @@ mod tests {
     fn sizes_a_blob_and_not_its_replacement() {
         let (dir, repo) = isolated_repo();
         let dir = dir.path();
-        let hidden = blob(dir, "keyed.bin", format!("\0aws {}\0", key()).as_bytes());
+        let hidden = blob(
+            dir,
+            "keyed.bin",
+            format!("\0aws {}\0", aws_key()).as_bytes(),
+        );
         let large = blob(
             dir,
             "large.bin",
@@ -1117,7 +1124,7 @@ mod tests {
     fn keys_the_fingerprints_of_each_scan_afresh() {
         let one = Fingerprints(RandomState::new());
         let two = Fingerprints(RandomState::new());
-        let line = format!("aws {}", key());
+        let line = format!("aws {}", aws_key());
 
         assert_eq!(one.of(&line), one.of(&line));
         assert_ne!(one.of(&line), one.of("aws other"));
@@ -1178,46 +1185,49 @@ mod tests {
     /// elsewhere, make it added.
     #[test]
     fn tells_a_private_key_by_all_its_lines() {
-        let key = |data: &[&str]| {
-            format!(
-                "-----BEGIN OPENSSH PRIVATE KEY-----\n{}\n-----END OPENSSH PRIVATE KEY-----\n",
-                data.join("\n")
-            )
-        };
         let start = "b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9u";
         let (a, b) = ("A".repeat(64), "B".repeat(64));
         let whole = [start, &a, &b].concat();
-        let old = key(&[start, &a, &b]);
-        let changed = key(&[start, &a, &format!("{}C", &b[1..])]);
-        let rewrapped = key(&[&whole[..50], &whole[50..]]);
-        let hashes = ["a", "b", "c", "d"].map(|digit| digit.repeat(40));
-        let texts = [&old, &old, &changed, &rewrapped];
-        let stored: Vec<(&str, &[u8])> = hashes
-            .iter()
-            .zip(texts)
-            .map(|(hash, text)| (hash.as_str(), text.as_bytes()))
-            .collect();
-        let mut blobs = Counted::with(&stored);
-        let files: Vec<BinaryFile> = hashes[1..]
-            .iter()
-            .map(|hash| file("deploy.env", hash, &[&hashes[0]]))
-            .collect();
+        let old = key_block(&[start, &a, &b]);
+        let changed = key_block(&[start, &a, &format!("{}C", &b[1..])]);
+        let rewrapped = key_block(&[&whole[..50], &whole[50..]]);
 
-        let scanned = scan_from(&mut blobs, &files, MOST_BINARY_BYTES).unwrap();
+        let found = found_against(&old, &[&old, &changed, &rewrapped]);
 
-        let changes: Vec<(Option<usize>, Change)> = scanned
-            .findings
-            .iter()
-            .map(|finding| (finding.line, finding.change))
-            .collect();
+        let key = |change| (Some(3), change, "private key".to_owned());
         assert_eq!(
-            changes,
+            found,
             [
-                (Some(2), Change::Unchanged),
-                (Some(2), Change::Added),
-                (Some(2), Change::Added)
+                key(Change::Unchanged),
+                key(Change::Added),
+                key(Change::Added)
             ]
         );
+    }
+
+    /// Inside a key's block, a long line whose start is key data but whose rest isn't holds what
+    /// its windows find, as a scan of each whole line finds it.
+    #[test]
+    fn scans_a_long_line_in_a_key_block_that_is_not_all_key_data() {
+        let line = format!("{} {}", "A".repeat(WINDOW + 100), github_token());
+        let text = key_block(&["b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9u", &line]);
+
+        let found: Vec<(Option<usize>, String)> = found_against("", &[&text])
+            .into_iter()
+            .map(|(line, _, kind)| (line, kind))
+            .collect();
+
+        let whole: Vec<(Option<usize>, String)> =
+            redact::secret_lines(text.lines().map(ToOwned::to_owned))
+                .into_iter()
+                .flat_map(|line| {
+                    line.kinds
+                        .into_iter()
+                        .map(move |kind| (Some(line.number), kind))
+                })
+                .collect();
+        assert_eq!(found, whole);
+        assert_eq!(found[1], (Some(4), "GitHub token".to_owned()));
     }
 
     /// What a scan finds in each of `texts`, each the content of a file whose parent holds

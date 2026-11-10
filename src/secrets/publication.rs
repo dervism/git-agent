@@ -5,21 +5,21 @@
 
 use super::contents::{BinaryFile, BinaryFiles};
 use super::lines::{Line, Lines};
-use super::redact::{Change, DiffScan, Finding, Held, LineScan, LongLineIs};
-use crate::git::{LogLine, LogMarks};
+use super::redact::{Change, DiffScan, Finding, Held, LineScan};
+use crate::git::{LogLine, LogMarks, UNREADABLE_LOG};
 use anyhow::{Result, bail};
 use std::io::BufRead;
 
 /// What a read of a publication found: the secrets in its lines, and the binary files to read
 /// whole.
 #[derive(Debug, Default)]
-pub struct Published {
+pub struct Found {
     pub findings: Vec<Finding>,
     pub binary: Vec<BinaryFile>,
 }
 
 /// What `output`, a diff as git writes it, publishes.
-pub fn read_diff(output: &mut dyn BufRead) -> Result<Published> {
+pub fn read_diff(output: &mut dyn BufRead) -> Result<Found> {
     let mut lines = Lines::new(output);
     let mut diff = DiffRead::default();
     while let Some(line) = lines.next_line()? {
@@ -30,15 +30,12 @@ pub fn read_diff(output: &mut dyn BufRead) -> Result<Published> {
 
 /// What `output`, a log of commits with their patches in the format of `marks`, publishes:
 /// findings and files name their commit, as in "commit 1a2b3c4 message".
-pub fn read_log(output: &mut dyn BufRead, marks: &LogMarks) -> Result<Published> {
+pub fn read_log(output: &mut dyn BufRead, marks: &LogMarks) -> Result<Found> {
     let mut lines = Lines::new(output);
     let mut log = LogRead::default();
     while let Some(line) = lines.next_line()? {
-        let is = match &line {
-            Line::Whole(bytes) => marks.line(bytes)?,
-            Line::Long(_) => LogLine::Text,
-        };
-        match is {
+        let (Line::Whole(bytes) | Line::Long(bytes)) = &line;
+        match marks.line(bytes)? {
             LogLine::Commit(hash) => log.start_commit(hash)?,
             LogLine::MessageEnd => log.message_end(),
             LogLine::Text => log.text(line, &mut lines)?,
@@ -70,22 +67,22 @@ impl DiffRead {
     }
 
     /// Takes a line too long to read whole, whose first bytes are `start` and whose rest
-    /// `lines` reads next: a hunk's line is scanned in windows, and any other read past.
-    fn long_line<R: BufRead>(&mut self, start: Vec<u8>, lines: &mut Lines<R>) -> Result<()> {
-        let head = String::from_utf8_lossy(&start).into_owned();
+    /// `lines` reads next: a hunk's line is scanned in windows from after its markers, and any
+    /// other is left for `lines` to skip.
+    fn long_line<R: BufRead>(&mut self, mut start: Vec<u8>, lines: &mut Lines<R>) -> Result<()> {
+        let head = String::from_utf8_lossy(&start);
         self.binary.line(&head)?;
-        match self.scan.long_line(&head) {
-            LongLineIs::Text(text) => {
-                let long = lines.scan_rest(start[text.markers..].to_vec(), |_| {})?;
-                self.scan.long_text(text, long.kinds, &long.tail);
-            }
-            LongLineIs::Other | LongLineIs::KeyData => lines.read_rest(&start, |_| {})?,
-        }
+        let Some(mut text) = self.scan.long_line(&head) else {
+            return Ok(());
+        };
+        start.drain(..text.markers);
+        let long = lines.scan_rest(start, |piece| text.feed(piece))?;
+        self.scan.long_text(text, long.kinds, &long.tail);
         Ok(())
     }
 
-    fn finish(self) -> Result<Published> {
-        Ok(Published {
+    fn finish(self) -> Result<Found> {
+        Ok(Found {
             findings: self.scan.findings(),
             binary: self.binary.finish()?,
         })
@@ -101,7 +98,7 @@ fn without_end(line: &str) -> &str {
 /// A log read line by line, a commit at a time.
 #[derive(Default)]
 struct LogRead {
-    found: Published,
+    found: Found,
     commit: Option<CommitRead>,
 }
 
@@ -125,13 +122,11 @@ impl LogRead {
         match &mut self.commit {
             Some(commit) => commit.text(line, lines),
             None if matches!(&line, Line::Whole(bytes) if bytes.trim_ascii().is_empty()) => Ok(()),
-            None => {
-                bail!("git-agent couldn't read git's list of commits: a commit in it has no hash")
-            }
+            None => bail!(UNREADABLE_LOG),
         }
     }
 
-    fn finish(mut self) -> Result<Published> {
+    fn finish(mut self) -> Result<Found> {
         self.finish_commit()?;
         Ok(self.found)
     }
@@ -179,7 +174,7 @@ impl CommitRead {
 
     /// What the commit holds: the secrets in its message, then those in its patch, and its
     /// binary files, each named after the commit.
-    fn finish(mut self) -> Result<Published> {
+    fn finish(mut self) -> Result<Found> {
         self.message_end();
         let Self {
             hash,
@@ -197,7 +192,7 @@ impl CommitRead {
             place: place(&file.place),
             ..file
         });
-        Ok(Published {
+        Ok(Found {
             findings: in_message.into_iter().chain(in_patch).collect(),
             binary: binary.collect(),
         })
@@ -217,7 +212,7 @@ impl MessageRead {
         match line {
             Line::Whole(bytes) => {
                 let held = self.scan.line(&String::from_utf8_lossy(&bytes));
-                self.held(held);
+                self.take(held);
                 Ok(())
             }
             Line::Long(start) => self.long_line(start, lines),
@@ -225,21 +220,17 @@ impl MessageRead {
     }
 
     /// Takes a line too long to read whole, whose first bytes are `start` and whose rest
-    /// `lines` reads next: a private key's data is read past, and any other line scanned in
-    /// windows.
+    /// `lines` reads next, scanned in windows.
     fn long_line<R: BufRead>(&mut self, start: Vec<u8>, lines: &mut Lines<R>) -> Result<()> {
-        if let Some(held) = self.scan.long_line(&String::from_utf8_lossy(&start)) {
-            self.held(held);
-            lines.read_rest(&start, |_| {})?;
-        } else {
-            let long = lines.scan_rest(start, |_| {})?;
-            self.kinds.extend(long.kinds);
-            self.scan.after_long_line(&long.tail);
-        }
+        let mut line = self.scan.start_long_line(&String::from_utf8_lossy(&start));
+        let long = lines.scan_rest(start, |piece| line.feed(piece))?;
+        let held = self.scan.end_long_line(line, long.kinds, &long.tail);
+        self.take(held);
         Ok(())
     }
 
-    fn held(&mut self, held: Held) {
+    /// Keeps the secrets a line holds.
+    fn take(&mut self, held: Held) {
         if let Held::Secrets(kinds) = held {
             self.kinds.extend(kinds);
         }
@@ -264,16 +255,13 @@ mod tests {
     use super::super::lines::WINDOW;
     use super::super::lines::test_support::line_with_keys;
     use super::super::redact;
+    use super::super::test_support::{aws_key, github_token};
     use super::*;
     use crate::git::test_support::{isolated_repo, run};
     use std::fs;
     use std::io::Cursor;
 
-    fn key() -> String {
-        format!("AKIA{}", "Q".repeat(16))
-    }
-
-    fn diff_of(text: &str) -> Published {
+    fn diff_of(text: &str) -> Found {
         read_diff(&mut Cursor::new(text.as_bytes())).unwrap()
     }
 
@@ -291,7 +279,7 @@ mod tests {
     /// lines that end in CRLF, and binary files.
     #[test]
     fn reads_a_diff_as_a_scan_of_all_of_it() {
-        let key = key();
+        let key = aws_key();
         let (a, b) = ("1".repeat(40), "2".repeat(40));
         let diffs = [
             format!(
@@ -335,7 +323,7 @@ mod tests {
             "diff --git a/b.js b/b.js\n--- a/b.js\n+++ b/b.js\n@@ -1,2 +1,3 @@\n same\n-{}\n+{}\n+{}\n",
             String::from_utf8_lossy(&long[..WINDOW + 10]),
             String::from_utf8_lossy(&long),
-            key()
+            aws_key()
         );
 
         let read = diff_of(&diff);
@@ -370,7 +358,7 @@ mod tests {
              {}\n@@ -9 +9 @@\n+{}\n",
             "A".repeat(2 * WINDOW),
             "x".repeat(2 * WINDOW),
-            key()
+            aws_key()
         );
 
         let read = diff_of(&diff);
@@ -388,6 +376,77 @@ mod tests {
         );
     }
 
+    /// The data line of a private key, after its BEGIN line.
+    const KEY_DATA: &str = "b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9u";
+
+    /// A diff that adds `text` as the new file `path`.
+    fn added(path: &str, text: &str) -> String {
+        let lines: String = text.lines().map(|line| format!("+{line}\n")).collect();
+        let count = text.lines().count();
+        format!(
+            "diff --git a/{path} b/{path}\n--- /dev/null\n+++ b/{path}\n@@ -0,0 +1,{count} @@\n{lines}"
+        )
+    }
+
+    /// A key whose block begins at the end of a long line is found on the line after it, in a
+    /// diff and in a message, as a scan of all of it finds it.
+    #[test]
+    fn finds_a_key_whose_block_begins_at_the_end_of_a_long_line() {
+        let block = format!(
+            "{}-----BEGIN OPENSSH PRIVATE KEY-----\n{KEY_DATA}\n-----END OPENSSH PRIVATE KEY-----",
+            "x".repeat(2 * WINDOW)
+        );
+        let diff = added("k.pem", &block);
+
+        let read = diff_of(&diff);
+        let message = log_of(&log(&[("1a2b3c4", &block, "")])).unwrap();
+
+        assert_eq!(read.findings, whole(&diff).0);
+        assert_eq!(read.findings.len(), 1);
+        let place = "commit 1a2b3c4 message";
+        assert_eq!(message.findings, redact::text(&block, place).findings);
+        assert_eq!(message.findings.len(), 1);
+    }
+
+    /// Inside a key's block, a long line whose first window is key data but whose rest holds a
+    /// token holds the token, even when the key's data began on a line the diff only shows; and
+    /// a long header line of the key's keeps its block open. As a scan of all of it finds.
+    #[test]
+    fn reads_a_long_line_in_a_key_block_by_all_of_it() {
+        let begin = "-----BEGIN OPENSSH PRIVATE KEY-----";
+        let token = format!("{} {}", "A".repeat(WINDOW + 100), github_token());
+        let context = format!(
+            "diff --git a/k.pem b/k.pem\n--- a/k.pem\n+++ b/k.pem\n@@ -1,2 +1,3 @@\n \
+             {begin}\n {KEY_DATA}\n+{token}\n"
+        );
+        let comment = "x ".repeat(WINDOW);
+        let header = added(
+            "r.pem",
+            &format!(
+                "-----BEGIN RSA PRIVATE KEY-----\nProc-Type: 4,ENCRYPTED\nComment: {comment}\n\n\
+                 {KEY_DATA}\n-----END RSA PRIVATE KEY-----"
+            ),
+        );
+
+        let kinds = |diff: &str| -> Vec<(Change, String)> {
+            let read = diff_of(diff);
+            assert_eq!(read.findings, whole(diff).0);
+            read.findings
+                .into_iter()
+                .map(|finding| (finding.change, finding.kind))
+                .collect()
+        };
+
+        assert_eq!(
+            kinds(&context),
+            [
+                (Change::Unchanged, "private key".to_owned()),
+                (Change::Added, "GitHub token".to_owned())
+            ]
+        );
+        assert_eq!(kinds(&header), [(Change::Added, "private key".to_owned())]);
+    }
+
     /// A log with each commit's hash, message and patch, as git writes it in
     /// [`LogMarks::plain`]'s marks: git's separators as they are.
     fn log(commits: &[(&str, &str, &str)]) -> String {
@@ -397,7 +456,7 @@ mod tests {
             .collect()
     }
 
-    fn log_of(text: &str) -> Result<Published> {
+    fn log_of(text: &str) -> Result<Found> {
         read_log(&mut Cursor::new(text.as_bytes()), &LogMarks::plain())
     }
 
@@ -405,7 +464,7 @@ mod tests {
     /// commit, as a scan of each commit on its own names them; its binary files are too.
     #[test]
     fn reads_the_message_and_the_patch_of_each_commit() {
-        let key = key();
+        let key = aws_key();
         let patch = format!(
             "\ndiff --git a/x.env b/x.env\n--- a/x.env\n+++ b/x.env\n@@ -0,0 +1 @@\n+{key}\n\
              diff --git a/x.dat b/x.dat\nindex {}..{} 100644\nBinary files differ\n",
@@ -439,7 +498,7 @@ mod tests {
     #[test]
     fn finds_in_a_message_what_a_scan_of_it_trimmed_finds() {
         let long = String::from_utf8(line_with_keys(WINDOW + 50, &[WINDOW - 8])).unwrap();
-        let message = format!("\n \n   {}\nnext\n{long}\n", key());
+        let message = format!("\n \n   {}\nnext\n{long}\n", aws_key());
 
         let read = log_of(&log(&[("1a2b3c4", &message, ""), ("5d6e7f8", "", "")])).unwrap();
 
@@ -464,12 +523,12 @@ mod tests {
     /// Commits a key in `a.env`, then one with a message that holds a key and has no line end,
     /// whose hash it returns, then one with an empty message.
     fn commits_with_odd_messages(dir: &std::path::Path) -> String {
-        fs::write(dir.join("a.env"), format!("{}\n", key())).unwrap();
+        fs::write(dir.join("a.env"), format!("{}\n", aws_key())).unwrap();
         run(dir, &["add", "a.env"]);
         run(dir, &["commit", "-qm", "add a"]);
         let tree = run(dir, &["write-tree"]).trim().to_owned();
         let message = dir.join(".git/bare-message");
-        fs::write(&message, format!("no line end {}", key())).unwrap();
+        fs::write(&message, format!("no line end {}", aws_key())).unwrap();
         let file = message.to_str().unwrap();
         let bare = run(dir, &["commit-tree", &tree, "-p", "HEAD", "-F", file]);
         run(dir, &["reset", "-q", "--hard", bare.trim()]);

@@ -59,7 +59,7 @@ pub async fn revise<T, S, E, C>(
     person: &dyn Person,
 ) -> Result<Option<(T, String)>>
 where
-    T: Copy,
+    T: Copy + PartialEq,
     S: ModelServer,
     E: Fn(&str) -> Result<Option<String>>,
     C: Fn(String) -> Result<String>,
@@ -90,7 +90,7 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::super::test_support::REVIEW;
+    use super::super::test_support::{REVIEW, declining_with};
     use super::*;
     use crate::conversation::test_support::{ScriptedPerson, configured};
     use crate::server::Role;
@@ -102,6 +102,16 @@ mod tests {
     /// numbered versions, or fail if `failing`, and an editor that adds ", edited" or fails
     /// as `edits` says in turn.
     async fn reviewed(
+        person: &ScriptedPerson,
+        server: &FakeServer<'_>,
+        edits: &[Option<bool>],
+    ) -> Option<(u8, String)> {
+        reviewed_at(&REVIEW, person, server, edits).await
+    }
+
+    /// [`reviewed`], at `review`.
+    async fn reviewed_at(
+        review: &Review<u8>,
         person: &ScriptedPerson,
         server: &FakeServer<'_>,
         edits: &[Option<bool>],
@@ -121,7 +131,7 @@ mod tests {
             },
             clean: |reply: String| Ok(format!("{reply}.")),
         };
-        revise(&REVIEW, "draft".to_owned(), revisions, person)
+        revise(review, "draft".to_owned(), revisions, person)
             .await
             .unwrap()
     }
@@ -174,9 +184,30 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn quits_when_the_person_quits_or_input_ends() {
-        for lines in [&["q"][..], &["e", "n"], &[]] {
+        for lines in [&["q"][..], &["e", "q"], &[]] {
             let person = ScriptedPerson::typing(lines);
             assert_eq!(reviewed(&person, &versions(), &[Some(true)]).await, None);
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn ends_with_the_choice_n_picks_and_the_text_as_it_stands() {
+        for typed in ["n", "no"] {
+            let person = ScriptedPerson::typing(&["r", typed, "c"]);
+
+            let reviewed = reviewed_at(&declining_with(2), &person, &versions(), &[]).await;
+
+            assert_eq!(reviewed, Some((2, "version 1.".to_owned())), "{typed:?}");
+            assert_eq!(person.lines_left(), 1, "{typed:?}");
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn quits_on_n_and_no_when_the_review_has_no_choice_to_decline_with() {
+        for typed in ["n", "no"] {
+            let person = ScriptedPerson::typing(&["e", typed, "c"]);
+            assert_eq!(reviewed(&person, &versions(), &[Some(true)]).await, None);
+            assert_eq!(person.lines_left(), 1, "{typed:?}");
         }
     }
 }

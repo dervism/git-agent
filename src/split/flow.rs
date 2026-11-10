@@ -16,7 +16,7 @@ use crate::conversation::{
 use crate::delivery::{NewCommit, commit, push, refuse_unknown_commit_args};
 use crate::git::worktree::TempWorktree;
 use crate::git::{Changes, Repo, Scope, names};
-use crate::review::{self, Action, Choice, Person, Review, Revisions, Terminal};
+use crate::review::{self, Action, Choice, Decline, Person, Review, Revisions, Terminal};
 use crate::secrets::contents::Scanned;
 use crate::secrets::{AtCommit, Wording, check_changes, redact, report_secrets};
 use crate::server::{Message, ModelServer};
@@ -63,6 +63,7 @@ const PLAN_REVIEW: Review<PlanAcceptance> = Review {
             value: PlanAcceptance::CommitAll,
         },
     ],
+    decline: Decline::Quit,
     quit: "quit without committing anything",
 };
 
@@ -101,6 +102,7 @@ const SPLIT_COMMIT_REVIEW: Review<SplitCommitAcceptance> = Review {
             value: SplitCommitAcceptance::Skip,
         },
     ],
+    decline: Decline::Choose(SplitCommitAcceptance::Skip),
     quit: "stop here; the commits made so far stay, and the rest stays uncommitted",
 };
 
@@ -844,6 +846,7 @@ mod tests {
     use super::*;
     use crate::conversation::test_support::{ScriptedPerson, configured};
     use crate::git::test_support::{isolated_repo, numbered_lines, run, with_submodule};
+    use crate::review::test_support::{action_for, last_lines_of_help};
     use crate::server::test_support::FakeServer;
     use std::cell::{Cell, RefCell};
     use std::path::Path;
@@ -946,6 +949,126 @@ mod tests {
                 Some(acceptance),
                 "{typed:?}"
             );
+        }
+    }
+
+    #[test]
+    fn n_and_no_quit_the_plan_of_a_split_and_skip_a_commit_of_it() {
+        for typed in ["n", "no", "N", "No"] {
+            assert_eq!(action_for(&PLAN_REVIEW, typed), Action::Quit, "{typed:?}");
+            assert_eq!(
+                action_for(&SPLIT_COMMIT_REVIEW, typed),
+                Action::Accept(SplitCommitAcceptance::Skip),
+                "{typed:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn helps_with_what_y_and_n_do_at_the_reviews_of_a_split() {
+        assert_eq!(
+            last_lines_of_help(&PLAN_REVIEW, 2),
+            ["  y  the same as c (commit)", "  n  the same as q (quit)"]
+        );
+        assert_eq!(
+            last_lines_of_help(&SPLIT_COMMIT_REVIEW, 2),
+            ["  y  the same as c (commit)", "  n  the same as s (skip)"]
+        );
+    }
+
+    /// Runs `with` on a splitter whose person types `lines`, and returns what is left.
+    async fn with_a_person_typing<R>(
+        lines: &[&str],
+        with: impl AsyncFnOnce(&Splitter<'_, FakeServer<'_>>) -> R,
+    ) -> (R, usize) {
+        let (_dir, repo) = staged_three_parts();
+        let args = args(true, None);
+        let config = Config::default();
+        let work = changes_to_split(&repo, &args, &config).unwrap().unwrap();
+        let units = split::describe(&work.files, 100_000).unwrap().units;
+        let server = ScriptedModel::new(DOCS_USES_DEFS, "feat: x").server();
+        let person = ScriptedPerson::typing(lines);
+        let splitter = Splitter {
+            repo: &repo,
+            config: &config,
+            args: &args,
+            work: &work,
+            units: &units,
+            server: &server,
+            model: &configured(100_000),
+            person: &person,
+        };
+        let result = with(&splitter).await;
+        (result, person.lines_left())
+    }
+
+    /// What the user decides about a commit when they type `lines` at the review of its
+    /// message, and how many lines are left.
+    async fn decided_typing(lines: &[&str]) -> (Decision, usize) {
+        with_a_person_typing(lines, async |splitter| {
+            let conversation = [Message::user("write it")];
+            let reviewed = splitter.reviewed("feat: x".to_owned(), &conversation, None);
+            reviewed.await.unwrap()
+        })
+        .await
+    }
+
+    /// The plan the user accepts when they type `lines` at the review of the plan, and how
+    /// many lines are left.
+    async fn planned_typing(lines: &[&str]) -> (Option<(Plan, PlanAcceptance)>, usize) {
+        with_a_person_typing(lines, async |splitter| {
+            let conversation = [Message::system(prompt::SPLIT_PROMPT)];
+            let plan = splitter.new_plan(&conversation).await.unwrap();
+            splitter.review_plan(plan, &conversation).await.unwrap()
+        })
+        .await
+    }
+
+    #[tokio::test]
+    async fn n_and_no_at_the_message_of_a_commit_skip_it_and_go_on() {
+        for typed in ["n", "no"] {
+            let (decision, left) = decided_typing(&[typed, "c"]).await;
+            assert!(matches!(decision, Decision::Skip), "{typed:?}");
+            assert_eq!(left, 1, "{typed:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn q_at_the_message_of_a_commit_still_stops_the_split() {
+        let (decision, left) = decided_typing(&["q", "c"]).await;
+        assert!(matches!(decision, Decision::Stop));
+        assert_eq!(left, 1);
+    }
+
+    /// What the split makes, and how many lines the user has left, when they type `lines` at
+    /// the review of each message.
+    async fn made_typing(lines: &[&str]) -> (Outcome, usize) {
+        with_a_person_typing(lines, async |splitter| {
+            let conversation = [Message::system(prompt::SPLIT_PROMPT)];
+            let plan = splitter.new_plan(&conversation).await.unwrap();
+            let prepared = splitter.prepare_commits(&plan).await.unwrap();
+            splitter
+                .make_commits(&prepared, PlanAcceptance::ReviewEach)
+                .await
+                .unwrap()
+        })
+        .await
+    }
+
+    #[tokio::test]
+    async fn n_at_the_message_of_a_commit_skips_it_and_makes_the_others() {
+        let (outcome, left) = made_typing(&["n", "c", "c"]).await;
+        assert_eq!((outcome.made, outcome.skipped), (2, 1));
+        assert!(!outcome.stopped);
+        assert_eq!(left, 0);
+    }
+
+    #[tokio::test]
+    async fn n_and_no_at_the_plan_of_a_split_stop_before_any_commit() {
+        for typed in ["n", "no"] {
+            let (reviewed, left) = planned_typing(&[typed, "c"]).await;
+            assert!(reviewed.is_none(), "{typed:?}");
+            assert_eq!(left, 1, "{typed:?}");
         }
     }
 
@@ -1256,32 +1379,21 @@ mod tests {
 
     #[tokio::test]
     async fn moves_docs_last_in_a_new_plan_but_keeps_the_order_of_a_refined_one() {
-        let (_dir, repo) = staged_three_parts();
-        let args = args(true, None);
-        let config = Config::default();
-        let work = changes_to_split(&repo, &args, &config).unwrap().unwrap();
-        let units = split::describe(&work.files, 100_000).unwrap().units;
-        let server = ScriptedModel::new(DOCS_USES_DEFS, "feat: x").server();
-        let model = configured(100_000);
-        let splitter = Splitter {
-            repo: &repo,
-            config: &config,
-            args: &args,
-            work: &work,
-            units: &units,
-            server: &server,
-            model: &model,
-            person: &ScriptedPerson::away(),
-        };
         let titles =
             |plan: &Plan| -> Vec<String> { plan.commits.iter().map(|c| c.title.clone()).collect() };
         let conversation = [Message::system(prompt::SPLIT_PROMPT)];
-        let new = splitter.new_plan(&conversation).await.unwrap();
+
+        let ((new, refined), _) = with_a_person_typing(&[], async |splitter| {
+            let new = splitter.new_plan(&conversation).await.unwrap();
+            let refined = splitter
+                .refined_plan(&conversation, &new, "put the readme first")
+                .await
+                .unwrap();
+            (new, refined)
+        })
+        .await;
+
         assert_eq!(titles(&new), ["Add uses", "Add defs", "Update the readme"]);
-        let refined = splitter
-            .refined_plan(&conversation, &new, "put the readme first")
-            .await
-            .unwrap();
         assert_eq!(
             titles(&refined),
             ["Update the readme", "Add uses", "Add defs"]

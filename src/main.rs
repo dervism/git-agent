@@ -40,7 +40,7 @@ use delivery::{NewCommit, commit, push, refuse_unknown_commit_args};
 use git::{Changes, CommitPatch, Repo, Scope, names};
 use github::PullRequest;
 use prompt::Work;
-use review::{Action, Choice, Person, Review, Revisions, Terminal};
+use review::{Action, Choice, Decline, Person, Review, Revisions, Terminal};
 use secrets::redact::{self, Finding};
 use secrets::{
     AtCommit, Wording, added, check_changes, check_commits, list_findings, report_secrets,
@@ -88,6 +88,7 @@ const COMMIT_REVIEW: Review<CommitAcceptance> = Review {
             value: CommitAcceptance::CommitAndPush,
         },
     ],
+    decline: Decline::Quit,
     quit: "quit without committing",
 };
 
@@ -132,6 +133,7 @@ const PULL_REQUEST_REVIEW: Review<PullRequestAcceptance> = Review {
             value: PullRequestAcceptance::CreateDraft,
         },
     ],
+    decline: Decline::Quit,
     quit: "quit without creating it",
 };
 
@@ -156,6 +158,7 @@ const TIDY_REVIEW: Review<()> = Review {
         help: "write the new messages, reviewing each, then tidy the commits",
         value: (),
     }],
+    decline: Decline::Quit,
     quit: "quit without changing anything",
 };
 
@@ -193,6 +196,7 @@ const TIDY_MESSAGE_REVIEW: Review<TidyMessageAcceptance> = Review {
             value: TidyMessageAcceptance::KeepOld,
         },
     ],
+    decline: Decline::Choose(TidyMessageAcceptance::KeepOld),
     quit: "stop without changing anything",
 };
 
@@ -211,6 +215,7 @@ const BRANCH_REVIEW: Review<()> = Review {
         help: "create the branch and switch to it",
         value: (),
     }],
+    decline: Decline::Quit,
     quit: "quit without creating a branch",
 };
 
@@ -1401,6 +1406,7 @@ mod tests {
     use crate::secrets::contents::Scanned;
     use crate::server::test_support::FakeServer;
     use conversation::test_support::configured;
+    use review::test_support::{ScriptedPerson, action_for, last_lines_of_help};
     use tempfile::TempDir;
 
     /// A commit without a diff to show reaches tidy's prompt by the names of its files, each on
@@ -1471,6 +1477,81 @@ mod tests {
                 "{typed:?}"
             );
         }
+    }
+
+    #[test]
+    fn n_and_no_quit_every_review_that_has_no_choice_to_decline_with() {
+        for typed in ["n", "no", "N", "No"] {
+            assert_eq!(action_for(&COMMIT_REVIEW, typed), Action::Quit, "{typed:?}");
+            assert_eq!(
+                action_for(&PULL_REQUEST_REVIEW, typed),
+                Action::Quit,
+                "{typed:?}"
+            );
+            assert_eq!(action_for(&TIDY_REVIEW, typed), Action::Quit, "{typed:?}");
+            assert_eq!(action_for(&BRANCH_REVIEW, typed), Action::Quit, "{typed:?}");
+        }
+    }
+
+    #[test]
+    fn n_and_no_keep_the_old_message_at_a_tidied_commit() {
+        for typed in ["n", "no", "N", "No"] {
+            assert_eq!(
+                action_for(&TIDY_MESSAGE_REVIEW, typed),
+                Action::Accept(TidyMessageAcceptance::KeepOld),
+                "{typed:?}"
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn n_and_no_end_the_review_of_a_tidy_plan_without_a_plan() {
+        let (_dir, repo) = isolated_repo();
+        for typed in ["n", "no"] {
+            let nowhere = Config {
+                base_url: "http://127.0.0.1:9/v1".to_owned(),
+                ..Config::default()
+            };
+            let server = Server::connect(&nowhere).unwrap();
+            let person = ScriptedPerson::typing(&[typed, "a"]);
+            let tidier = Tidier {
+                repo: &repo,
+                server: &server,
+                model: &configured(100_000),
+                commits: &[],
+                person: &person,
+            };
+            let plan = tidy::Plan { groups: Vec::new() };
+
+            let reviewed = tidier.review_plan(plan, &[]).await.unwrap();
+
+            assert_eq!(reviewed, None, "{typed:?}");
+            assert_eq!(person.lines_left(), 1, "{typed:?}");
+        }
+    }
+
+    #[test]
+    fn helps_with_what_y_and_n_do_at_each_review() {
+        assert_eq!(
+            last_lines_of_help(&COMMIT_REVIEW, 2),
+            ["  y  the same as c (commit)", "  n  the same as q (quit)"]
+        );
+        assert_eq!(
+            last_lines_of_help(&PULL_REQUEST_REVIEW, 2),
+            ["  y  the same as c (create)", "  n  the same as q (quit)"]
+        );
+        assert_eq!(
+            last_lines_of_help(&TIDY_REVIEW, 2),
+            ["  y  the same as a (accept)", "  n  the same as q (quit)"]
+        );
+        assert_eq!(
+            last_lines_of_help(&TIDY_MESSAGE_REVIEW, 2),
+            ["  y  the same as u (use)", "  n  the same as k (keep)"]
+        );
+        assert_eq!(
+            last_lines_of_help(&BRANCH_REVIEW, 2),
+            ["  y  the same as c (create)", "  n  the same as q (quit)"]
+        );
     }
 
     #[test]

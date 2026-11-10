@@ -56,6 +56,7 @@ const LAYERS: &[(&str, Layer)] = &[
     ("safe_text", Core),
     ("server", Core),
     ("temp", Core),
+    ("test_support", Core),
     ("ui", Core),
 ];
 

@@ -72,12 +72,12 @@ impl DiffRead {
     fn long_line<R: BufRead>(&mut self, mut start: Vec<u8>, lines: &mut Lines<R>) -> Result<()> {
         let head = String::from_utf8_lossy(&start);
         self.binary.line(&head)?;
-        let Some(mut text) = self.scan.long_line(&head) else {
+        let Some(mut text) = self.scan.start_long_line(&head) else {
             return Ok(());
         };
         start.drain(..text.markers);
-        let long = lines.scan_rest(start, |piece| text.feed(piece))?;
-        self.scan.long_text(text, long.kinds, &long.tail);
+        let windows = lines.scan_rest(start, |piece| text.feed(piece))?;
+        self.scan.end_long_line(text, windows);
         Ok(())
     }
 
@@ -222,9 +222,9 @@ impl MessageRead {
     /// Takes a line too long to read whole, whose first bytes are `start` and whose rest
     /// `lines` reads next, scanned in windows.
     fn long_line<R: BufRead>(&mut self, start: Vec<u8>, lines: &mut Lines<R>) -> Result<()> {
-        let mut line = self.scan.start_long_line(&String::from_utf8_lossy(&start));
-        let long = lines.scan_rest(start, |piece| line.feed(piece))?;
-        let held = self.scan.end_long_line(line, long.kinds, &long.tail);
+        let mut line = self.scan.start_long_line();
+        let windows = lines.scan_rest(start, |piece| line.feed(piece))?;
+        let held = self.scan.end_long_line(line, windows);
         self.take(held);
         Ok(())
     }
@@ -428,23 +428,87 @@ mod tests {
             ),
         );
 
-        let kinds = |diff: &str| -> Vec<(Change, String)> {
-            let read = diff_of(diff);
-            assert_eq!(read.findings, whole(diff).0);
-            read.findings
-                .into_iter()
-                .map(|finding| (finding.change, finding.kind))
-                .collect()
-        };
-
         assert_eq!(
-            kinds(&context),
+            kinds_of(&context),
             [
                 (Change::Unchanged, "private key".to_owned()),
                 (Change::Added, "GitHub token".to_owned())
             ]
         );
-        assert_eq!(kinds(&header), [(Change::Added, "private key".to_owned())]);
+        assert_eq!(
+            kinds_of(&header),
+            [(Change::Added, "private key".to_owned())]
+        );
+    }
+
+    /// A long line whose BEGIN line is part of a value that a rule replaces starts no key's
+    /// block, as in a scan of the whole diff, so the lines after it are scanned as any others
+    /// and the key added among them is found.
+    #[test]
+    fn starts_no_key_block_after_a_begin_line_a_value_swallows() {
+        let begin = "-----BEGIN RSA PRIVATE KEY-----";
+        let line = format!("{} token=Ab1{begin}", "x".repeat(WINDOW));
+        let diff = format!(
+            "diff --git a/k.env b/k.env\n--- a/k.env\n+++ b/k.env\n@@ -1,2 +1,3 @@\n {line}\n \
+             AAAA\n+AAAA/{}/AAAA\n",
+            aws_key()
+        );
+
+        let kinds = kinds_of(&diff);
+
+        assert_eq!(
+            kinds.last(),
+            Some(&(Change::Added, "AWS access key".to_owned()))
+        );
+    }
+
+    /// What reading `diff` finds, which a scan of all of it finds too, as each finding's change
+    /// and kind.
+    fn kinds_of(diff: &str) -> Vec<(Change, String)> {
+        let read = diff_of(diff);
+        assert_eq!(read.findings, whole(diff).0);
+        read.findings
+            .into_iter()
+            .map(|finding| (finding.change, finding.kind))
+            .collect()
+    }
+
+    /// A hidden character at the edge of a long line's pieces counts as it does in the whole
+    /// line: a joiner at a piece's start, after a letter, keeps the line from being key data,
+    /// so the key in it is found after a key the diff only shows; and a zero-width space cut in
+    /// two leaves a long line of key data a key, in a diff and in a message.
+    #[test]
+    fn reads_a_hidden_character_at_a_piece_s_edge_as_the_whole_line_does() {
+        let begin = "-----BEGIN OPENSSH PRIVATE KEY-----";
+        let end = "-----END OPENSSH PRIVATE KEY-----";
+        let joined = format!(
+            "{}\u{200d}{}/{}/AAAA",
+            "A".repeat(WINDOW - 1),
+            "A".repeat(100),
+            aws_key()
+        );
+        let context = format!(
+            "diff --git a/k.pem b/k.pem\n--- a/k.pem\n+++ b/k.pem\n@@ -1,2 +1,3 @@\n \
+             {begin}\n {KEY_DATA}\n+{joined}\n"
+        );
+        let cut = |at: usize| format!("{}\u{200b}{}", "A".repeat(at), "A".repeat(100));
+        let data = added("k.pem", &format!("{begin}\n{}\n{end}", cut(WINDOW - 2)));
+        let message = format!("{begin}\n{}\n{end}", cut(WINDOW - 1));
+
+        let read = log_of(&log(&[("1a2b3c4", &message, "")])).unwrap();
+
+        let found = |change, kind: &str| (change, kind.to_owned());
+        assert_eq!(
+            kinds_of(&context),
+            [
+                found(Change::Unchanged, "private key"),
+                found(Change::Added, "AWS access key")
+            ]
+        );
+        assert_eq!(kinds_of(&data), [found(Change::Added, "private key")]);
+        let place = "commit 1a2b3c4 message";
+        assert_eq!(read.findings, redact::text(&message, place).findings);
+        assert_eq!(read.findings.len(), 1);
     }
 
     /// A log with each commit's hash, message and patch, as git writes it in

@@ -76,8 +76,9 @@ enum Form {
 }
 
 /// What a selector or a joiner comes after, since a run of them can hide data.
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq, Default)]
 enum Before {
+    #[default]
     Nothing,
     Visible,
     Selector,
@@ -86,14 +87,75 @@ enum Before {
 
 /// Each character of `text`, with whether it's safe where it stands.
 fn judged(text: &str, form: Form) -> impl Iterator<Item = (char, bool)> + '_ {
+    judged_after(text, form, Before::Nothing).map(|(character, safe, _)| (character, safe))
+}
+
+/// Each character of `text`, which comes after `before`, with whether it's safe where it stands
+/// and what the character after it comes after.
+fn judged_after(
+    text: &str,
+    form: Form,
+    mut before: Before,
+) -> impl Iterator<Item = (char, bool, Before)> + '_ {
     let mut characters = text.chars().peekable();
-    let mut before = Before::Nothing;
     std::iter::from_fn(move || {
         let character = characters.next()?;
         let (safe, now) = judge(character, characters.peek().copied(), before, form);
         before = now;
-        Some((character, safe))
+        Some((character, safe, now))
     })
+}
+
+/// Prose without what [`escaped`] would escape, as [`without_hidden`] takes it out of all of it,
+/// from bytes that come a piece at a time, such as a long line's: a character cut between two
+/// pieces waits for its rest, and so does a carriage return at a piece's end, which stays only
+/// before a line feed; what a joiner or a selector comes after carries over.
+#[derive(Default)]
+pub struct Unhidden {
+    before: Before,
+    cut: Vec<u8>,
+}
+
+impl Unhidden {
+    /// The text of `piece` without its hidden characters, all but what waits at its end for the
+    /// next piece: the start of a character cut off, and a carriage return.
+    pub fn piece(&mut self, piece: &[u8]) -> String {
+        let mut bytes = std::mem::take(&mut self.cut);
+        bytes.extend_from_slice(piece);
+        let finished = bytes.len() - unfinished_end(&bytes);
+        let waiting = finished - usize::from(bytes[..finished].ends_with(b"\r"));
+        self.cut = bytes.split_off(waiting);
+        self.visible(&String::from_utf8_lossy(&bytes))
+    }
+
+    /// What's left at the end: the start of a character that never finished, read as a read of
+    /// all of it reads it, or a carriage return before nothing.
+    pub fn finish(&mut self) -> String {
+        let cut = std::mem::take(&mut self.cut);
+        self.visible(&String::from_utf8_lossy(&cut))
+    }
+
+    fn visible(&mut self, text: &str) -> String {
+        judged_after(text, Form::Prose, self.before)
+            .filter_map(|(character, safe, now)| {
+                self.before = now;
+                safe.then_some(character)
+            })
+            .collect()
+    }
+}
+
+/// How many bytes at the end of `bytes` start a character that isn't finished there.
+fn unfinished_end(bytes: &[u8]) -> usize {
+    (1..=bytes.len().min(3))
+        .rev()
+        .find(|length| {
+            matches!(
+                std::str::from_utf8(&bytes[bytes.len() - length..]),
+                Err(error) if error.valid_up_to() == 0 && error.error_len().is_none()
+            )
+        })
+        .unwrap_or(0)
 }
 
 /// Whether `character` is safe after `before` and ahead of `next`, and what the
@@ -382,6 +444,33 @@ mod tests {
             "\x1b[3;1Hx",
         ] {
             assert_eq!(without_styles(kept), kept);
+        }
+    }
+
+    /// Text cleaned a piece at a time, cut at any byte, comes out as the whole of it cleaned at
+    /// once: characters cut in two, joiners and selectors at a piece's start, invalid bytes.
+    #[test]
+    fn cleans_text_a_piece_at_a_time_as_it_cleans_it_whole() {
+        let characters = [
+            "A", " ", "\t", "\r", "\n", "é", "😀", "\u{a0}", "\u{200b}", "\u{200c}", "\u{200d}",
+            "\u{fe00}", "\u{fe0e}", "\u{fe0f}", "\u{202e}",
+        ];
+        let invalid: [&[u8]; 3] = [&[0x80], &[0xe2], &[0xff]];
+        let parts: Vec<&[u8]> = characters
+            .iter()
+            .map(|character| character.as_bytes())
+            .chain(invalid)
+            .collect();
+        let mut picks = crate::test_support::Picks::seeded();
+        for _ in 0..100_000 {
+            let (whole, pieces) = picks.pieces(&parts, 8);
+            let mut unhidden = Unhidden::default();
+
+            let mut cleaned: String = pieces.iter().map(|piece| unhidden.piece(piece)).collect();
+            cleaned.push_str(&unhidden.finish());
+
+            let at_once = without_hidden(&String::from_utf8_lossy(&whole)).text;
+            assert_eq!(cleaned, at_once, "{whole:?} in {pieces:?}");
         }
     }
 }

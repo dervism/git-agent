@@ -2,7 +2,7 @@
 //! longer one, such as a minified bundle's, is scanned in windows that overlap, or skipped, so
 //! that no more than a window or two of it is held at once.
 
-use super::redact;
+use super::redact::{self, Windows};
 use std::collections::BTreeMap;
 use std::io::{self, BufRead, Read};
 
@@ -21,14 +21,6 @@ pub enum Line {
     /// The first [`WINDOW`] bytes of a longer line, whose rest [`Lines::scan_rest`] reads next,
     /// or [`Lines::next_line`] skips.
     Long(Vec<u8>),
-}
-
-/// What a line too long to hold whole holds: what its secrets look like, and its end, after
-/// which a private key's block may begin.
-#[derive(Debug, PartialEq)]
-pub struct LongLine {
-    pub kinds: Vec<String>,
-    pub tail: String,
 }
 
 /// The lines of the text a reader holds.
@@ -75,37 +67,47 @@ impl<R: BufRead> Lines<R> {
         &mut self,
         start: Vec<u8>,
         mut feed: impl FnMut(&[u8]),
-    ) -> io::Result<LongLine> {
+    ) -> io::Result<Windows> {
         self.unfinished = false;
         feed(&start);
         let mut tally = Tally::default();
         let mut window = start;
-        loop {
-            tally.window(kinds_in(&window));
+        let ends_with_begin = loop {
+            let ends_with_begin = tally.scan(&window);
             let piece = self.piece(WINDOW - OVERLAP)?;
             if piece.bytes.is_empty() {
-                break;
+                break ends_with_begin;
             }
             feed(&piece.bytes);
             let overlap = &window[window.len().saturating_sub(OVERLAP)..];
             tally.overlap(kinds_in(overlap));
             window = [overlap, &piece.bytes].concat();
             if piece.last {
-                tally.window(kinds_in(&window));
-                break;
+                break tally.scan(&window);
             }
-        }
-        let tail = &window[window.len().saturating_sub(OVERLAP)..];
-        Ok(LongLine {
+        };
+        Ok(Windows {
             kinds: tally.kinds(),
-            tail: String::from_utf8_lossy(tail).into_owned(),
+            ends_with_begin,
         })
     }
 
-    /// Reads past the rest of a long line.
+    /// Reads past the rest of a long line, its line end included, without holding it.
     fn skip_rest(&mut self) -> io::Result<()> {
-        while !self.piece(WINDOW)?.last {}
-        Ok(())
+        loop {
+            let buffer = self.reader.fill_buf()?;
+            if buffer.is_empty() {
+                return Ok(());
+            }
+            let (length, ended) = buffer
+                .iter()
+                .position(|byte| *byte == b'\n')
+                .map_or((buffer.len(), false), |end| (end + 1, true));
+            self.reader.consume(length);
+            if ended {
+                return Ok(());
+            }
+        }
     }
 
     /// Up to `most` more bytes of the line being read, without its line end.
@@ -156,6 +158,14 @@ impl Count {
 }
 
 impl Tally {
+    /// Counts what `window`, scanned as a line on its own, holds, and says whether, with its
+    /// secrets replaced, it ends with a private key's BEGIN line.
+    fn scan(&mut self, window: &[u8]) -> bool {
+        let scanned = redact::scan_window(&String::from_utf8_lossy(window));
+        self.window(scanned.kinds);
+        scanned.ends_with_begin
+    }
+
     fn window(&mut self, kinds: Vec<String>) {
         for (kind, times) in times_each(kinds) {
             self.count(kind, times).windows += times;
@@ -214,7 +224,7 @@ mod tests {
 
     /// Each line of `text`: a whole one as it is, and a long one as what its scan found, with
     /// all of it that `feed` was given.
-    fn read(text: &[u8]) -> Vec<(Line, Option<(LongLine, usize)>)> {
+    fn read(text: &[u8]) -> Vec<(Line, Option<(Windows, usize)>)> {
         let mut lines = Lines::new(Cursor::new(text));
         let mut read = Vec::new();
         while let Some(line) = lines.next_line().unwrap() {
@@ -272,7 +282,7 @@ mod tests {
 
     /// A long line's windows find what a scan of the whole line finds: a key inside a window,
     /// one inside an overlap, which two windows find, one across a window's edge, and one at the
-    /// end, each once; the tail is the line's last [`OVERLAP`] bytes.
+    /// end, each once.
     #[test]
     fn scans_a_long_line_in_windows_as_a_scan_of_it_whole() {
         let length = 3 * WINDOW + WINDOW / 2;
@@ -285,12 +295,26 @@ mod tests {
         assert_eq!(whole.len(), 4);
         let (long, fed) = read[0].1.as_ref().unwrap();
         assert_eq!((&long.kinds, *fed), (&whole, length));
-        assert_eq!(
-            long.tail.as_bytes(),
-            &line[length - OVERLAP..],
-            "the tail is the line's end"
-        );
+        assert!(!long.ends_with_begin);
         assert_eq!(read.len(), 1);
+    }
+
+    /// A long line ends with a private key's BEGIN line when it does once its secrets are
+    /// replaced, as a scan of the whole line tells: not when the BEGIN line is part of a value
+    /// that a rule replaces.
+    #[test]
+    fn tells_whether_a_long_line_ends_with_a_begin_line_with_its_secrets_replaced() {
+        let begin = "-----BEGIN RSA PRIVATE KEY-----";
+        let padding = "x".repeat(2 * WINDOW);
+        let ends = |end: &str| {
+            let line = format!("{padding}{end}\n");
+            let read = read(line.as_bytes());
+            read[0].1.as_ref().unwrap().0.ends_with_begin
+        };
+
+        assert!(ends(&format!(" {begin}")));
+        assert!(!ends(&format!(" token=Ab1{begin}")));
+        assert!(!ends(" plain"));
     }
 
     /// The rest of a long line that isn't scanned is skipped, however long, and the line after

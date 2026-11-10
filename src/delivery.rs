@@ -247,11 +247,7 @@ mod tests {
     use std::path::Path;
 
     fn commit_key(dir: &Path) {
-        fs::write(
-            dir.join("deploy.env"),
-            format!("aws AKIA{}\n", "Q".repeat(16)),
-        )
-        .unwrap();
+        fs::write(dir.join("deploy.env"), format!("aws {}\n", aws_key())).unwrap();
         run(dir, &["add", "deploy.env"]);
         run(dir, &["commit", "-q", "-m", "add the deploy settings"]);
     }

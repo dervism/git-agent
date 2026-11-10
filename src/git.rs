@@ -1999,6 +1999,8 @@ fn readable<'a>(args: &[&'a str]) -> Vec<&'a str> {
 /// Runs `command`, git with `args`, and gives `read` its stdout as git writes it, failing with
 /// its stderr when git fails, before or after `read` does. git is stopped when `read` fails
 /// first, and what `read` leaves of the output is read to the end, so that git can finish.
+/// git is judged before its output is closed, so that a git the closed pipe ends isn't taken for
+/// one that failed.
 fn stream_of<T>(
     mut command: Command,
     args: &[&str],
@@ -2023,10 +2025,10 @@ fn stream_of<T>(
             io::copy(&mut output, &mut io::sink())?;
             Ok(read)
         });
-        drop(output);
         let git_failed_first =
             outcome.is_err() && matches!(child.try_wait(), Ok(Some(status)) if !status.success());
         let stopped = outcome.is_err() && !git_failed_first && child.kill().is_ok();
+        drop(output);
         let status = child.wait().context("failed to wait for git")?;
         let said = said.join().ok().and_then(Result::ok).unwrap_or_default();
         let failed = (!status.success() && !stopped).then(|| {

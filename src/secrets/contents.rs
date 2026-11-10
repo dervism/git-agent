@@ -490,21 +490,21 @@ impl SecretLines<'_> {
         start: Vec<u8>,
         lines: &mut Lines<R>,
     ) -> io::Result<()> {
-        let mut line = self.scan.start_long_line(&String::from_utf8_lossy(&start));
+        let mut line = self.scan.start_long_line();
         let mut own = self.fingerprints.start();
         let mut more = self.last.as_ref().map(|last| {
             let mut print = last.print.clone();
             print.feed(b"\n");
             print
         });
-        let long = lines.scan_rest(start, |piece| {
+        let windows = lines.scan_rest(start, |piece| {
             line.feed(piece);
             own.feed(piece);
             if let Some(more) = &mut more {
                 more.feed(piece);
             }
         })?;
-        match self.scan.end_long_line(line, long.kinds, &long.tail) {
+        match self.scan.end_long_line(line, windows) {
             Held::Secrets(kinds) => self.keep(Some(Waiting {
                 number,
                 print: own,
@@ -1289,6 +1289,18 @@ mod tests {
                 ]
             );
         }
+    }
+
+    /// A zero-width space cut in two at the edge of a long line's first window leaves a long line
+    /// of key data a key, as a scan of each whole line finds it.
+    #[test]
+    fn reads_a_character_cut_at_a_window_s_edge_as_the_whole_line_does() {
+        let line = format!("{}\u{200b}{}", "A".repeat(WINDOW - 1), "A".repeat(100));
+        let text = key_block(&[&line]);
+
+        let found = found_against("", &[&text]);
+
+        assert_eq!(found, [(Some(3), Change::Added, "private key".to_owned())]);
     }
 
     /// A long line is told from another by all of it: the same line in a parent holds its keys,

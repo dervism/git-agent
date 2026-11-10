@@ -22,6 +22,8 @@ mod server;
 mod split;
 mod staging;
 mod temp;
+#[cfg(test)]
+mod test_support;
 mod tidy;
 mod ui;
 mod why;

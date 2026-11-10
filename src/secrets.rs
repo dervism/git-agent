@@ -2,17 +2,21 @@
 //! reaches a model, and refusing or warning when a commit or a push would add them.
 //!
 //! The checks read what git publishes, every file of every commit, rather than what the model
-//! reads, so that no setting, such as `exclude`, can hide a secret from them. A file a diff shows
-//! only as binary is read whole (`contents`).
+//! reads, so that no setting, such as `exclude`, can hide a secret from them. They read it as git
+//! streams it (`publication`), a line at a time and a long line in windows (`lines`), so that no
+//! diff or history is held whole. A file a diff shows only as binary is read whole (`contents`).
 
 pub mod contents;
+mod lines;
+mod publication;
 pub mod redact;
 
 use crate::config::OnSecrets;
-use crate::git::{CommitPatch, Repo, Scope};
+use crate::git::{Repo, Scope};
 use crate::ui;
 use anyhow::{Result, bail};
-use contents::{BinaryFile, MOST_BINARY_BYTES, Scanned, Unchecked};
+use contents::{MOST_BINARY_BYTES, Scanned, Unchecked};
+use publication::Published;
 use redact::{Change, Finding};
 
 /// How to make a check pass when its findings aren't secrets.
@@ -169,35 +173,21 @@ pub fn check_outgoing(repo: &Repo, on_secrets: OnSecrets) -> Result<()> {
 
 /// The secrets in every file of what a commit of `scope` will hold.
 fn found_in_changes(repo: &Repo, scope: Scope) -> Result<Scanned> {
-    let diff = repo.changes_to_publish(scope)?;
-    let whole = contents::scan(repo, &contents::binary_files(&diff)?, MOST_BINARY_BYTES)?;
-    let findings = redact::diff_findings(&diff)
-        .into_iter()
-        .chain(whole.findings);
-    Ok(Scanned {
-        findings: findings.collect(),
-        unchecked: whole.unchecked,
-    })
+    let published = repo.changes_to_publish(scope, publication::read_diff)?;
+    with_binary_files(repo, published)
 }
 
 /// The secrets in the messages and every file of the commits `range` publishes.
 fn found_in_commits(repo: &Repo, range: &[&str]) -> Result<Scanned> {
-    let commits = repo.published_commits(range)?;
-    let binary = commits
-        .iter()
-        .map(|commit| {
-            let files = contents::binary_files(&commit.patch)?;
-            Ok(files.into_iter().map(|file| BinaryFile {
-                place: format!("commit {} {}", commit.hash, file.place),
-                ..file
-            }))
-        })
-        .collect::<Result<Vec<_>>>()?
-        .into_iter()
-        .flatten()
-        .collect::<Vec<BinaryFile>>();
-    let whole = contents::scan(repo, &binary, MOST_BINARY_BYTES)?;
-    let findings = scan_commits(&commits).into_iter().chain(whole.findings);
+    let published = repo.published_commits(range, publication::read_log)?;
+    with_binary_files(repo, published)
+}
+
+/// What `published` holds: the secrets in its lines, then those in the whole content of its
+/// binary files.
+fn with_binary_files(repo: &Repo, published: Published) -> Result<Scanned> {
+    let whole = contents::scan(repo, &published.binary, MOST_BINARY_BYTES)?;
+    let findings = published.findings.into_iter().chain(whole.findings);
     Ok(Scanned {
         findings: findings.collect(),
         unchecked: whole.unchecked,
@@ -325,14 +315,6 @@ fn settle(verdict: Verdict) -> Result<()> {
         }
         Verdict::Refuse(text) => bail!(text),
     }
-}
-
-/// The secrets in the messages and patches of `commits`.
-fn scan_commits(commits: &[CommitPatch]) -> Vec<Finding> {
-    commits
-        .iter()
-        .flat_map(|commit| redact::commit(&commit.hash, &commit.message, &commit.patch))
-        .collect()
 }
 
 /// The findings the change adds, rather than leaves alone or removes.
@@ -608,37 +590,6 @@ mod tests {
 
         assert_eq!(new_unchecked(&found, &before), [file("other.bin")]);
         assert_eq!(new_unchecked(&found, &[]), found);
-    }
-
-    #[test]
-    fn scans_the_message_and_the_patch_of_each_commit() {
-        let commits = [
-            CommitPatch {
-                hash: "1a2b3c4".to_owned(),
-                message: format!("add {}", key()),
-                patch: String::new(),
-            },
-            CommitPatch {
-                hash: "5d6e7f8".to_owned(),
-                message: "tidy".to_owned(),
-                patch: format!(
-                    "diff --git a/x.env b/x.env\n--- a/x.env\n+++ b/x.env\n@@ -0,0 +1 @@\n+{}\n",
-                    key()
-                ),
-            },
-        ];
-        let places: Vec<(String, Option<usize>)> = scan_commits(&commits)
-            .into_iter()
-            .map(|finding| (finding.place, finding.line))
-            .collect();
-        assert_eq!(
-            places,
-            [
-                ("commit 1a2b3c4 message".to_owned(), None),
-                ("commit 5d6e7f8 x.env".to_owned(), Some(1)),
-            ]
-        );
-        assert!(scan_commits(&[]).is_empty());
     }
 
     /// The model doesn't read lockfiles, or what a user's own `exclude` names, but a commit

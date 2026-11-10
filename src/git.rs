@@ -16,7 +16,7 @@ use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
 use std::fs;
 use std::hash::{BuildHasher, Hasher};
-use std::io::Write;
+use std::io::{self, BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
 use worktree::TempWorktree;
@@ -422,10 +422,27 @@ impl Repo {
     /// Runs a read for the secret checks: a readable read, with [`PUBLISHED_SETTINGS`] and
     /// without grafts.
     fn git_published(&self, args: &[&str]) -> Result<String> {
+        let (command, args) = self.published_command(args);
+        Ok(String::from_utf8_lossy(&stdout_of(command, &args)?).into_owned())
+    }
+
+    /// Runs a read for the secret checks, as [`Repo::git_published`] does, and gives `read` git's
+    /// output as git writes it, so that none of it is held whole.
+    fn stream_published<T>(
+        &self,
+        args: &[&str],
+        read: impl FnOnce(&mut dyn BufRead) -> Result<T>,
+    ) -> Result<T> {
+        let (command, args) = self.published_command(args);
+        stream_of(command, &args, read)
+    }
+
+    /// git with `args` for a read for the secret checks, and the arguments in full.
+    fn published_command<'a>(&self, args: &[&'a str]) -> (Command, Vec<&'a str>) {
         let args = readable(&[&PUBLISHED_SETTINGS[..], args].concat());
         let mut command = self.command(&args);
         command.env("GIT_GRAFT_FILE", NO_GRAFTS);
-        Ok(String::from_utf8_lossy(&stdout_of(command, &args)?).into_owned())
+        (command, args)
     }
 
     fn has_diff(&self, args: &[&str]) -> Result<bool> {
@@ -820,16 +837,22 @@ impl Repo {
     /// model: every file, whatever `exclude` says, with git's settings that change a diff
     /// pinned. The Tracked scope is staged first in a private copy of the index, as
     /// `git commit --all` stages it, so what's staged meanwhile is read too, a clean filter
-    /// applies as it will at the commit, and every new blob exists.
-    pub fn changes_to_publish(&self, scope: Scope) -> Result<String> {
+    /// applies as it will at the commit, and every new blob exists. `read` is given the diff as
+    /// git writes it.
+    pub fn changes_to_publish<T>(
+        &self,
+        scope: Scope,
+        read: impl FnOnce(&mut dyn BufRead) -> Result<T>,
+    ) -> Result<T> {
         let mut args = vec!["diff", "--cached"];
         args.extend(PUBLISHED_DIFF);
         args.extend(["--", ":/"]);
         match scope {
-            Scope::Staged => self.git_published(&args),
+            Scope::Staged => self.stream_published(&args, read),
             Scope::Tracked => {
                 let folder = PrivateDir::create("check")?;
-                self.staged_as_commit_all(&folder)?.git_published(&args)
+                self.staged_as_commit_all(&folder)?
+                    .stream_published(&args, read)
             }
         }
     }
@@ -851,10 +874,15 @@ impl Repo {
 
     /// The commits `range` (`git log` arguments) publishes, with their patches, read for the
     /// secret checks: every commit and every file, what a merge adds itself, and the root
-    /// commit's diff, whatever the user's settings, replacements and grafts say.
-    pub fn published_commits(&self, range: &[&str]) -> Result<Vec<CommitPatch>> {
+    /// commit's diff, whatever the user's settings, replacements and grafts say. `read` is given
+    /// the log as git writes it, in [`LogMarks::stream_format`], with the marks to read it by.
+    pub fn published_commits<T>(
+        &self,
+        range: &[&str],
+        read: impl FnOnce(&mut dyn BufRead, &LogMarks) -> Result<T>,
+    ) -> Result<T> {
         let marks = LogMarks::new();
-        let format = marks.patch_format();
+        let format = marks.stream_format();
         let mut args = vec![
             "log",
             "--patch",
@@ -866,11 +894,7 @@ impl Repo {
         args.extend(PUBLISHED_DIFF);
         args.extend_from_slice(range);
         args.push("--");
-        let log = MarkedLog {
-            text: self.git_published(&args)?,
-            marks,
-        };
-        log.patches()
+        self.stream_published(&args, |output| read(output, &marks))
     }
 
     /// The commits on HEAD that `base` lacks, oldest first, without merges.
@@ -1798,8 +1822,19 @@ fn without_dirty_submodule(file: &str) -> Option<String> {
 /// The marks `git log` writes before each commit and between its fields: the bytes 0x1e and
 /// 0x1f, each followed by a random value drawn for the read. A commit message can hold those
 /// bytes, but not the value, so it can't forge a record or a field.
-struct LogMarks {
+pub struct LogMarks {
     value: String,
+}
+
+/// What a line of a log in [`LogMarks::stream_format`] is.
+#[derive(Debug, PartialEq)]
+pub enum LogLine {
+    /// The start of a commit, with its short hash.
+    Commit(String),
+    /// The end of the commit's message, after which its patch comes.
+    MessageEnd,
+    /// A line of a message or of a patch.
+    Text,
 }
 
 /// `git log` output whose records and fields are set apart by [`LogMarks`].
@@ -1853,9 +1888,7 @@ impl MarkedLog {
     pub fn plain(text: &str) -> Self {
         Self {
             text: text.to_owned(),
-            marks: LogMarks {
-                value: String::new(),
-            },
+            marks: LogMarks::plain(),
         }
     }
 }
@@ -1865,6 +1898,44 @@ impl LogMarks {
         Self {
             value: random_hex(),
         }
+    }
+
+    /// git's separators as they are, without a value, as tests write them.
+    #[cfg(test)]
+    pub fn plain() -> Self {
+        Self {
+            value: String::new(),
+        }
+    }
+
+    /// What `line`, a line of a log in [`LogMarks::stream_format`], is. Fails on a commit's
+    /// line without a commit's hash, as when the marks didn't come out as written, rather than
+    /// read a commit as none.
+    pub fn line(&self, line: &[u8]) -> Result<LogLine> {
+        let line = line.strip_suffix(b"\n").unwrap_or(line);
+        match line.first() {
+            Some(0x1e) if line.starts_with(self.record().as_bytes()) => {
+                let hash = std::str::from_utf8(&line[self.record().len()..])
+                    .ok()
+                    .filter(|hash| is_commit_hash(hash))
+                    .context(
+                        "git-agent couldn't read git's list of commits: a commit in it has no hash",
+                    )?;
+                Ok(LogLine::Commit(hash.to_owned()))
+            }
+            Some(0x1f) if line == self.field().as_bytes() => Ok(LogLine::MessageEnd),
+            _ => Ok(LogLine::Text),
+        }
+    }
+
+    /// The `--format` of a commit's hash and message for a log read a line at a time: each mark
+    /// on a line of its own, the record's before the hash, and the field's after the message.
+    fn stream_format(&self) -> String {
+        format!(
+            "--format={}%h%n%B%n{}",
+            self.record_format(),
+            self.field_format()
+        )
     }
 
     fn record(&self) -> String {
@@ -1923,6 +1994,47 @@ const PUBLISHED_DIFF: [&str; 10] = [
 /// `args` with the settings of a read whose output names files to people or models.
 fn readable<'a>(args: &[&'a str]) -> Vec<&'a str> {
     [&READABLE_NAMES[..], &WHOLE_TREE, &UTF8_LOGS, args].concat()
+}
+
+/// Runs `command`, git with `args`, and gives `read` its stdout as git writes it, failing with
+/// its stderr when git fails. git is stopped when `read` fails, and what `read` leaves of the
+/// output is read to the end, so that git can finish.
+fn stream_of<T>(
+    mut command: Command,
+    args: &[&str],
+    read: impl FnOnce(&mut dyn BufRead) -> Result<T>,
+) -> Result<T> {
+    let mut child = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("failed to run git; is it installed?")?;
+    let (Some(stdout), Some(mut stderr)) = (child.stdout.take(), child.stderr.take()) else {
+        bail!("git was started without its output");
+    };
+    std::thread::scope(|scope| {
+        let said = scope.spawn(move || {
+            let mut said = Vec::new();
+            stderr.read_to_end(&mut said).map(|_| said)
+        });
+        let mut output = BufReader::new(stdout);
+        let read = read(&mut output).and_then(|read| {
+            io::copy(&mut output, &mut io::sink())?;
+            Ok(read)
+        });
+        let stopped = read.is_err() && child.kill().is_ok();
+        let status = child.wait().context("failed to wait for git")?;
+        let said = said.join().ok().and_then(Result::ok).unwrap_or_default();
+        if !status.success() && !stopped {
+            bail!(
+                "`git {}` failed: {}",
+                args.join(" "),
+                String::from_utf8_lossy(&said).trim()
+            );
+        }
+        read
+    })
 }
 
 /// Runs `command`, git with `args`, and returns its stdout as it is, failing with its stderr.
@@ -2106,12 +2218,83 @@ pub mod test_support {
 
 #[cfg(test)]
 mod tests {
-    use super::test_support::{add_remote, commit_elsewhere, hook, isolate};
+    use super::test_support::{add_remote, commit_elsewhere, hook, isolate, isolated_repo};
     use super::*;
     use tempfile::TempDir;
 
     fn fields(raw: &[&str]) -> Vec<String> {
         raw.iter().map(ToString::to_string).collect()
+    }
+
+    /// How many commits [`Repo::published_commits`] reads for `range`.
+    fn published_count(repo: &Repo, range: &[&str]) -> usize {
+        repo.published_commits(range, |output, marks| {
+            let lines = output.split(b'\n').collect::<io::Result<Vec<_>>>()?;
+            Ok(lines
+                .iter()
+                .filter(|line| matches!(marks.line(line), Ok(LogLine::Commit(_))))
+                .count())
+        })
+        .unwrap()
+    }
+
+    /// Each mark of a log read a line at a time is a line of its own: a commit's, with its hash,
+    /// and the end of its message. A commit's line without a hash fails the read.
+    #[test]
+    fn tells_the_lines_of_a_log_by_their_marks() {
+        let marks = LogMarks::new();
+        let (record, field) = (marks.record(), marks.field());
+        let line = |text: &str| marks.line(text.as_bytes());
+
+        assert_eq!(
+            line(&format!("{record}1a2b3c4\n")).unwrap(),
+            LogLine::Commit("1a2b3c4".to_owned())
+        );
+        assert_eq!(line(&format!("{field}\n")).unwrap(), LogLine::MessageEnd);
+        assert_eq!(line(&field).unwrap(), LogLine::MessageEnd);
+        for text in [
+            "feat: add b\n".to_owned(),
+            "\u{1e}1a2b3c4\n".to_owned(),
+            "\u{1f}\n".to_owned(),
+            format!("{field} more\n"),
+            format!(" {record}1a2b3c4\n"),
+            String::new(),
+        ] {
+            assert_eq!(line(&text).unwrap(), LogLine::Text, "{text:?}");
+        }
+        for text in [format!("{record}\n"), format!("{record}not-a-hash\n")] {
+            let error = line(&text).unwrap_err().to_string();
+            assert!(error.contains("a commit in it has no hash"), "{text:?}");
+        }
+        assert!(
+            marks
+                .stream_format()
+                .ends_with(&format!("%h%n%B%n{}", marks.field_format()))
+        );
+    }
+
+    /// A streamed read fails with what git said when git fails, and with the reader's error,
+    /// rather than git's, when the reader stops first.
+    #[test]
+    fn fails_a_streamed_read_with_git_or_with_the_reader() {
+        let (dir, repo) = isolated_repo();
+        fs::write(dir.path().join("a.txt"), "a\n").unwrap();
+        run(dir.path(), &["add", "a.txt"]);
+        run(dir.path(), &["commit", "-qm", "add a"]);
+
+        let missing = repo
+            .published_commits(&["no-such-revision"], |_, _| Ok(()))
+            .unwrap_err()
+            .to_string();
+        let stopped = repo
+            .published_commits(&["HEAD"], |_, _| -> Result<()> { bail!("stopped") })
+            .unwrap_err()
+            .to_string();
+
+        assert!(missing.contains("failed: fatal:"), "{missing}");
+        assert!(missing.contains("no-such-revision"), "{missing}");
+        assert_eq!(stopped, "stopped");
+        assert_eq!(published_count(&repo, &["HEAD~1..HEAD"]), 1);
     }
 
     #[test]
@@ -2451,12 +2634,12 @@ mod tests {
         );
         assert!(patches[1].patch.contains("diff --git a/lib.rs b/lib.rs"));
         let outgoing = ["HEAD", "--not", "--remotes"];
-        assert_eq!(repo.published_commits(&outgoing).unwrap().len(), 2);
+        assert_eq!(published_count(&repo, &outgoing), 2);
 
         assert!(repo.has_unpushed_commits().unwrap());
         repo.push().unwrap();
         assert!(!repo.has_unpushed_commits().unwrap());
-        assert!(repo.published_commits(&outgoing).unwrap().is_empty());
+        assert_eq!(published_count(&repo, &outgoing), 0);
         assert!(!repo.has_uncommitted_changes().unwrap());
         fs::write(dir.path().join("lib.rs"), "fn d() {}\n").unwrap();
         assert!(repo.has_uncommitted_changes().unwrap());

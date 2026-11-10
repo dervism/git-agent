@@ -2,6 +2,7 @@
 //! byte in, and those `.gitattributes` marks `-diff` or `binary`. A diff shows no lines of them,
 //! so their blobs are read instead.
 
+use super::lines::{Line, Lines};
 use super::redact::{self, Change, Finding, Held, LineScan, SecretLine};
 use crate::git::blob::BlobBatch;
 use crate::git::{Repo, names};
@@ -21,14 +22,6 @@ const TEXT_TEST_BYTES: u64 = 8000;
 /// The shortest run of printable characters in a binary file that is scanned. No secret the
 /// rules know is shorter.
 const SHORTEST_RUN: usize = 8;
-
-/// The longest line scanned whole. A longer one is scanned in windows of this size, so that no
-/// more of it is held at once.
-const WINDOW: usize = 1024 * 1024;
-
-/// How much each window of a long line overlaps the next: more than any secret the rules find on
-/// one line, so that each lies whole in some window.
-const OVERLAP: usize = 64 * 1024;
 
 /// A file a diff shows as binary, with the blobs its `--full-index` lines name.
 #[derive(Debug, Clone, PartialEq)]
@@ -128,32 +121,45 @@ impl Fingerprinting {
     }
 }
 
-/// The files whose new content `diff` names without showing it: those with an `index` line and
-/// no hunk, as git shows a binary file, whatever made it binary. A deleted file adds nothing, so
-/// it isn't one of them. Fails on a binary file without the blobs to read.
-pub fn binary_files(diff: &str) -> Result<Vec<BinaryFile>> {
-    let mut files = Vec::new();
-    let mut section = Section::default();
-    for line in diff.lines() {
-        if ["diff --git ", "diff --cc ", "diff --combined "]
-            .iter()
-            .any(|start| line.starts_with(start))
-        {
-            files.extend(section.unshown()?);
-            section = Section {
-                place: names::of_diff(line),
-                ..Section::default()
-            };
+/// The files whose new content a diff names without showing it, from its lines one after
+/// another: those with an `index` line and no hunk, as git shows a binary file, whatever made it
+/// binary. A deleted file adds nothing, so it isn't one of them. Fails on a binary file without
+/// the blobs to read.
+#[derive(Default)]
+pub struct BinaryFiles {
+    files: Vec<BinaryFile>,
+    section: Section,
+}
+
+impl BinaryFiles {
+    /// Takes the next line of the diff, without its line end. A line too long to read whole
+    /// can be given by its start, since only a line's start tells this anything.
+    pub fn line(&mut self, line: &str) -> Result<()> {
+        if redact::is_file_header(line) {
+            let place = names::of_diff(line);
+            let done = std::mem::replace(
+                &mut self.section,
+                Section {
+                    place,
+                    ..Section::default()
+                },
+            );
+            self.files.extend(done.unshown()?);
         } else if let Some(index) = line.strip_prefix("index ") {
-            section.blobs = index_blobs(index);
+            self.section.blobs = index_blobs(index);
         } else if line.starts_with("@@") {
-            section.hunks = true;
+            self.section.hunks = true;
         } else if line.starts_with("Binary files ") {
-            section.binary = true;
+            self.section.binary = true;
         }
+        Ok(())
     }
-    files.extend(section.unshown()?);
-    Ok(files)
+
+    /// The files found, once the diff has ended.
+    pub fn finish(mut self) -> Result<Vec<BinaryFile>> {
+        self.files.extend(self.section.unshown()?);
+        Ok(self.files)
+    }
 }
 
 /// What a diff says of one file, as far as reading it whole goes.
@@ -425,34 +431,24 @@ fn streamed_content(
 }
 
 /// The secret lines of text read from `reader`, a line at a time, each kept by its fingerprint: a
-/// line up to [`WINDOW`] bytes is scanned whole, and a longer one in windows.
-fn secret_lines_of(
-    mut reader: impl BufRead,
-    fingerprints: &Fingerprints,
-) -> io::Result<Vec<Secrets>> {
-    let mut lines = SecretLines {
+/// line up to [`WINDOW`](super::lines::WINDOW) bytes is scanned whole, and a longer one in
+/// windows.
+fn secret_lines_of(reader: impl BufRead, fingerprints: &Fingerprints) -> io::Result<Vec<Secrets>> {
+    let mut lines = Lines::new(reader);
+    let mut found = SecretLines {
         scan: LineScan::default(),
         fingerprints,
         found: Vec::new(),
         last: None,
     };
     for number in 1.. {
-        let mut start = Vec::new();
-        if (&mut reader)
-            .take(WINDOW as u64)
-            .read_until(b'\n', &mut start)?
-            == 0
-        {
-            break;
-        }
-        if start.len() < WINDOW || start.ends_with(b"\n") {
-            lines.line(number, &start);
-        } else {
-            let long = long_line(&mut reader, start, fingerprints)?;
-            lines.long_line(number, long);
+        match lines.next_line()? {
+            None => break,
+            Some(Line::Whole(bytes)) => found.line(number, &bytes),
+            Some(Line::Long(start)) => found.long_line(number, start, &mut lines)?,
         }
     }
-    Ok(lines.finish())
+    Ok(found.finish())
 }
 
 /// The secret lines found so far, as [`redact::secret_lines`] finds them, where a private key's
@@ -477,36 +473,72 @@ impl SecretLines<'_> {
     fn line(&mut self, number: usize, bytes: &[u8]) {
         let text = String::from_utf8_lossy(bytes.strip_suffix(b"\n").unwrap_or(bytes));
         match self.scan.line(&text) {
-            Held::MoreOfAKey => {
-                if let Some(last) = &mut self.last {
-                    last.print.feed(b"\n");
-                    last.print.feed(text.as_bytes());
-                }
-            }
-            Held::Secrets(kinds) => {
+            Held::MoreOfAKey => self.more_of_a_key(text.as_bytes()),
+            Held::Secrets(kinds) => self.found_on(number, text.as_bytes(), kinds),
+            Held::Nothing => {}
+        }
+    }
+
+    /// Takes the line `number`, too long to scan whole, whose first bytes are `start` and whose
+    /// rest `lines` reads next. A private key's data is fingerprinted as it streams; any other
+    /// such line is scanned in windows, with a fingerprint of all of it.
+    fn long_line<R: BufRead>(
+        &mut self,
+        number: usize,
+        start: Vec<u8>,
+        lines: &mut Lines<R>,
+    ) -> io::Result<()> {
+        match self.scan.long_line(&String::from_utf8_lossy(&start)) {
+            Some(Held::Secrets(kinds)) => {
                 let mut print = self.fingerprints.start();
-                print.feed(text.as_bytes());
+                lines.read_rest(&start, |piece| print.feed(piece))?;
                 self.keep(Some(Waiting {
                     number,
                     print,
                     kinds,
                 }));
             }
-            Held::Nothing => {}
+            Some(_) => match &mut self.last {
+                Some(last) => {
+                    last.print.feed(b"\n");
+                    lines.read_rest(&start, |piece| last.print.feed(piece))?;
+                }
+                None => lines.read_rest(&start, |_| {})?,
+            },
+            None => {
+                let mut print = self.fingerprints.start();
+                let long = lines.scan_rest(start, |piece| print.feed(piece))?;
+                self.scan.after_long_line(&long.tail);
+                self.keep(None);
+                if !long.kinds.is_empty() {
+                    self.found.push(Secrets {
+                        number,
+                        fingerprint: print.finish(),
+                        kinds: long.kinds,
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Feeds `text`, a later line of a private key's data, to the key's fingerprint.
+    fn more_of_a_key(&mut self, text: &[u8]) {
+        if let Some(last) = &mut self.last {
+            last.print.feed(b"\n");
+            last.print.feed(text);
         }
     }
 
-    /// Takes the line `number`, too long to scan whole, which `long` says what it holds.
-    fn long_line(&mut self, number: usize, long: LongLine) {
-        self.scan.after_long_line(&long.tail);
-        self.keep(None);
-        if !long.kinds.is_empty() {
-            self.found.push(Secrets {
-                number,
-                fingerprint: long.fingerprint,
-                kinds: long.kinds,
-            });
-        }
+    /// Takes `text`, the line `number`, which holds secrets that look like `kinds`.
+    fn found_on(&mut self, number: usize, text: &[u8], kinds: Vec<String>) {
+        let mut print = self.fingerprints.start();
+        print.feed(text);
+        self.keep(Some(Waiting {
+            number,
+            print,
+            kinds,
+        }));
     }
 
     /// Finishes the line that waits, and makes `next` the one that waits.
@@ -524,119 +556,6 @@ impl SecretLines<'_> {
         self.keep(None);
         self.found
     }
-}
-
-/// What a line too long to scan whole holds: what its secrets look like, its fingerprint, and its
-/// end, after which a private key's block may begin.
-struct LongLine {
-    kinds: Vec<String>,
-    fingerprint: Fingerprint,
-    tail: String,
-}
-
-/// Scans a long line, whose first [`WINDOW`] bytes are `start` and whose rest `reader` holds, in
-/// windows that each overlap the next by [`OVERLAP`] bytes, counting through a [`Tally`]. No more
-/// than a window or two of the line is held at once.
-fn long_line(
-    reader: &mut impl BufRead,
-    start: Vec<u8>,
-    fingerprints: &Fingerprints,
-) -> io::Result<LongLine> {
-    let mut print = fingerprints.start();
-    print.feed(&start);
-    let mut tally = Tally::default();
-    let mut window = start;
-    loop {
-        tally.window(kinds_in(&window));
-        let mut more = Vec::new();
-        let step = (WINDOW - OVERLAP) as u64;
-        reader.take(step).read_until(b'\n', &mut more)?;
-        let ended = more.ends_with(b"\n");
-        more.truncate(more.len() - usize::from(ended));
-        if more.is_empty() {
-            break;
-        }
-        print.feed(&more);
-        let overlap = &window[window.len() - OVERLAP..];
-        tally.overlap(kinds_in(overlap));
-        let last = ended || more.len() < WINDOW - OVERLAP;
-        window = [overlap, &more].concat();
-        if last {
-            tally.window(kinds_in(&window));
-            break;
-        }
-    }
-    let tail = &window[window.len().saturating_sub(OVERLAP)..];
-    Ok(LongLine {
-        kinds: tally.kinds(),
-        fingerprint: print.finish(),
-        tail: String::from_utf8_lossy(tail).into_owned(),
-    })
-}
-
-/// What the secrets in `bytes`, scanned on their own, look like.
-fn kinds_in(bytes: &[u8]) -> Vec<String> {
-    redact::kinds_in(&String::from_utf8_lossy(bytes))
-}
-
-/// What a long line's windows find, less what their overlaps find on their own, kind by kind. A
-/// secret in an overlap is found by both its windows and by the overlap, so it counts once, as
-/// long as what's around it differs on one side only. A scan can still count differently at an
-/// edge, for example when a window has used up its searches again inside implausible matches, so
-/// no kind ever comes out below the most that one scan, of a window or an overlap, found: the
-/// subtraction may lower a count, but never takes away a secret a scan found.
-#[derive(Default)]
-struct Tally(BTreeMap<String, Count>);
-
-/// How often the scans of a long line found one kind of secret.
-#[derive(Default)]
-struct Count {
-    windows: usize,
-    overlaps: usize,
-    most: usize,
-}
-
-impl Count {
-    fn counted(&self) -> usize {
-        self.windows.saturating_sub(self.overlaps).max(self.most)
-    }
-}
-
-impl Tally {
-    fn window(&mut self, kinds: Vec<String>) {
-        for (kind, times) in times_each(kinds) {
-            self.count(kind, times).windows += times;
-        }
-    }
-
-    fn overlap(&mut self, kinds: Vec<String>) {
-        for (kind, times) in times_each(kinds) {
-            self.count(kind, times).overlaps += times;
-        }
-    }
-
-    /// The count of `kind`, which one scan found `times`.
-    fn count(&mut self, kind: String, times: usize) -> &mut Count {
-        let count = self.0.entry(kind).or_default();
-        count.most = count.most.max(times);
-        count
-    }
-
-    /// What the secrets look like, each kind as often as it counts.
-    fn kinds(self) -> Vec<String> {
-        self.0
-            .into_iter()
-            .flat_map(|(kind, count)| std::iter::repeat_n(kind, count.counted()))
-            .collect()
-    }
-}
-
-/// How many times each kind is among `kinds`.
-fn times_each(kinds: Vec<String>) -> BTreeMap<String, usize> {
-    kinds.into_iter().fold(BTreeMap::new(), |mut times, kind| {
-        *times.entry(kind).or_default() += 1;
-        times
-    })
 }
 
 /// The runs of printable ASCII characters in `bytes` that are long enough to hold a secret, as
@@ -680,6 +599,8 @@ fn runs_of(characters: impl Iterator<Item = Option<u8>>) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+    use super::super::lines::WINDOW;
+    use super::super::lines::test_support::line_with_keys;
     use super::*;
     use crate::git::test_support::{isolated_repo, run};
     use std::fs;
@@ -695,6 +616,16 @@ mod tests {
         run(dir, &["hash-object", "-w", "--", name])
             .trim()
             .to_owned()
+    }
+
+    /// The files whose new content `diff` names without showing it, as [`BinaryFiles`] finds
+    /// them.
+    fn binary_files(diff: &str) -> Result<Vec<BinaryFile>> {
+        let mut files = BinaryFiles::default();
+        for line in diff.lines() {
+            files.line(line)?;
+        }
+        files.finish()
     }
 
     fn file(place: &str, result: &str, parents: &[&str]) -> BinaryFile {
@@ -1193,39 +1124,12 @@ mod tests {
         assert_ne!(one.of(&line), two.of(&line));
     }
 
-    /// `length` bytes of padding with an AWS key put at each of `at`, between spaces.
-    fn line_with_keys(length: usize, at: &[usize]) -> Vec<u8> {
-        let mut line = vec![b'x'; length];
-        for start in at {
-            let key = format!(" {} ", key());
-            line[*start..*start + key.len()].copy_from_slice(key.as_bytes());
-        }
-        line
-    }
-
     fn lines_of(bytes: &[u8]) -> Vec<Secrets> {
         let fingerprints = Fingerprints(RandomState::new());
         match content_of(bytes, &fingerprints).unwrap() {
             Content::Read { lines, .. } => lines,
             Content::TooLarge(_) => panic!("text is never too large"),
         }
-    }
-
-    /// A line too long to scan whole is scanned in overlapping windows, and finds what a scan of
-    /// the whole line finds: a key inside a window, one inside an overlap, which two windows
-    /// find, one across a window's edge, and one at the end, each once.
-    #[test]
-    fn scans_a_long_line_in_windows_as_a_scan_of_it_whole() {
-        let length = 3 * WINDOW + WINDOW / 2;
-        let at = [100_000, WINDOW - OVERLAP + 1000, WINDOW - 8, length - 40];
-        let line = line_with_keys(length, &at);
-
-        let lines = lines_of(&line);
-
-        let whole = redact::kinds_in(&String::from_utf8_lossy(&line));
-        assert_eq!(whole.len(), 4);
-        assert_eq!(lines.len(), 1);
-        assert_eq!((lines[0].number, &lines[0].kinds), (1, &whole));
     }
 
     /// A line of a window's length or less, line end included, is scanned whole; one byte more
@@ -1266,48 +1170,6 @@ mod tests {
         assert_eq!(
             (lines[0].number, lines[0].kinds.as_slice()),
             (2, &["private key".to_owned()][..])
-        );
-    }
-
-    /// What the scans of `windows`, between which each of `overlaps` lies, find, as a [`Tally`]
-    /// counts it; each scan finds the kinds named.
-    fn tally(windows: &[&[&str]], overlaps: &[&[&str]]) -> Vec<String> {
-        let found = |kinds: &[&str]| kinds.iter().map(ToString::to_string).collect();
-        let mut tally = Tally::default();
-        tally.window(found(windows[0]));
-        for (overlap, window) in overlaps.iter().zip(&windows[1..]) {
-            tally.overlap(found(overlap));
-            tally.window(found(window));
-        }
-        tally.kinds()
-    }
-
-    /// A secret in an overlap counts once, though both its windows and the overlap find it;
-    /// secrets apart from the overlaps count as often as their windows find them.
-    #[test]
-    fn counts_a_secret_in_an_overlap_once() {
-        assert_eq!(tally(&[&["aws"], &["aws"]], &[&["aws"]]), ["aws"]);
-        assert_eq!(
-            tally(&[&["aws", "aws"], &["aws", "pass"]], &[&["aws"]]),
-            ["aws", "aws", "pass"]
-        );
-        assert_eq!(
-            tally(&[&["aws"], &["aws"], &["aws"]], &[&["aws"], &[]]),
-            ["aws", "aws"]
-        );
-        assert!(tally(&[&[], &[]], &[&[]]).is_empty());
-    }
-
-    /// A count never comes out below what one scan found: not when a window misses what the
-    /// overlap before it finds, and not when the overlap finds what both its windows miss.
-    #[test]
-    fn counts_no_kind_below_what_one_scan_found() {
-        assert_eq!(tally(&[&["pass"], &[]], &[&["pass"]]), ["pass"]);
-        assert_eq!(tally(&[&["aws", "aws"], &[]], &[&["aws"]]), ["aws", "aws"]);
-        assert_eq!(tally(&[&[], &[]], &[&["pass"]]), ["pass"]);
-        assert_eq!(
-            tally(&[&["aws"], &[], &["aws"]], &[&["aws", "aws"], &[]]),
-            ["aws", "aws"]
         );
     }
 
@@ -1356,6 +1218,67 @@ mod tests {
                 (Some(2), Change::Added)
             ]
         );
+    }
+
+    /// What a scan finds in each of `texts`, each the content of a file whose parent holds
+    /// `parent`: where each secret is, whether the parent holds it, and what it looks like.
+    fn found_against(parent: &str, texts: &[&str]) -> Vec<(Option<usize>, Change, String)> {
+        let hash = |at: usize| {
+            char::from(b'a' + u8::try_from(at).unwrap())
+                .to_string()
+                .repeat(40)
+        };
+        let contents: Vec<(String, &str)> = std::iter::once(parent)
+            .chain(texts.iter().copied())
+            .enumerate()
+            .map(|(at, text)| (hash(at), text))
+            .collect();
+        let stored: Vec<(&str, &[u8])> = contents
+            .iter()
+            .map(|(hash, text)| (hash.as_str(), text.as_bytes()))
+            .collect();
+        let files: Vec<BinaryFile> = (1..contents.len())
+            .map(|at| file("deploy.env", &hash(at), &[&hash(0)]))
+            .collect();
+        let scanned = scan_from(&mut Counted::with(&stored), &files, MOST_BINARY_BYTES).unwrap();
+        scanned
+            .findings
+            .into_iter()
+            .map(|finding| (finding.line, finding.change, finding.kind))
+            .collect()
+    }
+
+    /// A private key's block, after a first line, with its `data` lines.
+    fn key_block(data: &[&str]) -> String {
+        format!(
+            "x\n-----BEGIN OPENSSH PRIVATE KEY-----\n{}\n-----END OPENSSH PRIVATE KEY-----\n",
+            data.join("\n")
+        )
+    }
+
+    /// A private key whose data has a line longer than a window, its first or a later one, is
+    /// found where its data starts, and told by all of its data: the same key in a parent holds
+    /// it, and one byte changed at the end of the long line makes it added.
+    #[test]
+    fn finds_a_private_key_with_a_long_line_of_data() {
+        let long = "A".repeat(2 * WINDOW);
+        let changed = format!("{}B", &long[1..]);
+        let start = "b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9u";
+        for (old, new) in [
+            (key_block(&[&long]), key_block(&[&changed])),
+            (key_block(&[start, &long]), key_block(&[start, &changed])),
+        ] {
+            let found = found_against(&old, &[&old, &new]);
+
+            let key = "private key".to_owned();
+            assert_eq!(
+                found,
+                [
+                    (Some(3), Change::Unchanged, key.clone()),
+                    (Some(3), Change::Added, key)
+                ]
+            );
+        }
     }
 
     /// A long line is told from another by all of it: the same line in a parent holds its keys,

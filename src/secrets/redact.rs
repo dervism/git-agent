@@ -234,41 +234,136 @@ pub fn diff_findings(diff: &str) -> Vec<Finding> {
 
 /// Finds the secrets in a diff, and gives `keep` the diff in order with them replaced.
 fn scan_diff(diff: &str, mut keep: impl FnMut(&str)) -> Vec<Finding> {
-    let mut scanner = Scanner::default();
-    let mut findings = Vec::new();
-    let mut path = String::new();
-    let mut hunk: Option<Hunk> = None;
+    let mut scan = DiffScan::default();
     for line in diff.split_inclusive('\n') {
-        if ["diff --git ", "diff --cc ", "diff --combined "]
-            .iter()
-            .any(|start| line.starts_with(start))
-        {
-            path = names::of_diff(line);
-            hunk = None;
-            scanner = Scanner::default();
-        } else if line.starts_with("@@") {
-            hunk = Some(Hunk::starting(line));
-            scanner = Scanner::default();
-        } else if let Some(hunk) = &mut hunk
-            && let Some(markers) = hunk.markers(line)
-        {
-            let (change, number) = hunk.take(markers.as_bytes());
-            let mut kinds = Vec::new();
-            if let Some(content) = scanner.scan(&line[markers.len()..], &mut kinds) {
+        match scan.line(line) {
+            Kept::As(line) => keep(line),
+            Kept::Scanned { markers, content } => {
                 keep(markers);
                 keep(&content);
             }
-            findings.extend(kinds.into_iter().map(|kind| Finding {
-                place: path.clone(),
-                line: Some(number),
-                change,
-                kind,
-            }));
-            continue;
+            Kept::Out => {}
         }
-        keep(line);
     }
-    findings
+    scan.findings()
+}
+
+/// Whether `line` starts a file's part of a diff, a merge's combined diff included.
+pub fn is_file_header(line: &str) -> bool {
+    ["diff --git ", "diff --cc ", "diff --combined "]
+        .iter()
+        .any(|start| line.starts_with(start))
+}
+
+/// A line of a diff as scanning it leaves it.
+pub enum Kept<'l> {
+    /// A line outside the hunks, as it was.
+    As(&'l str),
+    /// A hunk's line: its markers, and its content with its secrets replaced.
+    Scanned { markers: &'l str, content: String },
+    /// A line of a private key's data that the key's one [`REDACTED`] line already stands for.
+    Out,
+}
+
+/// What a line of a diff too long to scan whole is, as [`DiffScan::long_line`] tells from its
+/// start.
+#[derive(Debug, PartialEq)]
+pub enum LongLineIs {
+    /// A line outside the hunks, which needs no more reading than its start.
+    Other,
+    /// More of a private key's data, which the key's finding already covers.
+    KeyData,
+    /// A hunk's line to scan in windows, from after its markers, and to give back to
+    /// [`DiffScan::long_text`].
+    Text(LongText),
+}
+
+/// A hunk's line too long to scan whole: how many bytes its markers take, and where it is.
+#[derive(Debug, PartialEq)]
+pub struct LongText {
+    pub markers: usize,
+    change: Change,
+    number: usize,
+}
+
+/// Scans a diff's lines one after another, keeping track of the file, the hunk and a private
+/// key's block they are in, and of what they hold.
+#[derive(Default)]
+pub struct DiffScan {
+    scanner: Scanner,
+    path: String,
+    hunk: Option<Hunk>,
+    findings: Vec<Finding>,
+}
+
+impl DiffScan {
+    /// Scans `line`, the next line of the diff, with its line end.
+    pub fn line<'l>(&mut self, line: &'l str) -> Kept<'l> {
+        if is_file_header(line) {
+            self.path = names::of_diff(line);
+            self.hunk = None;
+            self.scanner = Scanner::default();
+        } else if line.starts_with("@@") {
+            self.hunk = Some(Hunk::starting(line));
+            self.scanner = Scanner::default();
+        } else if let Some((markers, change, number)) = self.take(line) {
+            let mut kinds = Vec::new();
+            let content = self.scanner.scan(&line[markers.len()..], &mut kinds);
+            self.found(change, number, kinds);
+            return content.map_or(Kept::Out, |content| Kept::Scanned { markers, content });
+        }
+        Kept::As(line)
+    }
+
+    /// Takes the next line, too long to scan whole, which starts with `start`, and says what
+    /// is left to do with it.
+    pub fn long_line(&mut self, start: &str) -> LongLineIs {
+        let Some((markers, change, number)) = self.take(start) else {
+            self.line(start);
+            return LongLineIs::Other;
+        };
+        match self.scanner.long_line(&start[markers.len()..]) {
+            Some(kinds) => {
+                self.found(change, number, kinds);
+                LongLineIs::KeyData
+            }
+            None => LongLineIs::Text(LongText {
+                markers: markers.len(),
+                change,
+                number,
+            }),
+        }
+    }
+
+    /// Takes what the windows of `text` hold: the secrets that look like `kinds`, and the line's
+    /// end, `tail`, after which a private key's block may begin.
+    pub fn long_text(&mut self, text: LongText, kinds: Vec<String>, tail: &str) {
+        self.found(text.change, text.number, kinds);
+        self.scanner.after_long_line(tail);
+    }
+
+    /// The findings so far.
+    pub fn findings(self) -> Vec<Finding> {
+        self.findings
+    }
+
+    /// The markers of `line`, if it's a line of the current hunk, with what the line does and
+    /// its number. Moves the hunk past it.
+    fn take<'l>(&mut self, line: &'l str) -> Option<(&'l str, Change, usize)> {
+        let hunk = self.hunk.as_mut()?;
+        let markers = hunk.markers(line)?;
+        let (change, number) = hunk.take(markers.as_bytes());
+        Some((markers, change, number))
+    }
+
+    fn found(&mut self, change: Change, number: usize, kinds: Vec<String>) {
+        self.findings.extend(kinds.into_iter().map(|kind| Finding {
+            place: self.path.clone(),
+            line: Some(number),
+            change,
+            kind,
+        }));
+    }
 }
 
 /// Where a hunk has got to: the number of the next line in each parent and in the result. A
@@ -420,14 +515,25 @@ impl LineScan {
         }
     }
 
+    /// What the next line, too long to scan whole, which starts with `start`, holds of a private
+    /// key, when it's the key's data: the key, where its data starts, or more of it. `None` for
+    /// any other line, which is to be scanned in windows and then given to
+    /// [`LineScan::after_long_line`].
+    pub fn long_line(&mut self, start: &str) -> Option<Held> {
+        self.0.long_line(start).map(|kinds| {
+            if kinds.is_empty() {
+                Held::MoreOfAKey
+            } else {
+                Held::Secrets(kinds)
+            }
+        })
+    }
+
     /// Takes up again after a line too long to scan whole, which ends with `tail`: a private
-    /// key's block can't go on through such a line, and one starts after it if `tail` ends with
-    /// a key's BEGIN line.
+    /// key's block ends at such a line, and one starts after it if `tail` ends with a key's
+    /// BEGIN line.
     pub fn after_long_line(&mut self, tail: &str) {
-        self.0 = Scanner {
-            in_key: starts_key_block(&without_hidden(tail).text),
-            key_replaced: false,
-        };
+        self.0.after_long_line(tail);
     }
 }
 
@@ -491,6 +597,32 @@ impl Scanner {
         } else {
             line.to_owned()
         })
+    }
+
+    /// What the next line, too long to scan whole, which starts with `start`, holds of a private
+    /// key: inside a key's block, a line that starts as key data is more of the key's data, and
+    /// the key itself where the data starts, as [`Scanner::scan_visible`] takes a line of it.
+    /// `None` for any other line.
+    fn long_line(&mut self, start: &str) -> Option<Vec<String>> {
+        if !(self.in_key && is_key_data(&without_hidden(start).text)) {
+            return None;
+        }
+        let starts = !self.key_replaced;
+        self.key_replaced = true;
+        Some(if starts {
+            vec!["private key".to_owned()]
+        } else {
+            Vec::new()
+        })
+    }
+
+    /// Takes up again after a line too long to scan whole, which ends with `tail`, as
+    /// [`LineScan::after_long_line`] says.
+    fn after_long_line(&mut self, tail: &str) {
+        *self = Scanner {
+            in_key: starts_key_block(&without_hidden(tail).text),
+            key_replaced: false,
+        };
     }
 
     fn scan_visible(&mut self, line: &str, kinds: &mut Vec<String>) -> Option<String> {

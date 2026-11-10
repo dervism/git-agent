@@ -239,6 +239,8 @@ pub fn push(repo: &Repo, ask: bool, on_secrets: OnSecrets) -> Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    use crate::git::test_support::hook;
     use crate::git::test_support::{add_remote, commit_elsewhere, isolated_repo, run};
     use std::fs;
     use std::path::Path;
@@ -341,17 +343,6 @@ mod tests {
     /// Whether `refusal` is the check's before the commit, which no commit came before.
     fn refused_before_commit(refusal: &anyhow::Error) -> bool {
         refusal.to_string().starts_with(BEFORE_COMMIT.refused)
-    }
-
-    /// Installs `script` as the hook `name`, from a folder of hooks of the test's own.
-    #[cfg(unix)]
-    fn hook(dir: &Path, name: &str, script: &str) {
-        use std::os::unix::fs::PermissionsExt;
-        let hook = dir.join("hooks").join(name);
-        fs::create_dir_all(hook.parent().unwrap()).unwrap();
-        fs::write(&hook, format!("#!/bin/sh\n{script}")).unwrap();
-        fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).unwrap();
-        run(dir, &["config", "core.hooksPath", "hooks"]);
     }
 
     /// A hook script that writes a key to `deploy.env` and stages it.

@@ -1317,8 +1317,11 @@ impl Repo {
         Ok(self.workdir.join(path.trim_end_matches(['\n', '\r'])))
     }
 
-    /// Commits with `message`. If git fails (e.g. a hook rejects the commit),
-    /// the message is left on disk so it isn't lost.
+    /// Commits with `message`. If git fails (e.g. a hook rejects the commit), the message is
+    /// left on disk so it isn't lost. git writes its summary of the commit to git-agent's
+    /// stderr, where the user reads status: on stdout, with the reader of git-agent's output
+    /// gone, that write would kill git after the commit exists, and a commit that was made
+    /// would be reported as failed.
     pub fn commit(
         &self,
         message: &str,
@@ -1332,6 +1335,7 @@ impl Repo {
 
         let status = self
             .commit_command(&path, scope, extra_args, leave_out)
+            .stdout(ui::child_stdout_on_stderr()?)
             .status()
             .context("failed to run git commit")?;
         if !status.success() {
@@ -1344,9 +1348,8 @@ impl Repo {
         Ok(())
     }
 
-    /// The `git commit` that commits the message in `message_file`. It is `--quiet`: git
-    /// writes its summary after the commit exists, and with the reader of the output gone,
-    /// that write would kill it, and a commit that was made would be reported as failed.
+    /// The `git commit` that commits the message in `message_file`, with the scope and
+    /// arguments of [`Repo::commit`].
     fn commit_command(
         &self,
         message_file: &Path,
@@ -1354,7 +1357,7 @@ impl Repo {
         extra_args: &[String],
         leave_out: &[String],
     ) -> Command {
-        let mut command = self.command(&["commit", "--quiet", "--file"]);
+        let mut command = self.command(&["commit", "--file"]);
         command.arg(message_file);
         if scope == Scope::Tracked {
             // What `--all` commits, apart from the work-tree changes in `leave_out`:
@@ -1932,6 +1935,27 @@ pub mod test_support {
         (1..=count).map(|n| format!("line {n}\n")).collect()
     }
 
+    /// Installs `script` as the hook `name`, from a folder of hooks of the test's own.
+    #[cfg(unix)]
+    pub fn hook(dir: &Path, name: &str, script: &str) {
+        use std::os::unix::fs::PermissionsExt;
+        let hook = dir.join("hooks").join(name);
+        fs::create_dir_all(hook.parent().unwrap()).unwrap();
+        fs::write(&hook, format!("#!/bin/sh\n{script}")).unwrap();
+        fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).unwrap();
+        run(dir, &["config", "core.hooksPath", "hooks"]);
+    }
+
+    /// The command that runs the test `name` of this test binary alone, in a process of its
+    /// own, with `variable` set: such a test is ignored, and does nothing without it.
+    pub fn test_alone(name: &str, variable: &str) -> Command {
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
+            .args(["--ignored", "--exact", "--nocapture", name])
+            .env(variable, "1");
+        command
+    }
+
     /// Keeps the user's global settings (signing, hooks) out of the tests.
     pub fn isolate(dir: &Path) {
         run(dir, &["config", "user.name", "Test"]);
@@ -2022,7 +2046,7 @@ pub mod test_support {
 
 #[cfg(test)]
 mod tests {
-    use super::test_support::{add_remote, commit_elsewhere, isolate};
+    use super::test_support::{add_remote, commit_elsewhere, hook, isolate, test_alone};
     use super::*;
     use tempfile::TempDir;
 
@@ -2824,55 +2848,56 @@ mod tests {
         assert!(mark.exists());
     }
 
-    fn commit_arguments(
-        repo: &Repo,
-        scope: Scope,
-        extra: &[&str],
-        leave_out: &[&str],
-    ) -> Vec<String> {
-        let extra: Vec<String> = extra.iter().map(|arg| (*arg).to_owned()).collect();
-        let leave_out: Vec<String> = leave_out.iter().map(|path| (*path).to_owned()).collect();
-        repo.commit_command(Path::new("MSG"), scope, &extra, &leave_out)
-            .get_args()
-            .map(|arg| arg.to_string_lossy().into_owned())
-            .collect()
-    }
+    const COMMIT_HELPER: &str = "GIT_AGENT_TEST_COMMIT_HELPER";
 
+    /// Not a test by itself: `shows_git_s_and_the_hooks_output_on_stderr` runs it in a process
+    /// of its own and reads what it writes. A hook stops one commit, then git makes the next.
+    #[cfg(unix)]
     #[test]
-    fn commits_quietly_whatever_the_scope_and_arguments() {
-        let (_dir, repo) = setup();
-        for (scope, extra, leave_out) in [
-            (Scope::Staged, vec![], vec![]),
-            (Scope::Tracked, vec![], vec![]),
-            (Scope::Tracked, vec!["--no-verify"], vec![]),
-            (Scope::Tracked, vec!["--no-verify"], vec!["library"]),
-        ] {
-            let args = commit_arguments(&repo, scope, &extra, &leave_out);
-            assert!(
-                args.windows(2).any(|pair| pair == ["commit", "--quiet"]),
-                "{args:?}"
-            );
+    #[ignore = "runs only as a helper of another test"]
+    fn commit_helper() {
+        if std::env::var_os(COMMIT_HELPER).is_none() {
+            return;
         }
+        let (dir, repo) = setup();
+        let lint = "echo 'lint: to stdout'\necho 'lint: to stderr' >&2\nexit 1\n";
+        hook(dir.path(), "pre-commit", lint);
+        fs::write(dir.path().join("lib.rs"), "fn b() {}\n").unwrap();
+        assert!(repo.commit("feat: b", Scope::Tracked, &[], &[]).is_err());
+        hook(dir.path(), "pre-commit", "exit 0\n");
+        repo.commit("feat: b", Scope::Tracked, &[], &[]).unwrap();
     }
 
+    /// What git and the hooks print when committing reaches the user on git-agent's stderr,
+    /// git's summary of the commit included, and none of it goes to stdout, where a reader
+    /// that's gone would kill git after the commit exists.
+    #[cfg(unix)]
     #[test]
-    fn a_commit_that_succeeds_writes_no_summary() {
-        let (dir, repo) = setup();
-        fs::write(dir.path().join("lib.rs"), "fn b() {}\n").unwrap();
-        let message = dir.path().join("message");
-        fs::write(&message, "feat: b\n").unwrap();
-
-        let output = repo
-            .commit_command(&message, Scope::Tracked, &[], &[])
+    fn shows_git_s_and_the_hooks_output_on_stderr() {
+        let child = test_alone("git::tests::commit_helper", COMMIT_HELPER)
+            .env("LC_ALL", "C")
             .output()
             .unwrap();
 
-        assert!(output.status.success());
-        assert_eq!(String::from_utf8_lossy(&output.stdout), "");
-        assert_eq!(
-            run(dir.path(), &["log", "-1", "--format=%s"]).trim(),
-            "feat: b"
+        let stdout = String::from_utf8_lossy(&child.stdout);
+        let stderr = String::from_utf8_lossy(&child.stderr);
+        assert!(child.status.success(), "{stdout}{stderr}");
+        assert!(stdout.contains("1 passed"), "{stdout}");
+        assert!(
+            !stdout.contains("lint:") && !stdout.contains("feat: b"),
+            "{stdout}"
         );
+        assert!(
+            stderr.contains("lint: to stdout\nlint: to stderr\n"),
+            "{stderr}"
+        );
+        let summary = stderr
+            .lines()
+            .skip_while(|line| !(line.starts_with("[main ") && line.ends_with("] feat: b")))
+            .take(2)
+            .collect::<Vec<_>>();
+        assert_eq!(summary.len(), 2, "{stderr}");
+        assert_eq!(summary[1], " 1 file changed, 1 insertion(+), 1 deletion(-)");
     }
 
     #[test]

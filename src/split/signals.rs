@@ -102,7 +102,7 @@ pub fn end_on_stop_signals() {
 
 #[cfg(test)]
 mod tests {
-    use crate::git::test_support::isolated_repo;
+    use crate::git::test_support::{isolated_repo, test_alone};
     use crate::git::worktree::TempWorktree;
     use crate::split::check::check_trees;
     use crate::split::command::BuildCheck;
@@ -145,14 +145,7 @@ mod tests {
     #[test]
     fn signals_end_the_program_after_a_check_while_it_waits() {
         for (signal, code) in [("INT", 130), ("TERM", 143)] {
-            let mut child = Command::new(std::env::current_exe().unwrap())
-                .args([
-                    "--ignored",
-                    "--exact",
-                    "--nocapture",
-                    "split::signals::tests::helper",
-                ])
-                .env(HELPER_VARIABLE, "1")
+            let mut child = test_alone("split::signals::tests::helper", HELPER_VARIABLE)
                 .stdin(Stdio::null())
                 .stdout(Stdio::piped())
                 .spawn()

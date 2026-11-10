@@ -176,8 +176,9 @@ What that means for the commands that change the repository:
 - `git agent tidy --apply` shows the plan and each new message before it rewrites the commits,
   so if the reader has gone away by then, it changes nothing.
 
-A push or a pull request that was under way when the reader went away still finishes, and
-git-agent says so.
+What git prints when it commits or pushes, such as its summary of a commit, goes to stderr
+with git-agent's messages, so the reader going away can't stop git halfway. A push or a pull
+request that was under way when the reader went away still finishes, and git-agent says so.
 
 ## Starting a branch
 

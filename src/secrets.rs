@@ -390,6 +390,8 @@ pub fn list_findings(findings: &[&Finding]) -> String {
 /// What the tests of the secret checks share.
 #[cfg(test)]
 pub mod test_support {
+    use super::redact::Change;
+
     /// An AWS access key's shape, built at run time so that the source holds no key.
     pub fn aws_key() -> String {
         format!("AKIA{}", "Q".repeat(16))
@@ -404,11 +406,320 @@ pub mod test_support {
             .collect();
         format!("ghp_{noise}")
     }
+
+    /// A private key's BEGIN line, of `kind` such as `OPENSSH`, built at run time.
+    pub fn key_begin(kind: &str) -> String {
+        format!("-----BEGIN {kind} {}-----", "PRIVATE KEY")
+    }
+
+    /// A private key's END line, of `kind`.
+    pub fn key_end(kind: &str) -> String {
+        format!("-----END {kind} {}-----", "PRIVATE KEY")
+    }
+
+    /// A line of a private key's data, 63 characters of `tag` over and over, so that keys made
+    /// with different tags differ.
+    pub fn key_data(tag: &str) -> String {
+        tag.repeat(63 / tag.len())
+    }
+
+    /// A diff of a private key's file, by the way it changes the key: its name, the diff, and
+    /// the findings a scan of it gives, as line numbers and changes. A key's data is reported
+    /// once for each change it makes in its block, and the new key's data, wherever git puts the
+    /// old key's lines, as added. Data the result keeps without a BEGIN line isn't a key there,
+    /// and gives no finding, though the model still doesn't see it: the model sees `redacted`
+    /// lines in its place, one for each change a block makes.
+    pub struct KeyEdit {
+        pub name: &'static str,
+        pub diff: String,
+        pub found: &'static [(usize, Change)],
+        pub redacted: usize,
+    }
+
+    /// A way of changing a key, as [`Shape::build`] makes a [`KeyEdit`] of it: its name, how
+    /// many parents its hunk has, more than one for a merge's combined diff, how many
+    /// [`REDACTED`](super::redact::REDACTED) lines the model sees, and its lines, in which
+    /// `{BEGIN}`, `{END}`, `{RSA BEGIN}` and `{RSA END}` stand for a key's marker lines, and a
+    /// tag in braces, such as `{Ab1}`, for a line of data.
+    struct Shape {
+        name: &'static str,
+        parents: usize,
+        redacted: usize,
+        lines: &'static [&'static str],
+        found: &'static [(usize, Change)],
+    }
+
+    const REMOVED: Change = Change::Removed;
+    const ADDED: Change = Change::Added;
+    const KEPT: Change = Change::Unchanged;
+    const MISSING: &str = "\\ No newline at end of file";
+
+    const SHAPES: [Shape; 19] = [
+        Shape {
+            name: "replaced in place",
+            parents: 1,
+            redacted: 2,
+            lines: &[" {BEGIN}", "-{Ab1}", "-{Ab2}", "+{Cd1}", "+{Cd2}", " {END}"],
+            found: &[(2, REMOVED), (2, ADDED)],
+        },
+        Shape {
+            name: "the old file without a final newline",
+            parents: 1,
+            redacted: 2,
+            lines: &[
+                " {BEGIN}", "-{Ab1}", "-{Ab2}", "-{END}", MISSING, "+{Cd1}", "+{Cd2}", "+{END}",
+            ],
+            found: &[(2, REMOVED), (2, ADDED)],
+        },
+        Shape {
+            name: "the new file without a final newline",
+            parents: 1,
+            redacted: 2,
+            lines: &[
+                " {BEGIN}", "-{Ab1}", "-{END}", "+{Cd1}", "+{Cd2}", "+{END}", MISSING,
+            ],
+            found: &[(2, REMOVED), (2, ADDED)],
+        },
+        Shape {
+            name: "a placeholder filled in",
+            parents: 1,
+            redacted: 1,
+            lines: &[
+                " {BEGIN}",
+                "-<your private key here>",
+                "+{Cd1}",
+                "+{Cd2}",
+                " {END}",
+            ],
+            found: &[(2, ADDED)],
+        },
+        Shape {
+            name: "a removed comment before the new data",
+            parents: 1,
+            redacted: 2,
+            lines: &[" {BEGIN}", " {Ab1}", "-# rotate me", "+{Cd1}", " {END}"],
+            found: &[(2, KEPT), (3, ADDED)],
+        },
+        Shape {
+            name: "lines that end in CRLF",
+            parents: 1,
+            redacted: 2,
+            lines: &[
+                " {BEGIN}\r",
+                "-{Ab1}\r",
+                "-{Ab2}\r",
+                "+{Cd1}\r",
+                "+{Cd2}\r",
+                " {END}\r",
+            ],
+            found: &[(2, REMOVED), (2, ADDED)],
+        },
+        Shape {
+            name: "an encrypted key, its headers kept",
+            parents: 1,
+            redacted: 2,
+            lines: &[
+                " {RSA BEGIN}",
+                " Proc-Type: 4,ENCRYPTED",
+                " DEK-Info: AES-128-CBC,0123456789ABCDEF",
+                " ",
+                "-{Ab1}",
+                "+{Cd1}",
+                " {RSA END}",
+            ],
+            found: &[(5, REMOVED), (5, ADDED)],
+        },
+        Shape {
+            name: "runs of changes between kept lines",
+            parents: 1,
+            redacted: 3,
+            lines: &[
+                " {BEGIN}", "-{Ab1}", "+{Cd1}", " {Ef1}", "-{Ab2}", "+{Cd2}", " {Ef2}", "-{Ab3}",
+                "+{Cd3}", " {END}",
+            ],
+            found: &[(2, REMOVED), (2, ADDED), (3, KEPT)],
+        },
+        Shape {
+            name: "two keys in one hunk",
+            parents: 1,
+            redacted: 4,
+            lines: &[
+                " {BEGIN}", "-{Ab1}", "+{Cd1}", " {END}", " {BEGIN}", "-{Ab2}", "+{Cd2}", " {END}",
+            ],
+            found: &[(2, REMOVED), (2, ADDED), (5, REMOVED), (5, ADDED)],
+        },
+        Shape {
+            name: "a line of the data removed",
+            parents: 1,
+            redacted: 2,
+            lines: &[" {BEGIN}", "-{Ab1}", " {Ab2}", " {END}"],
+            found: &[(2, REMOVED), (2, KEPT)],
+        },
+        Shape {
+            name: "the BEGIN line removed and the data kept",
+            parents: 1,
+            redacted: 1,
+            lines: &["-{BEGIN}", " {Ab1}", " {Ab2}", " {END}"],
+            found: &[],
+        },
+        Shape {
+            name: "a merge that resolves two keys with a third",
+            parents: 2,
+            redacted: 3,
+            lines: &["  {BEGIN}", "- {Ab1}", " -{Ab2}", "++{Cd1}", "  {END}"],
+            found: &[(2, REMOVED), (2, REMOVED), (2, ADDED)],
+        },
+        Shape {
+            name: "a merge that keeps one side's key",
+            parents: 2,
+            redacted: 2,
+            lines: &["  {BEGIN}", "- {Ab1}", "+ {Cd1}", "  {END}"],
+            found: &[(2, REMOVED), (2, KEPT)],
+        },
+        Shape {
+            name: "an octopus merge that resolves three keys with a fourth",
+            parents: 3,
+            redacted: 4,
+            lines: &[
+                "   {BEGIN}",
+                "-  {Ab1}",
+                " - {Ab2}",
+                "  -{Ab3}",
+                "+++{Cd1}",
+                "   {END}",
+            ],
+            found: &[(2, REMOVED), (2, REMOVED), (2, REMOVED), (2, ADDED)],
+        },
+        Shape {
+            name: "an octopus merge that keeps a third parent's key and adds to it",
+            parents: 3,
+            redacted: 3,
+            lines: &["   {BEGIN}", "-- {Ab1}", "++ {Ef1}", "+++{Cd1}", "   {END}"],
+            found: &[(2, REMOVED), (2, KEPT), (3, ADDED)],
+        },
+        Shape {
+            name: "the old BEGIN line and data replaced by data alone",
+            parents: 1,
+            redacted: 2,
+            lines: &["-{BEGIN}", "-{Ab1}", "+{Cd1}", " {END}"],
+            found: &[(2, REMOVED)],
+        },
+        Shape {
+            name: "a BEGIN line added over kept data",
+            parents: 1,
+            redacted: 1,
+            lines: &["+{BEGIN}", " {Ab1}", " {END}"],
+            found: &[(2, KEPT)],
+        },
+        Shape {
+            name: "a kept line that ends with a BEGIN line while the old block is open",
+            parents: 1,
+            redacted: 1,
+            lines: &["-{BEGIN}", " {NOTE} {BEGIN}", "+{Cd1}", " {END}"],
+            found: &[(2, ADDED)],
+        },
+        Shape {
+            name: "a key replaced after a kept line that ends with a BEGIN line",
+            parents: 1,
+            redacted: 2,
+            lines: &[" {NOTE} {BEGIN}", "-{Ab1}", "+{Cd1}", " {END}"],
+            found: &[(2, REMOVED), (2, ADDED)],
+        },
+    ];
+
+    /// The tags of the lines of key data the shapes use.
+    pub const KEY_TAGS: [&str; 8] = ["Ab1", "Ab2", "Ab3", "Cd1", "Cd2", "Cd3", "Ef1", "Ef2"];
+
+    /// Text that isn't a key's data, which `{NOTE}` stands for in a shape's lines.
+    pub const NOTE: &str = "the next key follows";
+
+    /// Every way of changing a key that the tests take it through.
+    pub fn key_edits() -> Vec<KeyEdit> {
+        SHAPES.iter().map(Shape::build).collect()
+    }
+
+    impl Shape {
+        /// The shape as a diff of `k.pem`, whose hunk header counts the lines each side holds.
+        fn build(&self) -> KeyEdit {
+            let lines: Vec<String> = self.lines.iter().map(|line| filled(line)).collect();
+            let header = match self.parents {
+                1 => "diff --git a/k.pem b/k.pem",
+                _ => "diff --cc k.pem",
+            };
+            let body: String = lines.iter().map(|line| format!("{line}\n")).collect();
+            KeyEdit {
+                name: self.name,
+                diff: format!(
+                    "{header}\n--- a/k.pem\n+++ b/k.pem\n{}\n{body}",
+                    self.hunk(&lines)
+                ),
+                found: self.found,
+                redacted: self.redacted,
+            }
+        }
+
+        /// The hunk header for `lines`: each parent's lines and the result's, counted by their
+        /// markers, as git counts them.
+        fn hunk(&self, lines: &[String]) -> String {
+            let marked: Vec<&[u8]> = lines
+                .iter()
+                .filter(|line| !line.starts_with('\\'))
+                .map(|line| &line.as_bytes()[..self.parents])
+                .collect();
+            let held_by = |parent: usize| {
+                let held = marked
+                    .iter()
+                    .filter(|markers| parent_holds(markers, parent));
+                held.count()
+            };
+            let signs = "@".repeat(self.parents + 1);
+            let parents: String = (0..self.parents)
+                .map(|parent| format!("-1,{} ", held_by(parent)))
+                .collect();
+            let result = marked
+                .iter()
+                .filter(|markers| result_holds(markers))
+                .count();
+            format!("{signs} {parents}+1,{result} {signs}")
+        }
+    }
+
+    /// Whether the result holds a line with these markers: no parent removes it.
+    fn result_holds(markers: &[u8]) -> bool {
+        !markers.contains(&b'-')
+    }
+
+    /// Whether `parent` holds a line with these markers: it removes the line, or keeps it.
+    fn parent_holds(markers: &[u8], parent: usize) -> bool {
+        markers[parent] == b'-' || (markers[parent] == b' ' && result_holds(markers))
+    }
+
+    /// `template` with its markers and data filled in.
+    fn filled(template: &str) -> String {
+        let markers = [
+            ("{BEGIN}", key_begin("OPENSSH")),
+            ("{END}", key_end("OPENSSH")),
+            ("{RSA BEGIN}", key_begin("RSA")),
+            ("{RSA END}", key_end("RSA")),
+            ("{NOTE}", NOTE.to_owned()),
+        ];
+        let data = KEY_TAGS.map(|tag| (format!("{{{tag}}}"), key_data(tag)));
+        let line = markers
+            .iter()
+            .fold(template.to_owned(), |line, (name, text)| {
+                line.replace(name, text)
+            });
+        let line = data
+            .iter()
+            .fold(line, |line, (name, text)| line.replace(name, text));
+        assert!(!line.contains('{'), "a token left in {template:?}");
+        line
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::test_support::aws_key;
+    use super::test_support::{aws_key, key_begin, key_data, key_end};
     use super::*;
     use crate::config::DEFAULT_EXCLUDE;
     use crate::git::test_support::{isolated_repo, move_pointer, run, with_submodule};
@@ -848,6 +1159,130 @@ mod tests {
                  `git rebase -i`. {ADVICE}"
             )
         );
+    }
+
+    /// A private key that replaces another in place is refused, though git shows the old key's
+    /// lines first.
+    #[test]
+    fn refuses_a_push_of_a_key_that_replaces_another() {
+        let (dir, repo) = isolated_repo();
+        let dir = dir.path();
+        commit_file(dir, &key_file("Ab1", true), "add the deploy key");
+        run(dir, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
+        let hash = commit_file(dir, &key_file("Cd2", true), "rotate the deploy key");
+
+        let error = check_push(&repo, OnSecrets::Reject).unwrap_err();
+
+        let shown = format!("commit {hash} deploy.env:2  private key");
+        assert!(error.to_string().contains(&shown), "{error}");
+    }
+
+    /// A private key file's text, with `tag`'s data, ending with a newline or not.
+    fn key_file(tag: &str, newline: bool) -> String {
+        let (begin, end) = (key_begin("OPENSSH"), key_end("OPENSSH"));
+        let data = key_data(tag);
+        let ending = if newline { "\n" } else { "" };
+        format!("{begin}\n{data}\n{data}\n{end}{ending}")
+    }
+
+    /// A new key replacing a key in place is refused before the commit, though the old file
+    /// ends with a newline and the new one doesn't, which changes the END line too.
+    #[test]
+    fn refuses_to_commit_a_key_that_replaces_another_and_its_end_line() {
+        let (dir, repo) = isolated_repo();
+        let dir = dir.path();
+        commit_at(dir, "k.pem", &key_file("Ab1", true), "add the key");
+        stage(dir, "k.pem", &key_file("Cd1", false));
+
+        let checked = check_changes(&repo, Scope::Staged, OnSecrets::Reject, &[], &WORDING);
+
+        let Err(error) = checked else {
+            panic!("the new key went through");
+        };
+        let error = error.to_string();
+        assert!(error.contains("k.pem:2  private key"), "{error}");
+    }
+
+    /// A pull request's commits that replace a key are refused, wherever git puts the old key's
+    /// lines.
+    #[test]
+    fn refuses_a_pull_request_of_a_key_that_replaces_another() {
+        let (dir, repo) = isolated_repo();
+        let dir = dir.path();
+        commit_at(dir, "k.pem", &key_file("Ab1", false), "add the key");
+        run(dir, &["checkout", "-q", "-b", "feature"]);
+        let hash = commit_at(dir, "k.pem", &key_file("Cd1", true), "rotate");
+
+        let check = check_commits(&repo, &["main..HEAD"], OnSecrets::Reject, &[], &WORDING);
+
+        let error = check.unwrap_err().to_string();
+        assert!(
+            error.contains(&format!("commit {hash} k.pem:2  private key")),
+            "{error}"
+        );
+    }
+
+    /// A merge that resolves a conflict between two keys with a third is refused, though both
+    /// sides are published.
+    #[test]
+    fn refuses_a_push_of_a_merge_that_resolves_two_keys_with_a_third() {
+        let (dir, repo) = isolated_repo();
+        let dir = dir.path();
+        commit_at(dir, "k.pem", &key_file("Ab1", true), "add the key");
+        run(dir, &["checkout", "-q", "-b", "side"]);
+        commit_at(dir, "k.pem", &key_file("Cd1", true), "one key");
+        run(dir, &["checkout", "-q", "main"]);
+        commit_at(dir, "k.pem", &key_file("Ef1", true), "another key");
+        run(dir, &["update-ref", "refs/remotes/origin/main", "main"]);
+        run(dir, &["update-ref", "refs/remotes/origin/side", "side"]);
+        let merged = std::process::Command::new("git")
+            .current_dir(dir)
+            .args(["merge", "-q", "--no-ff", "side"])
+            .output()
+            .unwrap();
+        assert!(!merged.status.success(), "the keys conflict");
+        let merge = commit_at(dir, "k.pem", &key_file("Gh1", true), "merge the side");
+
+        let error = check_push(&repo, OnSecrets::Reject).unwrap_err();
+
+        let shown = format!("commit {merge} k.pem:2  private key");
+        assert!(error.to_string().contains(&shown), "{error}");
+    }
+
+    /// An octopus merge that resolves three keys with a fourth is refused, though its three
+    /// parents are published.
+    #[test]
+    fn refuses_a_push_of_an_octopus_merge_that_resolves_three_keys_with_a_fourth() {
+        let (dir, repo) = isolated_repo();
+        let dir = dir.path();
+        commit_at(dir, "k.pem", &key_file("Ab1", true), "add the key");
+        let parents: Vec<String> = ["Cd1", "Ef1", "Gh1"]
+            .iter()
+            .map(|tag| {
+                run(dir, &["checkout", "-q", "-B", tag, "main"]);
+                commit_at(dir, "k.pem", &key_file(tag, true), "a key");
+                let tip = run(dir, &["rev-parse", "HEAD"]).trim().to_owned();
+                run(
+                    dir,
+                    &["update-ref", &format!("refs/remotes/origin/{tag}"), &tip],
+                );
+                tip
+            })
+            .collect();
+        run(dir, &["checkout", "-q", "main"]);
+        stage(dir, "k.pem", &key_file("Ij1", true));
+        let tree = run(dir, &["write-tree"]).trim().to_owned();
+        let mut args = vec!["commit-tree", tree.as_str(), "-m", "merge the keys"];
+        parents
+            .iter()
+            .for_each(|parent| args.extend(["-p", parent.as_str()]));
+        let merge = run(dir, &args).trim().to_owned();
+        run(dir, &["reset", "-q", "--hard", &merge]);
+
+        let error = check_push(&repo, OnSecrets::Reject).unwrap_err();
+
+        let shown = format!("commit {} k.pem:2  private key", &merge[..7]);
+        assert!(error.to_string().contains(&shown), "{error}");
     }
 
     /// A push said to go nowhere still has every commit checked, as one to a place that has

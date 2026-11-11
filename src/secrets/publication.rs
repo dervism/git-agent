@@ -75,7 +75,7 @@ impl DiffRead {
         let Some(mut text) = self.scan.start_long_line(&head) else {
             return Ok(());
         };
-        start.drain(..text.markers);
+        start.drain(..text.markers());
         let windows = lines.scan_rest(start, |piece| text.feed(piece))?;
         self.scan.end_long_line(text, windows);
         Ok(())
@@ -255,7 +255,7 @@ mod tests {
     use super::super::lines::WINDOW;
     use super::super::lines::test_support::line_with_keys;
     use super::super::redact;
-    use super::super::test_support::{aws_key, github_token};
+    use super::super::test_support::{KEY_TAGS, NOTE, aws_key, github_token, key_data, key_edits};
     use super::*;
     use crate::git::test_support::{isolated_repo, run};
     use std::fs;
@@ -309,6 +309,61 @@ mod tests {
         for diff in diffs {
             let read = diff_of(&diff);
             assert_eq!((read.findings, read.binary), whole(&diff), "{diff:?}");
+        }
+    }
+
+    /// A key that replaces another in place, with data lines short and longer than a window, is
+    /// found as added, as a scan of all of it finds it.
+    #[test]
+    fn reads_a_key_that_replaces_another_as_a_scan_of_all_of_it() {
+        let begin = "-----BEGIN OPENSSH PRIVATE KEY-----";
+        let end = "-----END OPENSSH PRIVATE KEY-----";
+        let long = KEY_DATA.repeat(2 * WINDOW / KEY_DATA.len() + 1);
+        for (old, new) in [
+            (KEY_DATA, &long[..]),
+            (&long[..], KEY_DATA),
+            (KEY_DATA, KEY_DATA),
+        ] {
+            let diff = format!(
+                "diff --git a/k.pem b/k.pem\n--- a/k.pem\n+++ b/k.pem\n@@ -1,3 +1,3 @@\n \
+                 {begin}\n-{old}\n+{new}\n {end}\n"
+            );
+
+            let read = diff_of(&diff);
+
+            assert_eq!(read.findings, whole(&diff).0, "{}", diff.len());
+            let added = read
+                .findings
+                .iter()
+                .filter(|finding| finding.change == Change::Added);
+            assert_eq!(added.count(), 1, "{}", diff.len());
+        }
+    }
+
+    /// Every way of changing a private key, with lines of key data short and longer than a
+    /// window, is read as a scan of all of it reads it, the new key's data as added.
+    #[test]
+    fn reads_every_way_of_changing_a_key_as_a_scan_of_all_of_it() {
+        let longer = |text: &str| text.repeat(WINDOW / text.len() + 1);
+        let long = |diff: &str| {
+            KEY_TAGS
+                .iter()
+                .fold(diff.replace(NOTE, &longer(NOTE)), |diff, tag| {
+                    diff.replace(&key_data(tag), &longer(tag))
+                })
+        };
+        for change in key_edits() {
+            for diff in [change.diff.clone(), long(&change.diff)] {
+                let read = diff_of(&diff);
+
+                let found: Vec<(usize, Change)> = read
+                    .findings
+                    .iter()
+                    .map(|finding| (finding.line.unwrap_or_default(), finding.change))
+                    .collect();
+                assert_eq!(found, change.found, "{} ({})", change.name, diff.len());
+                assert_eq!(read.findings, whole(&diff).0, "{}", change.name);
+            }
         }
     }
 

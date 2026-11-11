@@ -7,13 +7,20 @@
 //! `your-api-key` and references such as `${TOKEN}` are left alone, and so are
 //! secrets in formats none of the rules know.
 
-use crate::git::diff::is_file_header;
-use crate::git::names;
-use crate::safe_text::{Unhidden, without_hidden};
+use crate::safe_text::without_hidden;
+use key_block::{
+    KeyBlock, KeyBlockFacts, LongLineFacts, Taken, is_key_data, is_key_header, starts_key_block,
+};
 use regex_lite::Regex;
 use std::cell::OnceCell;
 use std::ops::Range;
 use std::sync::LazyLock;
+
+mod diff_scan;
+mod key_block;
+
+pub use diff_scan::{DiffScan, diff, diff_findings};
+pub use key_block::LongLineScan;
 
 pub const REDACTED: &str = "[REDACTED]";
 
@@ -28,6 +35,37 @@ pub struct Finding {
     pub change: Change,
     /// What it looks like, e.g. "GitHub token".
     pub kind: String,
+}
+
+impl Finding {
+    /// The finding as one in the commit `hash`, which its place then names.
+    pub fn in_commit(self, hash: &str) -> Self {
+        Self {
+            place: commit_place(hash, &self.place),
+            ..self
+        }
+    }
+}
+
+/// How a finding names `place` in the commit `hash`: its message, or a file of its patch.
+pub fn commit_place(hash: &str, place: &str) -> String {
+    format!("commit {hash} {place}")
+}
+
+/// How a finding names the message of the commit `hash`.
+pub fn commit_message_place(hash: &str) -> String {
+    commit_place(hash, "message")
+}
+
+/// The secrets in a commit's message and patch. Findings name the commit.
+pub fn commit(hash: &str, message: &str, patch: &str) -> Vec<Finding> {
+    let mut findings = text(message, &commit_message_place(hash)).findings;
+    findings.extend(
+        diff_findings(patch)
+            .into_iter()
+            .map(|finding| finding.in_commit(hash)),
+    );
+    findings
 }
 
 /// What a change does to the line a secret is on.
@@ -225,313 +263,6 @@ static COMPILED: LazyLock<Vec<(&Rule, Regex)>> = LazyLock::new(|| {
         .collect()
 });
 
-static KEY_BEGIN: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"-----BEGIN[A-Z ]*PRIVATE KEY(?: BLOCK)?-----").expect("valid key pattern")
-});
-
-/// Replaces the secrets in a diff. Findings name the file and the line.
-pub fn diff(diff: &str) -> Redacted {
-    let mut text = String::with_capacity(diff.len());
-    let findings = scan_diff(diff, |part| text.push_str(part));
-    Redacted { text, findings }
-}
-
-/// The secrets in a diff, as [`diff`] finds them, without a copy of the diff to send.
-pub fn diff_findings(diff: &str) -> Vec<Finding> {
-    scan_diff(diff, |_| {})
-}
-
-/// Finds the secrets in a diff, and gives `keep` the diff in order with them replaced.
-fn scan_diff(diff: &str, mut keep: impl FnMut(&str)) -> Vec<Finding> {
-    let mut scan = DiffScan::default();
-    for line in diff.split_inclusive('\n') {
-        match scan.line(line) {
-            Kept::Outside(line) => keep(line),
-            Kept::Scanned { markers, content } => {
-                keep(markers);
-                keep(&content);
-            }
-            Kept::Dropped => {}
-        }
-    }
-    scan.findings()
-}
-
-/// A line of a diff as scanning it leaves it.
-pub enum Kept<'l> {
-    /// A line outside the hunks, as it was.
-    Outside(&'l str),
-    /// A hunk's line: its markers, and its content with its secrets replaced.
-    Scanned { markers: &'l str, content: String },
-    /// A line of a private key's data that the key's one [`REDACTED`] line already stands for.
-    Dropped,
-}
-
-/// A hunk's line too long to scan whole, from its start until its windows have been scanned:
-/// its markers, where it is, and what it is to a private key's block.
-pub struct LongText {
-    columns: String,
-    change: Change,
-    number: usize,
-    line: LongLineScan,
-}
-
-impl LongText {
-    /// How many bytes the line's markers take.
-    pub fn markers(&self) -> usize {
-        self.columns.len()
-    }
-
-    /// Takes the next piece of the line, after its markers.
-    pub fn feed(&mut self, piece: &[u8]) {
-        self.line.feed(piece);
-    }
-}
-
-/// Scans a diff's lines one after another, keeping track of the file, the hunk and a private
-/// key's block they are in, and of what they hold.
-#[derive(Default)]
-pub struct DiffScan {
-    sides: Sides,
-    path: String,
-    hunk: Option<Hunk>,
-    findings: Vec<Finding>,
-}
-
-impl DiffScan {
-    /// Scans `line`, the next line of the diff, with its line end.
-    pub fn line<'l>(&mut self, line: &'l str) -> Kept<'l> {
-        if is_file_header(line) {
-            self.path = names::of_diff(line);
-            self.hunk = None;
-            self.sides = Sides::default();
-        } else if line.starts_with("@@") {
-            let hunk = Hunk::starting(line);
-            self.sides = Sides::of(hunk.parents.len());
-            self.hunk = Some(hunk);
-        } else if let Some((markers, change, number)) = self.take(line) {
-            let mut kinds = Vec::new();
-            let content = self.sides.scan(
-                markers.as_bytes(),
-                &line[markers.len()..],
-                change,
-                &mut kinds,
-            );
-            self.found(change, number, kinds);
-            return content.map_or(Kept::Dropped, |content| Kept::Scanned { markers, content });
-        }
-        Kept::Outside(line)
-    }
-
-    /// Takes the next line, too long to scan whole, which starts with `start`. A hunk's line
-    /// comes back to be scanned in windows from after its markers, fed to its [`LongText`], and
-    /// given to [`DiffScan::end_long_line`]; any other line needs nothing more than its start.
-    pub fn start_long_line(&mut self, start: &str) -> Option<LongText> {
-        let Some((markers, change, number)) = self.take(start) else {
-            self.line(start);
-            return None;
-        };
-        Some(LongText {
-            columns: markers.to_owned(),
-            change,
-            number,
-            line: self.sides.start_long_line(markers.as_bytes(), change),
-        })
-    }
-
-    /// Takes what the windows of `text` found.
-    pub fn end_long_line(&mut self, text: LongText, windows: Windows) {
-        let columns = text.columns.as_bytes();
-        let kinds = self
-            .sides
-            .end_long_line(columns, text.change, text.line, windows);
-        if let Some(kinds) = kinds {
-            self.found(text.change, text.number, kinds);
-        }
-    }
-
-    /// The findings so far.
-    pub fn findings(self) -> Vec<Finding> {
-        self.findings
-    }
-
-    /// The markers of `line`, if it's a line of the current hunk, with what the line does and
-    /// its number. Moves the hunk past it.
-    fn take<'l>(&mut self, line: &'l str) -> Option<(&'l str, Change, usize)> {
-        let hunk = self.hunk.as_mut()?;
-        let markers = hunk.markers(line)?;
-        let (change, number) = hunk.take(markers.as_bytes());
-        Some((markers, change, number))
-    }
-
-    fn found(&mut self, change: Change, number: usize, kinds: Vec<String>) {
-        self.findings.extend(kinds.into_iter().map(|kind| Finding {
-            place: self.path.clone(),
-            line: Some(number),
-            change,
-            kind,
-        }));
-    }
-}
-
-/// A hunk's sides, each scanned as a file of its own: the result, which holds its kept and added
-/// lines, and each parent, which holds its kept and removed lines. A line one side lacks, such
-/// as an old END line or a placeholder removed, then can't end a private key's block that the
-/// other side has open.
-#[derive(Default)]
-struct Sides {
-    result: Scanner,
-    parents: Vec<Scanner>,
-}
-
-impl Sides {
-    /// The sides of a hunk with `parents` parents, before its first line.
-    fn of(parents: usize) -> Self {
-        Self {
-            result: Scanner::default(),
-            parents: (0..parents).map(|_| Scanner::default()).collect(),
-        }
-    }
-
-    /// The sides that hold a line with these `markers`, which makes `change`, each with what
-    /// the line does there, the side it's reported on first: the result for a line it holds,
-    /// else the first parent that removes it. A parent holds a line it removes, and one it keeps.
-    fn holding<'s>(
-        &'s mut self,
-        markers: &'s [u8],
-        change: Change,
-    ) -> impl Iterator<Item = (&'s mut Scanner, Change)> {
-        let in_result = !markers.contains(&b'-');
-        let in_parents = if in_result {
-            Change::Unchanged
-        } else {
-            Change::Removed
-        };
-        let parents = self
-            .parents
-            .iter_mut()
-            .zip(markers)
-            .filter(move |(_, marker)| **marker == b'-' || (**marker == b' ' && in_result))
-            .map(move |(parent, _)| (parent, in_parents));
-        in_result
-            .then_some((&mut self.result, change))
-            .into_iter()
-            .chain(parents)
-    }
-
-    /// `content`, a line with these `markers` that makes `change`, as [`Scanner::scan`] gives
-    /// it, scanned once and taken by each side that holds it, adding to `kinds` what the side
-    /// it's reported on finds. It's left out, or becomes its key's [`REDACTED`] line, where any
-    /// side that holds it takes it for a private key's data; and a line shaped like key data
-    /// shows only as that line while any side is in a key's block, whether it holds the line or
-    /// not, since the old key's BEGIN line can be all that's left of it.
-    fn scan(
-        &mut self,
-        markers: &[u8],
-        content: &str,
-        change: Change,
-        kinds: &mut Vec<String>,
-    ) -> Option<String> {
-        let line = ScannedLine::of(content);
-        let data_in_an_open_block = self.any_in_key() && line.is_data();
-        let mut reported = None;
-        let mut least = Taken::Text;
-        for (side, change) in self.holding(markers, change) {
-            let taken = side.take(&line, change);
-            reported.get_or_insert(taken);
-            least = least.min(taken);
-        }
-        if data_in_an_open_block {
-            least = least.min(Taken::Key);
-        }
-        kinds.extend(line.kinds(reported.unwrap_or(Taken::Text)));
-        line.text(least)
-    }
-
-    /// Whether any side is in a private key's block.
-    fn any_in_key(&self) -> bool {
-        self.result.in_key || self.parents.iter().any(|parent| parent.in_key)
-    }
-
-    /// Starts on a line with these `markers`, which makes `change`, too long to scan whole.
-    fn start_long_line(&mut self, markers: &[u8], change: Change) -> LongLineScan {
-        let in_key = self.holding(markers, change).any(|(side, _)| side.in_key);
-        LongLineScan::starting(in_key)
-    }
-
-    /// What the long line with these `markers`, which makes `change`, holds on the side it's
-    /// reported on, now that its `windows` have been scanned. Every side that holds it takes it,
-    /// so that each side's block goes on from it.
-    fn end_long_line(
-        &mut self,
-        markers: &[u8],
-        change: Change,
-        line: LongLineScan,
-        windows: Windows,
-    ) -> Option<Vec<String>> {
-        let facts = LongLineFacts::of(line, &windows);
-        let mut reported = None;
-        for (side, change) in self.holding(markers, change) {
-            let taken = side.take(&facts, change);
-            reported.get_or_insert(taken);
-        }
-        windows.kinds_for(reported?)
-    }
-}
-
-/// How a side takes a line, the one that shows the least first.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-enum Taken {
-    /// As more of a key's data than its one [`REDACTED`] line: it's left out.
-    MoreOfAKey,
-    /// As a key's data where it first makes its change: it's the key's [`REDACTED`] line.
-    Key,
-    /// As text, its secrets replaced.
-    Text,
-}
-
-/// What a line is to a private key's block, which is all a side needs to take it.
-trait KeyBlockFacts {
-    /// Whether the line is a line of a private key's data.
-    fn is_data(&self) -> bool;
-    /// Whether the line is a header of a private key's, such as `Proc-Type: 4,ENCRYPTED`.
-    fn is_header(&self) -> bool;
-    /// Whether the line, with its secrets replaced, ends with a private key's BEGIN line.
-    fn begins_key(&self) -> bool;
-}
-
-/// What a line too long to scan whole is to a private key's block, once all of it has been read:
-/// inside a block, whether it's the key's data or a header (`in_key`), as only all of it can
-/// tell, and whether its last window ends with a key's BEGIN line.
-struct LongLineFacts {
-    in_key: Option<InKey>,
-    begins_key: bool,
-}
-
-impl LongLineFacts {
-    /// The facts of `line`, all of it read, whose `windows` have been scanned.
-    fn of(line: LongLineScan, windows: &Windows) -> Self {
-        Self {
-            in_key: line.verdict(),
-            begins_key: windows.ends_with_begin,
-        }
-    }
-}
-
-impl KeyBlockFacts for LongLineFacts {
-    fn is_data(&self) -> bool {
-        self.in_key.as_ref().is_some_and(|line| line.data)
-    }
-
-    fn is_header(&self) -> bool {
-        self.in_key.as_ref().is_some_and(|line| line.header)
-    }
-
-    fn begins_key(&self) -> bool {
-        self.begins_key
-    }
-}
-
 /// A line cleaned of hidden characters and read once for every side that takes it: whether it's
 /// a private key's data or a header of a key's, its secrets replaced, and whether it then ends
 /// with a key's BEGIN line, each worked out the first time a side needs it, so that a line costs
@@ -614,91 +345,6 @@ impl KeyBlockFacts for ScannedLine<'_> {
     }
 }
 
-/// Where a hunk has got to: the number of the next line in each parent and in the result. A
-/// plain diff has one parent, and a merge's combined diff one per parent, each with a column of
-/// markers: `-` for a line that parent has and the result doesn't, `+` for a line the result has
-/// and that parent doesn't, and a space for one both have, or neither in a removed line.
-struct Hunk {
-    parents: Vec<usize>,
-    result: usize,
-}
-
-impl Hunk {
-    /// The hunk a header such as `@@ -10,4 +10,5 @@`, or `@@@ -1,3 -1,3 +1,4 @@@` for a merge
-    /// of two, starts.
-    fn starting(header: &str) -> Self {
-        let signs = header.bytes().take_while(|byte| *byte == b'@').count();
-        let parents = signs.saturating_sub(1).max(1);
-        let mut words = header.split_whitespace().skip(1);
-        let start = |word: &str| -> usize {
-            word[1..]
-                .split(',')
-                .next()
-                .and_then(|number| number.parse().ok())
-                .unwrap_or(1)
-        };
-        let mut starts: Vec<usize> = words
-            .by_ref()
-            .take_while(|word| word.starts_with('-'))
-            .map(start)
-            .collect();
-        starts.resize(parents, 1);
-        let result = header
-            .split_whitespace()
-            .find(|word| word.starts_with('+'))
-            .map_or(1, start);
-        Self {
-            parents: starts,
-            result,
-        }
-    }
-
-    /// The marker columns that start `line`, if it's a line of this hunk.
-    fn markers<'a>(&self, line: &'a str) -> Option<&'a str> {
-        let markers = line.get(..self.parents.len())?;
-        markers
-            .bytes()
-            .all(|marker| matches!(marker, b'+' | b'-' | b' '))
-            .then_some(markers)
-    }
-
-    /// What the line with these `markers` does, and its number: in the result, or for a removed
-    /// line in the first parent that has it. Moves past the line.
-    fn take(&mut self, markers: &[u8]) -> (Change, usize) {
-        let in_result = !markers.contains(&b'-');
-        let (change, number) = if !in_result {
-            let parent = markers.iter().position(|marker| *marker == b'-');
-            (
-                Change::Removed,
-                parent.map_or(self.result, |parent| self.parents[parent]),
-            )
-        } else if markers.iter().all(|marker| *marker == b'+') {
-            (Change::Added, self.result)
-        } else {
-            (Change::Unchanged, self.result)
-        };
-        if in_result {
-            self.result = self.result.saturating_add(1);
-        }
-        for (marker, line) in markers.iter().zip(&mut self.parents) {
-            if *marker == b'-' || (*marker == b' ' && in_result) {
-                *line = line.saturating_add(1);
-            }
-        }
-        (change, number)
-    }
-}
-
-/// The secrets in a commit's message and patch. Findings name the commit.
-pub fn commit(hash: &str, message: &str, patch: &str) -> Vec<Finding> {
-    let mut findings = text(message, &format!("commit {hash} message")).findings;
-    findings.extend(diff_findings(patch).into_iter().map(|finding| Finding {
-        place: format!("commit {hash} {}", finding.place),
-        ..finding
-    }));
-    findings
-}
-
 /// A line that holds what look like secrets.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SecretLine {
@@ -750,7 +396,7 @@ pub enum Held {
 /// Scans lines one after another, as [`secret_lines`] does, carrying a private key's block
 /// across them.
 #[derive(Default)]
-pub struct LineScan(Scanner);
+pub struct LineScan(KeyBlock);
 
 impl LineScan {
     /// What `line`, the next line, holds.
@@ -770,7 +416,7 @@ impl LineScan {
 
     /// What the long line `line` holds, now that its `windows` have been scanned.
     pub fn end_long_line(&mut self, line: LongLineScan, windows: Windows) -> Held {
-        let facts = LongLineFacts::of(line, &windows);
+        let facts = LongLineFacts::of(line, windows.ends_with_begin);
         let taken = self.0.take(&facts, PLAIN);
         windows.kinds_for(taken).map_or(Held::MoreOfAKey, Held::of)
     }
@@ -785,16 +431,6 @@ impl Held {
             Self::Secrets(kinds)
         }
     }
-}
-
-/// A line too long to scan whole, read a piece at a time: whether the line before left a private
-/// key's block open, and, which only all of the line can tell, whether it's the key's data or a
-/// header of the key's.
-pub struct LongLineScan {
-    in_key: bool,
-    text: Unhidden,
-    data: KeyData,
-    header: KeyHeader,
 }
 
 /// What the windows of a line too long to scan whole found: what its secrets look like, and
@@ -821,185 +457,32 @@ impl Windows {
 /// What `text`, a window of a long line, holds when it's scanned as a line on its own.
 pub fn scan_window(text: &str) -> Windows {
     let line = ScannedLine::of(text);
-    let mut scanner = Scanner::default();
-    let taken = scanner.take(&line, PLAIN);
+    let mut block = KeyBlock::default();
+    let taken = block.take(&line, PLAIN);
     Windows {
         kinds: line.kinds(taken),
-        ends_with_begin: scanner.in_key,
-    }
-}
-
-/// What a long line in a private key's block is, once all of it has been read.
-struct InKey {
-    data: bool,
-    header: bool,
-}
-
-impl LongLineScan {
-    /// Starts on a line, `in_key` if the line before left a private key's block open.
-    fn starting(in_key: bool) -> Self {
-        Self {
-            in_key,
-            text: Unhidden::default(),
-            data: KeyData::default(),
-            header: KeyHeader::default(),
-        }
-    }
-
-    /// Takes the next piece of the line, cleaned of hidden characters as the whole line would
-    /// be, however the pieces cut it.
-    pub fn feed(&mut self, piece: &[u8]) {
-        if self.in_key {
-            let text = self.text.piece(piece);
-            self.data.feed(&text);
-            self.header.feed(&text);
-        }
-    }
-
-    /// What the line is to the key's block it's in, or `None` outside a block.
-    fn verdict(mut self) -> Option<InKey> {
-        if !self.in_key {
-            return None;
-        }
-        let rest = self.text.finish();
-        self.data.feed(&rest);
-        self.header.feed(&rest);
-        Some(InKey {
-            data: self.data.is_key_data(),
-            header: self.header.is_key_header(),
-        })
-    }
-}
-
-/// Whether text fed a piece at a time is a header line of a private key's, as [`is_key_header`]
-/// tells a whole line: nothing but what [`strip_code`] takes off, or a name of letters, digits
-/// and `-`, then `: ` and more that the stripping leaves.
-struct KeyHeader {
-    /// Whether all of the text so far is what the stripping takes off a line's end.
-    stripped: bool,
-    after_backslash: bool,
-    form: HeaderForm,
-}
-
-/// How far text has come in the form of a header: `Name: value`.
-#[derive(Clone, Copy)]
-enum HeaderForm {
-    /// Before the name, among what code puts in front of it.
-    Before,
-    /// Before the name, after a backslash, which only `n` can follow there.
-    BeforeBackslash,
-    Name,
-    Colon,
-    /// After `: `, and whether all of what came after it is what the stripping takes off.
-    Value {
-        stripped: bool,
-    },
-    Not,
-}
-
-impl Default for KeyHeader {
-    fn default() -> Self {
-        Self {
-            stripped: true,
-            after_backslash: false,
-            form: HeaderForm::Before,
-        }
-    }
-}
-
-impl KeyHeader {
-    fn feed(&mut self, text: &str) {
-        text.chars().for_each(|character| self.next(character));
-    }
-
-    fn next(&mut self, character: char) {
-        let code = character.is_whitespace() || "\"'`,;+".contains(character);
-        let stripped = code || character == '\\' || (character == 'n' && self.after_backslash);
-        let name = character.is_ascii_alphanumeric() || character == '-';
-        self.stripped &= stripped;
-        self.form = match (self.form, character) {
-            (HeaderForm::Before, '\\') => HeaderForm::BeforeBackslash,
-            (HeaderForm::BeforeBackslash, 'n') => HeaderForm::Before,
-            (HeaderForm::Before, _) if code => HeaderForm::Before,
-            (HeaderForm::Before | HeaderForm::Name, _) if name => HeaderForm::Name,
-            (HeaderForm::Name, ':') => HeaderForm::Colon,
-            (HeaderForm::Colon, ' ') => HeaderForm::Value { stripped: true },
-            (HeaderForm::Value { stripped: before }, _) => HeaderForm::Value {
-                stripped: before && stripped,
-            },
-            _ => HeaderForm::Not,
-        };
-        self.after_backslash = character == '\\';
-    }
-
-    fn is_key_header(&self) -> bool {
-        self.stripped || matches!(self.form, HeaderForm::Value { stripped: false })
-    }
-}
-
-/// Whether text fed a piece at a time is a private key's data, as [`is_key_data`] tells a whole
-/// line: base64, with what [`strip_code`] takes off its ends around it, and nothing else.
-#[derive(Default, Clone, Copy, Debug, PartialEq)]
-enum KeyData {
-    /// Before the data, among what code puts in front of it.
-    #[default]
-    Before,
-    /// Before the data, after a backslash, which only `n` can follow there.
-    BeforeBackslash,
-    Data,
-    /// After the data, among what code puts after it.
-    After,
-    /// After the data, after a backslash.
-    AfterBackslash,
-    /// Not a key's data.
-    Not,
-}
-
-impl KeyData {
-    fn feed(&mut self, text: &str) {
-        *self = text.chars().fold(*self, KeyData::next);
-    }
-
-    fn next(self, character: char) -> Self {
-        let code = character.is_whitespace() || "\"'`,;+".contains(character);
-        let data = character.is_ascii_alphanumeric() || "+/=".contains(character);
-        match (self, character) {
-            (KeyData::Before, '\\') => KeyData::BeforeBackslash,
-            (KeyData::BeforeBackslash, 'n') => KeyData::Before,
-            (KeyData::Before, _) if code => KeyData::Before,
-            (KeyData::Before | KeyData::Data, _) if data => KeyData::Data,
-            (KeyData::Data | KeyData::After | KeyData::AfterBackslash, '\\') => {
-                KeyData::AfterBackslash
-            }
-            (KeyData::AfterBackslash, 'n') => KeyData::After,
-            (KeyData::Data | KeyData::After | KeyData::AfterBackslash, _) if code => KeyData::After,
-            _ => KeyData::Not,
-        }
-    }
-
-    fn is_key_data(self) -> bool {
-        matches!(
-            self,
-            KeyData::Data | KeyData::After | KeyData::AfterBackslash
-        )
+        ends_with_begin: block.in_key(),
     }
 }
 
 /// What the secrets in `text`, scanned as a line on its own, look like.
 pub fn kinds_in(text: &str) -> Vec<String> {
     let line = ScannedLine::of(text);
-    let taken = Scanner::default().take(&line, PLAIN);
+    let taken = KeyBlock::default().take(&line, PLAIN);
     line.kinds(taken)
 }
 
 /// Replaces the secrets in plain text, such as a commit message. Findings name
 /// the text as `place`.
 pub fn text(text: &str, place: &str) -> Redacted {
-    let mut scanner = Scanner::default();
+    let mut block = KeyBlock::default();
     let mut out = String::with_capacity(text.len());
     let mut kinds = Vec::new();
     for line in text.split_inclusive('\n') {
-        if let Some(content) = scanner.scan(line, PLAIN, &mut kinds) {
+        let line = ScannedLine::of(line);
+        let taken = block.take(&line, PLAIN);
+        kinds.extend(line.kinds(taken));
+        if let Some(content) = line.text(taken) {
             out.push_str(&content);
         }
     }
@@ -1015,127 +498,6 @@ pub fn text(text: &str, place: &str) -> Redacted {
     Redacted {
         text: out,
         findings,
-    }
-}
-
-/// Follows a private key's block across the lines of one text, or one side of a diff: whether
-/// they're inside a block, and which changes its data has reported.
-#[derive(Default)]
-struct Scanner {
-    /// After a line that ends with a BEGIN marker, until the key's data ends.
-    in_key: bool,
-    /// What the lines of the key's data that have been reported do: the key's data becomes one
-    /// [`REDACTED`] line for each change, so that a key that replaces another, whose old lines
-    /// git shows first, is reported as added too.
-    key_changes: Vec<Change>,
-}
-
-impl Scanner {
-    /// `line`, which makes `change`, with its secrets replaced, adding what they look like to
-    /// `kinds`, or `None` if it's part of a key already replaced: a private key's lines that make
-    /// the same change become one [`REDACTED`] line, as [`ScannedLine::text`] gives them.
-    fn scan(&mut self, line: &str, change: Change, kinds: &mut Vec<String>) -> Option<String> {
-        let line = ScannedLine::of(line);
-        let taken = self.take(&line, change);
-        kinds.extend(line.kinds(taken));
-        line.text(taken)
-    }
-
-    /// Starts on the next line, too long to scan whole.
-    fn start_long_line(&self) -> LongLineScan {
-        LongLineScan::starting(self.in_key)
-    }
-
-    /// Takes `line`, which makes `change`, whole or a long line read in pieces: inside a key's
-    /// block, a line of the key's data is the key where its data first makes the change, and
-    /// more of it after that. Any other line is text; it ends the block unless it's a header of
-    /// the key's, and starts one if, with its secrets replaced, it ends with a key's BEGIN line.
-    fn take(&mut self, line: &impl KeyBlockFacts, change: Change) -> Taken {
-        if self.in_key && line.is_data() {
-            return self.key_data(change);
-        }
-        if self.in_key {
-            // Encrypted keys have headers such as "Proc-Type: 4,ENCRYPTED" before
-            // their data. Anything else, such as the END line, ends the block.
-            self.in_key = line.is_header();
-        }
-        if line.begins_key() {
-            self.begin_block();
-        }
-        Taken::Text
-    }
-
-    /// How a line of the key's data that makes `change` is taken: as the key, the first in the
-    /// block to make the change, else as more of it.
-    fn key_data(&mut self, change: Change) -> Taken {
-        if self.newly_reported(change) {
-            Taken::Key
-        } else {
-            Taken::MoreOfAKey
-        }
-    }
-
-    /// Starts a key's block, after its BEGIN line.
-    fn begin_block(&mut self) {
-        self.in_key = true;
-        self.key_changes.clear();
-    }
-
-    /// Whether a line of the key's data that makes `change` is the first of the block to make
-    /// it, and so reports the key, as a set's `insert` tells; the change is remembered.
-    fn newly_reported(&mut self, change: Change) -> bool {
-        let first = !self.key_changes.contains(&change);
-        if first {
-            self.key_changes.push(change);
-        }
-        first
-    }
-}
-
-/// Whether `line` ends with a private key's BEGIN marker, so the key's data
-/// follows. Code that only mentions the marker, such as
-/// `starts_with("-----BEGIN PRIVATE KEY-----")`, has more after it.
-fn starts_key_block(line: &str) -> bool {
-    KEY_BEGIN
-        .find_iter(line)
-        .last()
-        .is_some_and(|marker| strip_code(&line[marker.end()..]).is_empty())
-}
-
-/// Whether `line` is a line of a key's base64 data, perhaps inside a string literal.
-fn is_key_data(line: &str) -> bool {
-    let data = strip_code(line);
-    !data.is_empty()
-        && data
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || b"+/=".contains(&byte))
-}
-
-fn is_key_header(line: &str) -> bool {
-    let line = strip_code(line);
-    line.is_empty()
-        || line.split_once(": ").is_some_and(|(name, _)| {
-            !name.is_empty()
-                && name
-                    .bytes()
-                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
-        })
-}
-
-/// `text` without what code puts around a key written into a string literal:
-/// quotes, escaped line breaks, commas and concatenation.
-fn strip_code(text: &str) -> &str {
-    let mut text = text.trim();
-    loop {
-        let stripped = text
-            .trim_matches(|c: char| c.is_whitespace() || "\"'`,;+".contains(c))
-            .trim_end_matches('\\')
-            .trim_end_matches("\\n")
-            .trim_start_matches("\\n");
-        if stripped == text {
-            return text;
-        }
-        text = stripped;
     }
 }
 
@@ -1345,10 +707,7 @@ fn is_version(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::git::test_support::{isolated_repo, run};
-    use crate::secrets::test_support::{KEY_TAGS, key_data, key_edits};
-    use crate::test_support::Picks;
-    use std::fs;
+    use crate::secrets::test_support::noise;
 
     #[test]
     fn finds_a_secret_split_by_an_invisible_character() {
@@ -1369,16 +728,6 @@ mod tests {
         assert!(redacted.findings.is_empty());
         assert_eq!(redacted.text, patch);
         assert_eq!(text(&line[1..], "message").text, &line[1..]);
-    }
-
-    /// A random-looking string of `len` letters and digits, so no real-looking
-    /// secret is written out in this file.
-    fn noise(len: usize) -> String {
-        "q7Rk2LmZ9vXa4TbN8cWp3HdY6sJf5GeU"
-            .chars()
-            .cycle()
-            .take(len)
-            .collect()
     }
 
     /// OpenSSH's names for two of its security key algorithms, and usage text with a password
@@ -1717,151 +1066,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn names_a_file_with_norwegian_letters_in_a_finding() {
-        let secret = format!("ghp_{}", noise(36));
-        for header in [
-            "diff --git a/Kjøre.txt b/Kjøre.txt\n",
-            "diff --git \"a/Kj\\303\\270re.txt\" \"b/Kj\\303\\270re.txt\"\n",
-        ] {
-            let found = diff(&format!("{header}@@ -1 +1 @@\n+token = {secret}\n"));
-            assert_eq!(found.findings[0].place, "Kjøre.txt");
-        }
-    }
-
-    #[test]
-    fn finds_secrets_by_file_and_line_in_a_diff() {
-        let token = format!("ghp_{}", noise(36));
-        let diff = format!(
-            "diff --git a/src/a.rs b/src/a.rs\nindex 1..2 100644\n--- a/src/a.rs\n+++ b/src/a.rs\n\
-             @@ -10,4 +10,4 @@ fn main\n context\n-let old = \"{token}\";\n+let new = \"{token}\";\n \
-             let kept = \"{token}\";\n context\ndiff --git a/.env b/.env\n@@ -0,0 +1,2 @@\n\
-             +DEBUG=1\n+DB_PASSWORD={}\n",
-            noise(16)
-        );
-        let result = super::diff(&diff);
-        assert!(!result.text.contains(&token));
-        assert!(result.text.contains("+++ b/src/a.rs\n"));
-        let found: Vec<_> = result
-            .findings
-            .iter()
-            .map(|finding| (finding.place.as_str(), finding.line, finding.change))
-            .collect();
-        assert_eq!(
-            found,
-            [
-                ("src/a.rs", Some(11), Change::Removed),
-                ("src/a.rs", Some(11), Change::Added),
-                ("src/a.rs", Some(12), Change::Unchanged),
-                (".env", Some(2), Change::Added)
-            ]
-        );
-        assert_eq!(diff_findings(&diff), result.findings);
-    }
-
-    /// The places, lines and changes of what `diff` finds.
-    fn found_in(diff: &str) -> Vec<(String, Option<usize>, Change)> {
-        super::diff(diff)
-            .findings
-            .into_iter()
-            .map(|finding| (finding.place, finding.line, finding.change))
-            .collect()
-    }
-
-    #[test]
-    fn reads_what_a_merge_adds_in_a_combined_diff() {
-        let diff = format!(
-            "diff --cc settings.env\nindex 1a2b3c4,5d6e7f8..9a0b1c2\n--- a/settings.env\n\
-             +++ b/settings.env\n@@@ -1,4 -1,3 +1,4 @@@\n  shared = 1\n\
-             - ours_password = {ours}\n -their_password = {theirs}\n- old_password = {old}\n\
-             ++db_password = {added}\n + kept_password = {kept}\n  last = 2\n",
-            ours = noise(16),
-            theirs = noise(17),
-            added = noise(18),
-            kept = noise(19),
-            old = noise(20),
-        );
-        let result = super::diff(&diff);
-        assert!(!result.text.contains(&noise(18)), "{}", result.text);
-        assert!(
-            result.text.contains("++db_password = [REDACTED]\n"),
-            "{}",
-            result.text
-        );
-        let place = "settings.env".to_owned();
-        assert_eq!(
-            found_in(&diff),
-            [
-                (place.clone(), Some(2), Change::Removed),
-                (place.clone(), Some(2), Change::Removed),
-                (place.clone(), Some(3), Change::Removed),
-                (place.clone(), Some(2), Change::Added),
-                (place, Some(3), Change::Unchanged),
-            ]
-        );
-        assert_eq!(diff_findings(&diff), result.findings);
-    }
-
-    #[test]
-    fn reads_an_octopus_merge_with_a_column_per_parent() {
-        let diff = format!(
-            "diff --cc a.env\n@@@@ -1 -1 -1 +1,2 @@@@\n  +shared = 1\n+++db_password = {}\n",
-            noise(18)
-        );
-        assert_eq!(
-            found_in(&diff),
-            [("a.env".to_owned(), Some(2), Change::Added)]
-        );
-    }
-
-    #[test]
-    fn finds_a_secret_a_merge_adds_in_gits_own_output() {
-        let (dir, _repo) = isolated_repo();
-        let write = |text: &str| fs::write(dir.path().join("app.env"), text).unwrap();
-        write("mode = base\n");
-        run(dir.path(), &["add", "app.env"]);
-        run(dir.path(), &["commit", "-q", "-m", "base"]);
-        run(dir.path(), &["switch", "-q", "-c", "side"]);
-        write("mode = side\n");
-        run(dir.path(), &["commit", "-q", "-am", "side"]);
-        run(dir.path(), &["switch", "-q", "main"]);
-        write("mode = main\n");
-        run(dir.path(), &["commit", "-q", "-am", "main"]);
-        let _ = std::process::Command::new("git")
-            .current_dir(dir.path())
-            .args(["merge", "-q", "side"])
-            .output();
-        write(&format!("mode = both\ndb_password = {}\n", noise(18)));
-        run(dir.path(), &["commit", "-q", "-am", "merge side"]);
-
-        let patch = run(dir.path(), &["log", "-1", "--patch", "--cc", "--format="]);
-
-        assert_eq!(
-            found_in(&patch),
-            [("app.env".to_owned(), Some(2), Change::Added)]
-        );
-    }
-
-    #[test]
-    fn names_the_commit_in_its_findings() {
-        let patch = format!(
-            "diff --git a/.env b/.env\n@@ -0,0 +1 @@\n+API_TOKEN={}\n",
-            noise(20)
-        );
-        let message = format!("ci: deploy\n\nUses sk-proj-{} for now.", noise(40));
-        let found: Vec<_> = commit("1a2b3c4", &message, &patch)
-            .into_iter()
-            .map(|finding| (finding.place, finding.line, finding.change))
-            .collect();
-        assert_eq!(
-            found,
-            [
-                ("commit 1a2b3c4 message".to_owned(), None, Change::Added),
-                ("commit 1a2b3c4 .env".to_owned(), Some(1), Change::Added)
-            ]
-        );
-    }
-
     /// A key's finding holds all of its data, since keys of one type can begin alike.
     #[test]
     fn keeps_a_private_keys_whole_data_with_its_line() {
@@ -1885,111 +1089,6 @@ mod tests {
     }
 
     #[test]
-    fn replaces_private_key_blocks() {
-        let body: String = (0..5).map(|_| format!("+{}\n", noise(64))).collect();
-        let diff = format!(
-            "diff --git a/id_rsa b/id_rsa\n@@ -0,0 +1,7 @@\n+-----BEGIN OPENSSH PRIVATE KEY-----\n\
-             {body}+-----END OPENSSH PRIVATE KEY-----\n"
-        );
-        let result = super::diff(&diff);
-        assert_eq!(
-            result.text,
-            format!(
-                "diff --git a/id_rsa b/id_rsa\n@@ -0,0 +1,7 @@\n+-----BEGIN OPENSSH PRIVATE KEY-----\n\
-                 +{REDACTED}\n+-----END OPENSSH PRIVATE KEY-----\n"
-            )
-        );
-        assert_eq!(result.findings.len(), 1);
-        assert_eq!(result.findings[0].kind, "private key");
-        assert_eq!(result.findings[0].line, Some(2));
-        assert_eq!(diff_findings(&diff), result.findings);
-
-        // A key on one line, as in a cloud provider's JSON credentials.
-        let line = format!(
-            "\"private_key\": \"-----BEGIN PRIVATE KEY-----\\n{}\\n-----END PRIVATE KEY-----\\n\"",
-            noise(64)
-        );
-        let (line, kinds) = redacted(&line);
-        assert_eq!(
-            line,
-            format!(
-                "\"private_key\": \"-----BEGIN PRIVATE KEY-----{REDACTED}-----END PRIVATE KEY-----\\n\""
-            )
-        );
-        assert_eq!(kinds, ["private key"]);
-    }
-
-    /// A key that replaces another in place is reported as added, though git shows the old
-    /// key's lines first, and the model sees one line for each change the block makes.
-    #[test]
-    fn reports_a_key_that_replaces_another_once_for_each_change() {
-        let data = |marker: char| -> String {
-            (0..3).map(|_| format!("{marker}{}\n", noise(64))).collect()
-        };
-        let (begin, end) = (
-            "-----BEGIN OPENSSH PRIVATE KEY",
-            "-----END OPENSSH PRIVATE KEY",
-        );
-        let header = "diff --git a/deploy_key b/deploy_key\n@@ -1,6 +1,6 @@\n";
-        let diff = format!(
-            "{header} {begin}-----\n {}\n{}{} {end}-----\n",
-            noise(64),
-            data('-'),
-            data('+')
-        );
-
-        let result = super::diff(&diff);
-
-        assert_eq!(
-            result.text,
-            format!("{header} {begin}-----\n {REDACTED}\n-{REDACTED}\n+{REDACTED}\n {end}-----\n")
-        );
-        let found: Vec<(Option<usize>, Change)> = result
-            .findings
-            .iter()
-            .map(|finding| (finding.line, finding.change))
-            .collect();
-        let expected = [
-            (Some(2), Change::Unchanged),
-            (Some(3), Change::Removed),
-            (Some(3), Change::Added),
-        ];
-        assert_eq!(found, expected);
-        assert_eq!(diff_findings(&diff), result.findings);
-    }
-
-    /// Every way of changing a private key gives its findings, the new key's data as added
-    /// wherever git puts the old key's lines, and the model sees no line of either key's data.
-    #[test]
-    fn finds_every_way_of_changing_a_key_and_shows_none_of_its_data() {
-        let data = KEY_TAGS.map(key_data);
-        for change in key_edits() {
-            let result = super::diff(&change.diff);
-
-            let found: Vec<(usize, Change)> = result
-                .findings
-                .iter()
-                .map(|finding| (finding.line.unwrap_or_default(), finding.change))
-                .collect();
-            assert_eq!(found, change.found, "{}", change.name);
-            assert_eq!(
-                diff_findings(&change.diff),
-                result.findings,
-                "{}",
-                change.name
-            );
-            let redacted = result.text.matches(REDACTED).count();
-            assert_eq!(
-                redacted, change.redacted,
-                "{}: {}",
-                change.name, result.text
-            );
-            let shown = data.iter().find(|line| result.text.contains(line.as_str()));
-            assert_eq!(shown, None, "{}: {}", change.name, result.text);
-        }
-    }
-
-    #[test]
     fn names_the_text_in_findings_for_plain_text() {
         let result = text(
             &format!("fix: rotate the key\n\nold key: sk-proj-{}\n", noise(40)),
@@ -2002,19 +1101,6 @@ mod tests {
         assert_eq!(result.findings.len(), 1);
         assert_eq!(result.findings[0].place, "commit 1a2b3c4");
         assert_eq!(result.findings[0].line, None);
-    }
-
-    #[test]
-    fn reads_hunk_headers() {
-        let start = |header: &str| {
-            let hunk = Hunk::starting(header);
-            (hunk.parents, hunk.result)
-        };
-        assert_eq!(start("@@ -10,3 +12,4 @@ fn main\n"), (vec![10], 12));
-        assert_eq!(start("@@ -0,0 +1 @@\n"), (vec![0], 1));
-        assert_eq!(start("@@@ -4,2 -7 +9,3 @@@ fn main\n"), (vec![4, 7], 9));
-        assert_eq!(start("@@@@ -1 -2 -3 +5 @@@@\n"), (vec![1, 2, 3], 5));
-        assert_eq!(start("@@\n"), (vec![1], 1));
     }
 
     /// Text that binaries hold and that isn't a secret: OpenSSH's names for its algorithms, usage
@@ -2091,44 +1177,6 @@ mod tests {
         }
     }
 
-    /// What a long line in a key's block fed a piece at a time, cut at any byte, is to the block
-    /// agrees with what [`is_key_data`] and [`is_key_header`] tell from the whole line without its
-    /// hidden characters: on short lines of every character that matters to them, hidden ones,
-    /// ones of more than a byte, and bytes that start or end no character among them.
-    #[test]
-    fn tells_a_long_line_in_a_key_block_a_piece_at_a_time_as_a_whole_line_does() {
-        let characters = [
-            "A", "n", "-", ":", "+", "/", "=", "\\", " ", "\"", "'", ",", ";", "`", "x", "\t", "é",
-            "\u{a0}", "\u{3000}", "\u{200b}", "\u{200d}", "\u{fe0f}",
-        ];
-        let invalid: [&[u8]; 2] = [&[0xe2], &[0x80]];
-        let parts: Vec<&[u8]> = characters
-            .iter()
-            .map(|part| part.as_bytes())
-            .chain(invalid)
-            .collect();
-        let mut picks = Picks::seeded();
-        for _ in 0..200_000 {
-            let (whole, pieces) = picks.pieces(&parts, 9);
-            let in_key = Scanner {
-                in_key: true,
-                key_changes: Vec::new(),
-            };
-            let mut line = in_key.start_long_line();
-
-            pieces.iter().for_each(|piece| line.feed(piece));
-
-            let text = without_hidden(&String::from_utf8_lossy(&whole)).text;
-            let verdict = line.verdict().expect("in a key's block");
-            let whole_line = (is_key_data(&text), is_key_header(&text));
-            assert_eq!(
-                (verdict.data, verdict.header),
-                whole_line,
-                "{text:?} in {pieces:?}"
-            );
-        }
-    }
-
     /// Takes a long line, of `pieces`, whose windows found `kinds`, the way the line readers do.
     fn long(scan: &mut LineScan, pieces: &[&str], kinds: &[&str]) -> Held {
         let mut line = scan.start_long_line();
@@ -2192,31 +1240,40 @@ mod tests {
         assert_eq!(spaces, (Held::Nothing, Held::Nothing));
     }
 
-    /// A diff's long line outside the hunks needs no more than its start, which still counts as a
-    /// file's header; a hunk's comes back with its markers, and what its windows find lands on its
-    /// number, the lines after it keeping theirs.
+    /// A key on one line, as in a cloud provider's JSON credentials, is replaced whole.
     #[test]
-    fn takes_a_long_line_of_a_diff_by_where_it_is() {
-        let mut scan = DiffScan::default();
+    fn replaces_a_key_written_on_one_line() {
+        let line = format!(
+            "\"private_key\": \"-----BEGIN PRIVATE KEY-----\\n{}\\n-----END PRIVATE KEY-----\\n\"",
+            noise(64)
+        );
+        let (line, kinds) = redacted(&line);
+        assert_eq!(
+            line,
+            format!(
+                "\"private_key\": \"-----BEGIN PRIVATE KEY-----{REDACTED}-----END PRIVATE KEY-----\\n\""
+            )
+        );
+        assert_eq!(kinds, ["private key"]);
+    }
 
-        assert!(scan.start_long_line("diff --git a/x.env b/x.env").is_none());
-        scan.line("@@ -1,2 +1,3 @@\n");
-        scan.line(" same\n");
-        let text = scan.start_long_line("+added").expect("a hunk's line");
-        assert_eq!(text.markers(), 1);
-        let windows = Windows {
-            kinds: vec!["AWS access key".to_owned()],
-            ends_with_begin: false,
-        };
-        scan.end_long_line(text, windows);
-        scan.line(&format!("+{}\n", crate::secrets::test_support::aws_key()));
-
-        let found: Vec<(String, Option<usize>, Change)> = scan
-            .findings()
+    #[test]
+    fn names_the_commit_in_its_findings() {
+        let patch = format!(
+            "diff --git a/.env b/.env\n@@ -0,0 +1 @@\n+API_TOKEN={}\n",
+            noise(20)
+        );
+        let message = format!("ci: deploy\n\nUses sk-proj-{} for now.", noise(40));
+        let found: Vec<_> = commit("1a2b3c4", &message, &patch)
             .into_iter()
             .map(|finding| (finding.place, finding.line, finding.change))
             .collect();
-        let at = |line| ("x.env".to_owned(), Some(line), Change::Added);
-        assert_eq!(found, [at(2), at(3)]);
+        assert_eq!(
+            found,
+            [
+                ("commit 1a2b3c4 message".to_owned(), None, Change::Added),
+                ("commit 1a2b3c4 .env".to_owned(), Some(1), Change::Added)
+            ]
+        );
     }
 }

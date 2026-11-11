@@ -397,14 +397,19 @@ pub mod test_support {
         format!("AKIA{}", "Q".repeat(16))
     }
 
-    /// A GitHub token's shape, built at run time.
-    pub fn github_token() -> String {
-        let noise: String = "q7Rk2LmZ9vXa4TbN8cWp3HdY6sJf5GeU"
+    /// A random-looking string of `len` letters and digits, so no real-looking secret is
+    /// written out in the tests.
+    pub fn noise(len: usize) -> String {
+        "q7Rk2LmZ9vXa4TbN8cWp3HdY6sJf5GeU"
             .chars()
             .cycle()
-            .take(36)
-            .collect();
-        format!("ghp_{noise}")
+            .take(len)
+            .collect()
+    }
+
+    /// A GitHub token's shape, built at run time.
+    pub fn github_token() -> String {
+        format!("ghp_{}", noise(36))
     }
 
     /// A private key's BEGIN line, of `kind` such as `OPENSSH`, built at run time.

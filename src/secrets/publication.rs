@@ -5,7 +5,7 @@
 
 use super::contents::{BinaryFile, BinaryFiles};
 use super::lines::{Line, Lines};
-use super::redact::{Change, DiffScan, Finding, Held, LineScan};
+use super::redact::{self, Change, DiffScan, Finding, Held, LineScan};
 use crate::git::{LogLine, LogMarks, UNREADABLE_LOG};
 use anyhow::{Result, bail};
 use std::io::BufRead;
@@ -161,7 +161,7 @@ impl CommitRead {
 
     fn message_end(&mut self) {
         if let Some(message) = self.message.take() {
-            self.in_message = message.findings(&format!("commit {} message", self.hash));
+            self.in_message = message.findings(&redact::commit_message_place(&self.hash));
         }
     }
 
@@ -183,13 +183,12 @@ impl CommitRead {
             ..
         } = self;
         let patch = patch.finish()?;
-        let place = |place: &str| format!("commit {hash} {place}");
-        let in_patch = patch.findings.into_iter().map(|finding| Finding {
-            place: place(&finding.place),
-            ..finding
-        });
+        let in_patch = patch
+            .findings
+            .into_iter()
+            .map(|finding| finding.in_commit(&hash));
         let binary = patch.binary.into_iter().map(|file| BinaryFile {
-            place: place(&file.place),
+            place: redact::commit_place(&hash, &file.place),
             ..file
         });
         Ok(Found {

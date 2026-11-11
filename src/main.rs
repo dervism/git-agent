@@ -455,7 +455,7 @@ async fn pull_request(args: &PrArgs, overrides: &Overrides) -> Result<()> {
     changes.diff = redacted.text;
     let mut findings = redacted.findings;
     for commit in &mut commits {
-        let place = format!("commit {} message", commit.hash);
+        let place = redact::commit_message_place(&commit.hash);
         let redacted = redact::text(&commit.message, &place);
         commit.message = redacted.text;
         findings.extend(redacted.findings);
@@ -1084,15 +1084,20 @@ async fn explain_lines(args: &WhyArgs, overrides: &Overrides) -> Result<()> {
     let blame = redact::text(&why::blame_summary(&blamed, &summaries), "git blame");
     let mut findings = [excerpt.findings, blame.findings].concat();
     for change in &mut history {
-        let message = redact::text(&change.message, &format!("commit {} message", change.short));
+        let message = redact::text(
+            &change.message,
+            &redact::commit_message_place(&change.short),
+        );
         change.message = message.text;
         let patch = redact::diff(&change.patch);
         change.patch = patch.text;
         findings.extend(message.findings);
-        findings.extend(patch.findings.into_iter().map(|finding| Finding {
-            place: format!("commit {} {}", change.short, finding.place),
-            ..finding
-        }));
+        findings.extend(
+            patch
+                .findings
+                .into_iter()
+                .map(|finding| finding.in_commit(&change.short)),
+        );
     }
     report_secrets(
         &findings,
@@ -1232,7 +1237,7 @@ async fn explain_commits(args: &ExplainArgs, overrides: &Overrides) -> Result<()
     changes.diff = redacted.text;
     let mut findings = redacted.findings;
     for commit in &mut commits {
-        let place = format!("commit {} message", commit.hash);
+        let place = redact::commit_message_place(&commit.hash);
         let redacted = redact::text(&commit.message, &place);
         commit.message = redacted.text;
         findings.extend(redacted.findings);

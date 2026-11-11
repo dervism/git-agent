@@ -1,7 +1,7 @@
 //! Committing and pushing: the steps that record and publish what the user accepted.
 
 use crate::config::OnSecrets;
-use crate::git::{Repo, Scope};
+use crate::git::{Destination, Repo, Scope};
 use crate::secrets::contents::Scanned;
 use crate::secrets::{self, AtCommit, Wording};
 use crate::ui;
@@ -204,13 +204,17 @@ fn why_not_undo(repo: &Repo, made: &Made) -> Result<(), String> {
     }
 }
 
-/// Pushes, first rebasing onto commits that reached the remote from elsewhere
-/// (e.g. edits made on GitHub), then checking the commits it sends for secrets
-/// as `on_secrets` says. With `ask`, the user confirms the rebase.
-/// Returns whether it pushed: the user may decline the rebase.
+/// Pushes the current branch where a bare `git push` would, and nothing else. The destination is
+/// fetched first, so its branches are what it has now, and the branch is rebased onto commits
+/// that reached its upstream from elsewhere (e.g. edits made on GitHub). Then the commits the push
+/// would send to each place it goes to are checked for secrets as `on_secrets` says, and the
+/// commit checked is the one pushed. With `ask`, the user confirms the rebase. Returns whether it
+/// pushed: the user may decline the rebase.
 pub fn push(repo: &Repo, ask: bool, on_secrets: OnSecrets) -> Result<bool> {
     const SHOWN: usize = 5;
 
+    let destination = repo.push_destination()?;
+    repo.fetch_for_push(&destination)?;
     let incoming = repo.incoming_commits()?;
     if !incoming.is_empty() {
         ui::info(format!(
@@ -230,10 +234,33 @@ pub fn push(repo: &Repo, ask: bool, on_secrets: OnSecrets) -> Result<bool> {
         repo.rebase_onto_upstream()?;
         ui::info("🔀 Rebased onto the remote commits.");
     }
-    secrets::check_outgoing(repo, on_secrets)?;
-    repo.push()?;
+    let commit = repo
+        .head_commit()?
+        .context("the branch has no commits to push")?;
+    let published = repo.published_tips(&destination)?;
+    secrets::check_outgoing(repo, &commit, &published, on_secrets)?;
+    repo.push_commit(&commit, &destination)?;
+    if destination.sets_upstream() {
+        track(repo, &destination);
+    }
     ui::info(ui::green("✅ Pushed."));
     Ok(true)
+}
+
+/// Makes the branch just pushed to `destination` for the first time track it. The push has gone
+/// by then, so a failure is only a warning.
+fn track(repo: &Repo, destination: &Destination) {
+    let tracked = format!("{}/{}", destination.remote, destination.branch);
+    match repo.set_upstream(destination) {
+        Ok(()) => ui::info(format!(
+            "Branch {} set up to track {tracked}.",
+            destination.local()
+        )),
+        Err(error) => ui::warn(format!(
+            "pushed, but git-agent couldn't make {} track {tracked}: {error:#}",
+            destination.local()
+        )),
+    }
 }
 
 #[cfg(test)]
@@ -241,10 +268,30 @@ mod tests {
     use super::*;
     #[cfg(unix)]
     use crate::git::test_support::hook;
-    use crate::git::test_support::{add_remote, commit_elsewhere, isolated_repo, run};
+    use crate::git::test_support::{add_remote, commit_elsewhere, isolate, isolated_repo, run};
     use crate::secrets::test_support::aws_key;
     use std::fs;
     use std::path::Path;
+    use tempfile::TempDir;
+
+    /// An empty bare repository, to push to.
+    fn bare() -> TempDir {
+        let remote = TempDir::new().unwrap();
+        run(
+            remote.path(),
+            &["init", "--bare", "-q", "--initial-branch", "main"],
+        );
+        remote
+    }
+
+    fn branches(remote: &Path) -> String {
+        run(remote, &["branch", "--list"])
+    }
+
+    fn refused_for_the_key(error: &anyhow::Error) {
+        let shown = error.to_string();
+        assert!(shown.contains("deploy.env:1  AWS access key"), "{shown}");
+    }
 
     fn commit_key(dir: &Path) {
         fs::write(dir.join("deploy.env"), format!("aws {}\n", aws_key())).unwrap();
@@ -293,6 +340,208 @@ mod tests {
             ["add the deploy settings", "edit on GitHub"]
         );
         assert_eq!(remote_head(remote.path()), before);
+    }
+
+    /// A commit another remote has is checked before a push to this one: having reached an
+    /// internal remote doesn't make it public on the one pushed to.
+    #[test]
+    fn checks_commits_another_remote_has_before_a_push_to_this_one() {
+        let (dir, repo) = isolated_repo();
+        let dir = dir.path();
+        let public = add_remote(&repo);
+        let before = remote_head(public.path());
+        let internal = bare();
+        run(
+            dir,
+            &[
+                "remote",
+                "add",
+                "internal",
+                internal.path().to_str().unwrap(),
+            ],
+        );
+        commit_key(dir);
+        run(dir, &["push", "-q", "internal", "HEAD:refs/heads/main"]);
+
+        let error = push(&repo, false, OnSecrets::Reject).unwrap_err();
+
+        refused_for_the_key(&error);
+        assert_eq!(remote_head(public.path()), before);
+    }
+
+    /// A branch deleted on the remote no longer counts as published, though its remote-tracking
+    /// ref is still here: a new branch built on it would send its commits, so they're checked.
+    #[test]
+    fn checks_the_commits_of_a_branch_deleted_on_the_remote() {
+        let (dir, repo) = isolated_repo();
+        let dir = dir.path();
+        let remote = add_remote(&repo);
+        run(dir, &["switch", "-q", "-c", "old"]);
+        commit_key(dir);
+        run(dir, &["push", "-q", "origin", "old"]);
+        run(remote.path(), &["branch", "-q", "-D", "old"]);
+        run(dir, &["switch", "-q", "-c", "new"]);
+
+        let error = push(&repo, false, OnSecrets::Reject).unwrap_err();
+
+        refused_for_the_key(&error);
+        assert!(!branches(remote.path()).contains("new"));
+    }
+
+    /// A first push makes the branch track where it went, as `git push --set-upstream` does.
+    #[test]
+    fn a_first_push_makes_the_branch_track_where_it_went() {
+        let (dir, repo) = isolated_repo();
+        let remote = bare();
+        let at = remote.path().to_str().unwrap();
+        run(dir.path(), &["remote", "add", "origin", at]);
+
+        assert!(push(&repo, false, OnSecrets::Reject).unwrap());
+
+        assert!(branches(remote.path()).contains("main"));
+        let upstream = run(dir.path(), &["rev-parse", "--abbrev-ref", "@{upstream}"]);
+        assert_eq!(upstream.trim(), "origin/main");
+    }
+
+    /// The push has gone by the time the branch is made to track it, so a failure there is only
+    /// a warning, and the push counts.
+    #[test]
+    fn a_first_push_counts_though_the_branch_cannot_be_made_to_track_it() {
+        let (dir, repo) = isolated_repo();
+        let remote = bare();
+        let at = remote.path().to_str().unwrap();
+        run(dir.path(), &["remote", "add", "origin", at]);
+        fs::write(dir.path().join(".git/config.lock"), "").unwrap();
+
+        assert!(push(&repo, false, OnSecrets::Reject).unwrap());
+
+        assert!(branches(remote.path()).contains("main"));
+        assert!(repo.push_destination().unwrap().sets_upstream());
+    }
+
+    /// A first push to a new remote checks the whole history, the root commit's diff included,
+    /// whatever `log.showRoot` says.
+    #[test]
+    fn checks_the_whole_history_on_a_first_push_to_a_new_remote() {
+        let dir = TempDir::new().unwrap();
+        let dir = dir.path();
+        run(dir, &["init", "-q", "--initial-branch", "main"]);
+        isolate(dir);
+        commit_key(dir);
+        fs::write(dir.join("lib.rs"), "fn a() {}\n").unwrap();
+        run(dir, &["add", "lib.rs"]);
+        run(dir, &["commit", "-q", "-m", "add lib.rs"]);
+        run(dir, &["config", "log.showRoot", "false"]);
+        let remote = bare();
+        run(
+            dir,
+            &["remote", "add", "origin", remote.path().to_str().unwrap()],
+        );
+        let repo = Repo::open(dir).unwrap();
+
+        let error = push(&repo, false, OnSecrets::Reject).unwrap_err();
+
+        refused_for_the_key(&error);
+        assert!(branches(remote.path()).is_empty());
+    }
+
+    /// A key on the fetched remote's branch is published there, not at a push URL the fetch
+    /// doesn't come from, which is asked what it has: the key is checked before it goes there.
+    #[test]
+    fn checks_what_goes_to_a_push_url_the_fetch_doesnt_come_from() {
+        let (dir, repo) = isolated_repo();
+        let dir = dir.path();
+        let _internal = add_remote(&repo);
+        commit_key(dir);
+        run(dir, &["push", "-q", "origin", "main"]);
+        let public = bare();
+        let public_path = public.path().to_str().unwrap();
+        run(dir, &["config", "remote.origin.pushurl", public_path]);
+
+        let error = push(&repo, false, OnSecrets::Reject).unwrap_err();
+
+        refused_for_the_key(&error);
+        assert!(branches(public.path()).is_empty());
+    }
+
+    /// A remote with a second URL pushes to it too, so what goes there is checked against what it
+    /// has, not against the first URL's branches.
+    #[test]
+    fn checks_what_goes_to_each_url_of_a_remote() {
+        let (dir, repo) = isolated_repo();
+        let dir = dir.path();
+        let _first = add_remote(&repo);
+        commit_key(dir);
+        run(dir, &["push", "-q", "origin", "main"]);
+        let second = bare();
+        let second_path = second.path().to_str().unwrap();
+        run(dir, &["config", "--add", "remote.origin.url", second_path]);
+
+        let error = push(&repo, false, OnSecrets::Reject).unwrap_err();
+
+        refused_for_the_key(&error);
+        assert!(branches(second.path()).is_empty());
+    }
+
+    /// A narrowed fetch refspec keeps the ref of a branch deleted on the remote, which a pruned
+    /// fetch can't drop, so the remote is asked what it has, and a new branch built on that one
+    /// has its commits checked.
+    #[test]
+    fn checks_a_deleted_branch_whose_ref_a_narrowed_fetch_keeps() {
+        let (dir, repo) = isolated_repo();
+        let dir = dir.path();
+        let remote = add_remote(&repo);
+        run(dir, &["switch", "-q", "-c", "old"]);
+        commit_key(dir);
+        run(dir, &["push", "-q", "origin", "old"]);
+        run(remote.path(), &["branch", "-q", "-D", "old"]);
+        let narrow = "+refs/heads/main:refs/remotes/origin/main";
+        run(dir, &["config", "remote.origin.fetch", narrow]);
+        run(dir, &["switch", "-q", "-c", "new"]);
+
+        let error = push(&repo, false, OnSecrets::Reject).unwrap_err();
+
+        refused_for_the_key(&error);
+        assert!(!branches(remote.path()).contains("new"));
+    }
+
+    /// A fork's branch is rebased onto what came in on its upstream, which is fetched from the
+    /// upstream's remote, and goes to the fork, leaving the upstream alone.
+    #[test]
+    fn rebases_a_fork_s_branch_onto_its_upstream_and_pushes_it_to_the_fork() {
+        let (dir, repo) = isolated_repo();
+        let dir = dir.path();
+        let origin = add_remote(&repo);
+        let fork = bare();
+        run(
+            dir,
+            &["remote", "add", "fork", fork.path().to_str().unwrap()],
+        );
+        run(dir, &["config", "branch.main.pushRemote", "fork"]);
+        commit_elsewhere(&origin, "notes.txt", "notes\n", "edit on GitHub");
+        fs::write(dir.join("lib.rs"), "fn b() {}\n").unwrap();
+        run(dir, &["commit", "-q", "-am", "feat: b"]);
+
+        assert!(push(&repo, false, OnSecrets::Reject).unwrap());
+
+        let on_fork = run(fork.path(), &["log", "--format=%s", "-2", "main"]);
+        assert_eq!(on_fork, "feat: b\nedit on GitHub\n");
+        let on_origin = run(origin.path(), &["log", "--format=%s", "-1", "main"]);
+        assert_eq!(on_origin, "edit on GitHub\n");
+    }
+
+    /// The pruned fetch before a push leaves local tags alone, whatever `fetch.pruneTags` says.
+    #[test]
+    fn keeps_local_tags_whatever_fetch_prune_tags_says() {
+        let (dir, repo) = isolated_repo();
+        let dir = dir.path();
+        let _remote = add_remote(&repo);
+        run(dir, &["config", "fetch.pruneTags", "true"]);
+        run(dir, &["tag", "local-only"]);
+
+        assert!(push(&repo, false, OnSecrets::Reject).unwrap());
+
+        assert_eq!(run(dir, &["tag"]), "local-only\n");
     }
 
     #[test]

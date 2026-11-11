@@ -23,9 +23,6 @@ use redact::{Change, Finding};
 const ADVICE: &str = "If they aren't real secrets, add --on-secrets warn, or choose Warn under \
                       Secrets in `git agent config`.";
 
-/// The commits a push of HEAD sends: those no remote-tracking branch has.
-const OUTGOING: [&str; 3] = ["HEAD", "--not", "--remotes"];
-
 /// What a flow says when a check finds secrets.
 pub struct Wording {
     /// What the flow didn't do because of them.
@@ -162,11 +159,32 @@ pub fn warn_about_commits(
     settle(warning(&scanned.findings, reported, warned).map_or(Verdict::Clean, Verdict::Warn))
 }
 
-/// Checks the commits a push of HEAD would send. Its warning lists every secret they add, even
-/// one the flow listed before: a finding names a file rather than the secret, so leaving out
-/// what the flow listed could hide another secret of the same kind in an older commit.
-pub fn check_outgoing(repo: &Repo, on_secrets: OnSecrets) -> Result<()> {
-    let scanned = found_in_commits(repo, &OUTGOING)?;
+/// Checks the commits a push of `commit` would send to each place it goes to: those that none of
+/// the commits `published` for that place holds, the branches it has. One verdict covers all of
+/// them. Its warning lists every secret they add, even one the flow listed before: a finding names
+/// a file rather than the secret, so leaving out what the flow listed could hide another secret of
+/// the same kind in an older commit. Without any place, it checks as for one that has nothing yet,
+/// so that no commit goes unchecked.
+pub fn check_outgoing(
+    repo: &Repo,
+    commit: &str,
+    published: &[Vec<String>],
+    on_secrets: OnSecrets,
+) -> Result<()> {
+    let nowhere = [Vec::new()];
+    let places = if published.is_empty() {
+        &nowhere[..]
+    } else {
+        published
+    };
+    let scanned = places
+        .iter()
+        .map(|tips| {
+            let found = repo.outgoing_commits(commit, tips, publication::read_log)?;
+            with_binary_files(repo, found)
+        })
+        .collect::<Result<Vec<Scanned>>>()?;
+    let scanned = each_once(scanned);
     settle(unchecked_verdict(&scanned.unchecked))?;
     settle(verdict(&scanned.findings, on_secrets, &[], &PUSH))
 }
@@ -181,6 +199,25 @@ fn found_in_changes(repo: &Repo, scope: Scope) -> Result<Scanned> {
 fn found_in_commits(repo: &Repo, range: &[&str]) -> Result<Scanned> {
     let found = repo.published_commits(range, publication::read_log)?;
     with_binary_files(repo, found)
+}
+
+/// What `scans` found together, each finding and each file not checked once, in the order found.
+fn each_once(scans: Vec<Scanned>) -> Scanned {
+    scans
+        .into_iter()
+        .fold(Scanned::default(), |mut all, scanned| {
+            for finding in scanned.findings {
+                if !all.findings.contains(&finding) {
+                    all.findings.push(finding);
+                }
+            }
+            for file in scanned.unchecked {
+                if !all.unchecked.contains(&file) {
+                    all.unchecked.push(file);
+                }
+            }
+            all
+        })
 }
 
 /// What a read of a publication `found`: the secrets in its lines, then those in the whole
@@ -378,6 +415,21 @@ mod tests {
     use std::fs;
     use std::path::Path;
     use tempfile::TempDir;
+
+    /// The commits no remote-tracking branch has: what a push of HEAD sent before it named its
+    /// destination, still a range for the other checks.
+    const OUTGOING: [&str; 3] = ["HEAD", "--not", "--remotes"];
+
+    /// The check of a push of HEAD, with every remote's branches counted as published.
+    fn check_push(repo: &Repo, on_secrets: OnSecrets) -> Result<()> {
+        let head = repo.head_commit().unwrap().unwrap();
+        let tips = run(
+            repo.workdir(),
+            &["for-each-ref", "--format=%(objectname)", "refs/remotes/"],
+        );
+        let published: Vec<String> = tips.lines().map(str::to_owned).collect();
+        check_outgoing(repo, &head, &[published], on_secrets)
+    }
 
     const WORDING: Wording = Wording {
         refused: "stopped",
@@ -786,7 +838,7 @@ mod tests {
             "add the deploy settings",
         );
 
-        let error = check_outgoing(&repo, OnSecrets::Reject).unwrap_err();
+        let error = check_push(&repo, OnSecrets::Reject).unwrap_err();
 
         assert_eq!(
             error.to_string(),
@@ -798,6 +850,24 @@ mod tests {
         );
     }
 
+    /// A push said to go nowhere still has every commit checked, as one to a place that has
+    /// nothing yet.
+    #[test]
+    fn checks_every_commit_of_a_push_without_a_place_to_go() {
+        let (dir, repo) = isolated_repo();
+        let hash = commit_file(
+            dir.path(),
+            &format!("aws {}\n", aws_key()),
+            "add the deploy settings",
+        );
+        let head = repo.head_commit().unwrap().unwrap();
+
+        let error = check_outgoing(&repo, &head, &[], OnSecrets::Reject).unwrap_err();
+
+        let shown = format!("commit {hash} deploy.env:1  AWS access key");
+        assert!(error.to_string().contains(&shown), "{error}");
+    }
+
     /// A commit message can hold git's field separator; what follows it is still scanned as part
     /// of the message.
     #[test]
@@ -806,7 +876,7 @@ mod tests {
         let message = format!("tidy up\n\n\u{1f}aws {}", aws_key());
         let hash = commit_file(dir.path(), "plain\n", &message);
 
-        let error = check_outgoing(&repo, OnSecrets::Reject).unwrap_err();
+        let error = check_push(&repo, OnSecrets::Reject).unwrap_err();
 
         let shown = format!("commit {hash} message  AWS access key");
         assert!(error.to_string().contains(&shown), "{error}");
@@ -856,7 +926,7 @@ mod tests {
         run(dir, &["merge", "-q", "--no-ff", "--no-commit", "side"]);
         let merge = commit_file(dir, &format!("aws {}\n", aws_key()), "merge the side");
 
-        let error = check_outgoing(&repo, OnSecrets::Reject).unwrap_err();
+        let error = check_push(&repo, OnSecrets::Reject).unwrap_err();
 
         let shown = format!("commit {merge} deploy.env:1  AWS access key");
         assert!(error.to_string().contains(&shown), "{error}");
@@ -875,7 +945,7 @@ mod tests {
         );
         run(dir, &["config", "log.showRoot", "false"]);
         let shown = format!("commit {first} deploy.env:1  AWS access key");
-        let error = check_outgoing(&repo, OnSecrets::Reject).unwrap_err();
+        let error = check_push(&repo, OnSecrets::Reject).unwrap_err();
         assert!(error.to_string().contains(&shown), "{error}");
 
         let second = commit_file(dir, &format!("aws {}\nmore\n", aws_key()), "more");
@@ -886,7 +956,7 @@ mod tests {
         assert!(replaced.contains(&format!("{second} more\n")), "{replaced}");
         assert!(replaced.contains("+aws"), "{replaced}");
         assert!(!replaced.contains("add the deploy settings"), "{replaced}");
-        let error = check_outgoing(&repo, OnSecrets::Reject).unwrap_err();
+        let error = check_push(&repo, OnSecrets::Reject).unwrap_err();
         assert!(error.to_string().contains(&shown), "{error}");
         assert!(!error.to_string().contains(&second), "{error}");
     }
@@ -948,7 +1018,7 @@ mod tests {
             verdict(&found, OnSecrets::Warn, &[], &PUSH),
             Verdict::Warn(shown)
         );
-        assert!(check_outgoing(&repo, OnSecrets::Warn).is_ok());
+        assert!(check_push(&repo, OnSecrets::Warn).is_ok());
     }
 
     /// The push lists each commit's secret, even where the commit check listed the same kind in
@@ -994,7 +1064,7 @@ mod tests {
             &["merge", "-q", "--no-ff", "-m", "merge the side", "side"],
         );
 
-        assert!(check_outgoing(&repo, OnSecrets::Reject).is_ok());
+        assert!(check_push(&repo, OnSecrets::Reject).is_ok());
     }
 
     /// A submodule's own files aren't part of a commit or push of this repository, whatever
@@ -1042,7 +1112,7 @@ mod tests {
         let grafted = run(dir, &["log", "--format=%h", "HEAD", "--not", "--remotes"]);
         assert!(grafted.is_empty(), "{grafted}");
 
-        let error = check_outgoing(&repo, OnSecrets::Reject).unwrap_err();
+        let error = check_push(&repo, OnSecrets::Reject).unwrap_err();
 
         let shown = format!("commit {hash} deploy.env:1  AWS access key");
         assert!(error.to_string().contains(&shown), "{error}");
@@ -1060,11 +1130,11 @@ mod tests {
             dir.path(),
             &["update-ref", "refs/remotes/origin/main", "HEAD"],
         );
-        assert!(check_outgoing(&repo, OnSecrets::Reject).is_ok());
+        assert!(check_push(&repo, OnSecrets::Reject).is_ok());
 
         commit_file(dir.path(), "aws none\n", "take the key out");
 
-        assert!(check_outgoing(&repo, OnSecrets::Reject).is_ok());
+        assert!(check_push(&repo, OnSecrets::Reject).is_ok());
     }
 
     /// A file `.gitattributes` marks `-diff` shows only as binary, so it's read whole, with the
@@ -1179,7 +1249,7 @@ mod tests {
         run(dir, &["merge", "-q", "--no-commit", "-X", "ours", "side"]);
         let merge = commit_at(dir, "data.bin", &format!("\0aws {}\0", aws_key()), "merge");
 
-        let error = check_outgoing(&repo, OnSecrets::Reject).unwrap_err();
+        let error = check_push(&repo, OnSecrets::Reject).unwrap_err();
 
         let shown = format!("commit {merge} data.bin  AWS access key");
         assert!(error.to_string().contains(&shown), "{error}");
@@ -1207,7 +1277,7 @@ mod tests {
                 kind: "AWS access key".to_owned()
             }]
         );
-        assert!(check_outgoing(&repo, OnSecrets::Reject).is_ok());
+        assert!(check_push(&repo, OnSecrets::Reject).is_ok());
     }
 
     /// Whatever makes git show a file as binary, the `binary` macro or a diff driver set to

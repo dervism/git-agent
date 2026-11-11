@@ -490,10 +490,10 @@ mod tests {
     fn one_place_pushes() {
         let sources = sources();
         assert_eq!(
-            occurrences(&sources, ".push()"),
+            occurrences(&sources, ".push_commit("),
             BTreeMap::from([("delivery".to_owned(), 1)])
         );
-        assert!(modules_with(&sources, &["Repo::push"]).is_empty());
+        assert!(modules_with(&sources, &["Repo::push_commit"]).is_empty());
     }
 
     #[test]

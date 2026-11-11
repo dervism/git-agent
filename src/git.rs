@@ -4,7 +4,11 @@ pub mod blob;
 pub mod diff;
 pub mod lossless;
 pub mod names;
+mod push;
+mod settings;
 pub mod worktree;
+
+pub use push::Destination;
 
 use crate::safe_text::{one_line, without_styles};
 use crate::temp::PrivateDir;
@@ -263,6 +267,27 @@ impl Repo {
         fs::write(path, text).with_context(|| format!("failed to write {}", path.display()))
     }
 
+    /// Fetches `refspecs` from `remote`, all its branches by its own refspec when there are none,
+    /// with `options`, through the terminal, so that git can show errors and ask for
+    /// credentials.
+    fn fetch_from(&self, remote: &str, options: &[&str], refspecs: &[&str]) -> Result<()> {
+        let args = [
+            &["fetch", "--quiet"][..],
+            options,
+            &["--", remote],
+            refspecs,
+        ]
+        .concat();
+        let status = self
+            .command(&args)
+            .status()
+            .context("failed to run git fetch")?;
+        if !status.success() {
+            bail!("`git {}` failed ({status})", args.join(" "));
+        }
+        Ok(())
+    }
+
     /// The user's attributes file: `core.attributesFile`, else git's default.
     fn user_attributes(&self) -> Option<PathBuf> {
         if let Ok(path) = self.git(&["config", "--path", "--get", "core.attributesFile"]) {
@@ -434,7 +459,7 @@ impl Repo {
         read: impl FnOnce(&mut dyn BufRead) -> Result<T>,
     ) -> Result<T> {
         let (command, args) = self.published_command(args);
-        stream_of(command, &args, read)
+        stream_of(command, &args, None, read)
     }
 
     /// git with `args` for a read for the secret checks, and the arguments in full.
@@ -881,6 +906,33 @@ impl Repo {
         range: &[&str],
         read: impl FnOnce(&mut dyn BufRead, &LogMarks) -> Result<T>,
     ) -> Result<T> {
+        self.published_log(range, None, read)
+    }
+
+    /// The commits a push of `commit` publishes, read as [`Repo::published_commits`] reads a
+    /// range: `commit` and its history, but none of the commits `published` names, the branches
+    /// the destination has, nor their history. git takes them on its standard input, so a remote
+    /// with many branches can't make the command too long.
+    pub fn outgoing_commits<T>(
+        &self,
+        commit: &str,
+        published: &[String],
+        read: impl FnOnce(&mut dyn BufRead, &LogMarks) -> Result<T>,
+    ) -> Result<T> {
+        let mut revisions = format!("{}\n", object_hash(commit)?);
+        for tip in published {
+            revisions.push_str(&format!("^{}\n", object_hash(tip)?));
+        }
+        self.published_log(&["--stdin"], Some(revisions.as_bytes()), read)
+    }
+
+    /// The log of [`Repo::published_commits`] for `revisions`, with `input` on git's stdin.
+    fn published_log<T>(
+        &self,
+        revisions: &[&str],
+        input: Option<&[u8]>,
+        read: impl FnOnce(&mut dyn BufRead, &LogMarks) -> Result<T>,
+    ) -> Result<T> {
         let marks = LogMarks::new();
         let format = marks.stream_format();
         let mut args = vec![
@@ -892,9 +944,10 @@ impl Repo {
             &format,
         ];
         args.extend(PUBLISHED_DIFF);
-        args.extend_from_slice(range);
+        args.extend_from_slice(revisions);
         args.push("--");
-        self.stream_published(&args, |output| read(output, &marks))
+        let (command, args) = self.published_command(&args);
+        stream_of(command, &args, input, |output| read(output, &marks))
     }
 
     /// The commits on HEAD that `base` lacks, oldest first, without merges.
@@ -1340,14 +1393,7 @@ impl Repo {
     pub fn fetch_branch(&self, remote: &str, branch: &str) -> Result<String> {
         let tracking = format!("{remote}/{branch}");
         let refspec = format!("+refs/heads/{branch}:refs/remotes/{tracking}");
-        // Uses the terminal so git can show errors and ask for credentials.
-        let status = self
-            .command(&["fetch", "--quiet", remote, &refspec])
-            .status()
-            .context("failed to run git fetch")?;
-        if !status.success() {
-            bail!("`git fetch {remote} {branch}` failed ({status})");
-        }
+        self.fetch_from(remote, &[], &[&refspec])?;
         Ok(tracking)
     }
 
@@ -1521,114 +1567,6 @@ impl Repo {
     /// a split's commits do.
     pub fn uses_own_index(&self) -> bool {
         self.index.is_some()
-    }
-
-    /// Pushes the current branch. A branch without an upstream is pushed to the
-    /// default remote and its upstream is set, like `git push --set-upstream`.
-    pub fn push(&self) -> Result<()> {
-        let status = self
-            .push_command(
-                ui::child_stdout_on_stderr().context("failed to give git push a stdout")?,
-            )?
-            .status()
-            .context("failed to run git push")?;
-        if !status.success() {
-            bail!("`git push` failed ({status})");
-        }
-        Ok(())
-    }
-
-    /// The `git push` of [`Repo::push`], with `stdout` for git's standard output. It isn't
-    /// git-agent's own: the first push of a branch writes there that it tracks the remote
-    /// now, and a `pre-push` hook writes there too. With the reader of that output gone,
-    /// git would die of `SIGPIPE` after it has pushed, and the push would be reported as
-    /// failed.
-    fn push_command(&self, stdout: Stdio) -> Result<Command> {
-        let mut command = self.command(&["push"]);
-        if !self.has_upstream() {
-            let remote = self.push_remote()?;
-            command.args(["--set-upstream", remote.as_str(), "HEAD"]);
-        }
-        command.stdout(stdout);
-        Ok(command)
-    }
-
-    /// Fetches the upstream and returns the commits on it that the current branch
-    /// lacks, as `<hash> <subject>` lines. Empty if the branch has no upstream.
-    pub fn incoming_commits(&self) -> Result<Vec<String>> {
-        if !self.has_upstream() {
-            return Ok(Vec::new());
-        }
-        // Uses the terminal so git can show errors and ask for credentials.
-        let status = self
-            .command(&["fetch", "--quiet"])
-            .status()
-            .context("failed to run git fetch")?;
-        if !status.success() {
-            bail!("`git fetch` failed ({status})");
-        }
-        let log = self.git(&["log", "--format=%h %s", "HEAD..@{upstream}"])?;
-        Ok(log.lines().map(one_line).collect())
-    }
-
-    /// Replays local commits on top of the upstream, setting uncommitted changes
-    /// aside meanwhile. If that fails the rebase is aborted, leaving the branch as it was.
-    pub fn rebase_onto_upstream(&self) -> Result<()> {
-        let output = self
-            .command(&["rebase", "--autostash", "@{upstream}"])
-            .output()
-            .context("failed to run git rebase")?;
-        if output.status.success() {
-            return Ok(());
-        }
-        let _ = self.command(&["rebase", "--abort"]).output();
-
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let conflicts: Vec<&str> = stdout
-            .lines()
-            .chain(stderr.lines())
-            .filter(|line| line.starts_with("CONFLICT"))
-            .collect();
-        if conflicts.is_empty() {
-            bail!("`git rebase` failed: {}", stderr.trim());
-        }
-        bail!(
-            "your changes conflict with the new remote commits, so the rebase was cancelled:\n  {}\n\
-             Run `git pull --rebase`, resolve the conflicts, then `git push`",
-            conflicts.join("\n  ")
-        );
-    }
-
-    fn has_upstream(&self) -> bool {
-        self.git(&[
-            "rev-parse",
-            "--abbrev-ref",
-            "--symbolic-full-name",
-            "@{upstream}",
-        ])
-        .is_ok()
-    }
-
-    /// `remote.pushDefault` if set, else the only remote, else `origin`.
-    fn push_remote(&self) -> Result<String> {
-        if let Ok(remote) = self.git(&["config", "remote.pushDefault"]) {
-            return Ok(remote.trim().to_owned());
-        }
-        let remotes = self.git(&["remote"])?;
-        let remotes: Vec<&str> = remotes.lines().collect();
-        match remotes.as_slice() {
-            [] => bail!(
-                "there is no remote to push to; add one with `git remote add origin <url>`, \
-                 or create a GitHub repository with `gh repo create --source . --push`"
-            ),
-            [remote] => Ok(remote.to_string()),
-            _ if remotes.contains(&"origin") => Ok("origin".to_owned()),
-            _ => bail!(
-                "the branch has no upstream and there are several remotes; \
-                 push it once with `git push --set-upstream <remote> HEAD`"
-            ),
-        }
     }
 }
 
@@ -1996,26 +1934,26 @@ fn readable<'a>(args: &[&'a str]) -> Vec<&'a str> {
     [&READABLE_NAMES[..], &WHOLE_TREE, &UTF8_LOGS, args].concat()
 }
 
-/// Runs `command`, git with `args`, and gives `read` its stdout as git writes it, failing with
-/// its stderr when git fails, before or after `read` does. git is stopped when `read` fails
-/// first, and what `read` leaves of the output is read to the end, so that git can finish.
-/// git is judged before its output is closed, so that a git the closed pipe ends isn't taken for
-/// one that failed.
+/// Runs `command`, git with `args` and `input` on its stdin, and gives `read` its stdout as git
+/// writes it, failing with its stderr when git fails, before or after `read` does. git is stopped
+/// when `read` fails first, and what `read` leaves of the output is read to the end, so that git
+/// can finish. git is judged before its output is closed, so that a git the closed pipe ends isn't
+/// taken for one that failed.
 fn stream_of<T>(
-    mut command: Command,
+    command: Command,
     args: &[&str],
+    input: Option<&[u8]>,
     read: impl FnOnce(&mut dyn BufRead) -> Result<T>,
 ) -> Result<T> {
-    let mut child = command
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .context("failed to run git; is it installed?")?;
+    let mut child = spawned(command, input)?;
     let (Some(stdout), Some(mut stderr)) = (child.stdout.take(), child.stderr.take()) else {
         bail!("git was started without its output");
     };
+    let stdin = child.stdin.take();
     std::thread::scope(|scope| {
+        if let (Some(mut stdin), Some(input)) = (stdin, input) {
+            scope.spawn(move || stdin.write_all(input));
+        }
         let said = scope.spawn(move || {
             let mut said = Vec::new();
             stderr.read_to_end(&mut said).map(|_| said)
@@ -2031,19 +1969,44 @@ fn stream_of<T>(
         drop(output);
         let status = child.wait().context("failed to wait for git")?;
         let said = said.join().ok().and_then(Result::ok).unwrap_or_default();
-        let failed = (!status.success() && !stopped).then(|| {
-            format!(
-                "`git {}` failed: {}",
-                args.join(" "),
-                String::from_utf8_lossy(&said).trim()
-            )
-        });
-        match (outcome, failed) {
-            (Err(error), Some(failed)) => Err(error.context(failed)),
-            (Ok(_), Some(failed)) => Err(anyhow!(failed)),
-            (outcome, None) => outcome,
-        }
+        let git_failed = !status.success() && !stopped;
+        settled(outcome, git_failed.then(|| failure(args, &said)))
     })
+}
+
+/// `command` started with its output piped, and its input piped too when there's `input` for it.
+/// A write to git that fails shows as git's own failure.
+fn spawned(mut command: Command, input: Option<&[u8]>) -> Result<std::process::Child> {
+    let stdin = if input.is_some() {
+        Stdio::piped()
+    } else {
+        Stdio::null()
+    };
+    command
+        .stdin(stdin)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("failed to run git; is it installed?")
+}
+
+/// What git with `args` failing says, with what it `said` on stderr.
+fn failure(args: &[&str], said: &[u8]) -> String {
+    format!(
+        "`git {}` failed: {}",
+        args.join(" "),
+        String::from_utf8_lossy(said).trim()
+    )
+}
+
+/// The `outcome` of a read of git's output, unless git `failed`: then git's failure, with the
+/// read's error under it.
+fn settled<T>(outcome: Result<T>, failed: Option<String>) -> Result<T> {
+    match (outcome, failed) {
+        (Err(error), Some(failed)) => Err(error.context(failed)),
+        (Ok(_), Some(failed)) => Err(anyhow!(failed)),
+        (outcome, None) => outcome,
+    }
 }
 
 /// Runs `command`, git with `args`, and returns its stdout as it is, failing with its stderr.
@@ -2154,8 +2117,20 @@ pub mod test_support {
         );
         repo.git(&["remote", "add", "origin", remote.path().to_str().unwrap()])
             .unwrap();
-        repo.push().unwrap();
+        push(repo);
         remote
+    }
+
+    /// Pushes the current branch where git-agent would, as `delivery::push` does without its
+    /// checks of secrets.
+    pub fn push(repo: &Repo) {
+        let destination = repo.push_destination().unwrap();
+        repo.fetch_for_push(&destination).unwrap();
+        let commit = repo.head_commit().unwrap().unwrap();
+        repo.push_commit(&commit, &destination).unwrap();
+        if destination.sets_upstream() {
+            repo.set_upstream(&destination).unwrap();
+        }
     }
 
     /// Pushes a commit to `remote` from another clone, like an edit made on GitHub.
@@ -2227,7 +2202,7 @@ pub mod test_support {
 
 #[cfg(test)]
 mod tests {
-    use super::test_support::{add_remote, commit_elsewhere, hook, isolate, isolated_repo};
+    use super::test_support::{add_remote, commit_elsewhere, hook, isolate, isolated_repo, push};
     use super::*;
     use tempfile::TempDir;
 
@@ -2279,7 +2254,7 @@ mod tests {
         std::thread::spawn(move || {
             let mut command = Command::new("sh");
             command.args(["-c", "exec sleep 30"]);
-            let outcome = stream_of(command, &["log"], |_| -> Result<()> { bail!("stop") });
+            let outcome = stream_of(command, &["log"], None, |_| -> Result<()> { bail!("stop") });
             sent.send(outcome.map_err(|error| error.to_string()))
                 .unwrap();
         });
@@ -2295,7 +2270,7 @@ mod tests {
         let mut command = Command::new("sh");
         command.args(["-c", "printf partial; echo broken >&2; exit 3"]);
 
-        let error = stream_of(command, &["log"], |output| -> Result<()> {
+        let error = stream_of(command, &["log"], None, |output| -> Result<()> {
             io::copy(output, &mut io::sink())?;
             std::thread::sleep(std::time::Duration::from_millis(300));
             bail!("cut short")
@@ -2303,6 +2278,30 @@ mod tests {
         .unwrap_err();
 
         assert_eq!(format!("{error:#}"), "`git log` failed: broken: cut short");
+    }
+
+    /// The published commits go to git on its standard input, so there can be more of them than a
+    /// command line can hold.
+    #[test]
+    fn reads_the_outgoing_commits_past_any_number_of_published_ones() {
+        let (dir, repo) = isolated_repo();
+        let first = repo.head_commit().unwrap().unwrap();
+        fs::write(dir.path().join("lib.rs"), "fn b() {}\n").unwrap();
+        run(dir.path(), &["commit", "-q", "-am", "feat: b"]);
+        let second = repo.head_commit().unwrap().unwrap();
+        let published = vec![first; 50_000];
+
+        let count = repo
+            .outgoing_commits(&second, &published, |output, marks| {
+                let lines = output.split(b'\n').collect::<io::Result<Vec<_>>>()?;
+                let commits = lines
+                    .iter()
+                    .filter(|line| matches!(marks.line(line), Ok(LogLine::Commit(_))));
+                Ok(commits.count())
+            })
+            .unwrap();
+
+        assert_eq!(count, 1);
     }
 
     /// Each mark of a log read a line at a time is a line of its own: a commit's, with its hash,
@@ -2507,145 +2506,6 @@ mod tests {
     }
 
     #[test]
-    fn push_sets_upstream_then_reuses_it() {
-        let (dir, repo) = setup();
-        let remote = add_remote(&repo);
-        assert!(repo.has_upstream());
-
-        fs::write(dir.path().join("lib.rs"), "fn b() {}\n").unwrap();
-        repo.commit("feat: second", Scope::Tracked, &[], &[])
-            .unwrap();
-        assert!(repo.incoming_commits().unwrap().is_empty());
-        repo.push().unwrap();
-        let pushed = run(remote.path(), &["log", "--format=%s", "-1", "main"]);
-        assert_eq!(pushed.trim(), "feat: second");
-    }
-
-    /// A repository with `origin` as a bare repository that holds nothing yet, so that the
-    /// branch has no upstream to push to.
-    fn with_an_empty_remote() -> (TempDir, Repo, TempDir) {
-        let (dir, repo) = setup();
-        let remote = TempDir::new().unwrap();
-        run(
-            remote.path(),
-            &["init", "--bare", "-q", "--initial-branch", "main"],
-        );
-        repo.git(&["remote", "add", "origin", remote.path().to_str().unwrap()])
-            .unwrap();
-        (dir, repo, remote)
-    }
-
-    fn remote_has_main(remote: &TempDir) -> bool {
-        run(remote.path(), &["branch", "--list", "main"]).contains("main")
-    }
-
-    #[test]
-    fn a_first_push_into_a_stdout_nobody_reads_dies_of_sigpipe_after_it_pushed() {
-        use std::os::unix::process::ExitStatusExt;
-        let (_dir, repo, remote) = with_an_empty_remote();
-        let (reader, writer) = std::io::pipe().unwrap();
-        drop(reader);
-
-        let status = repo
-            .push_command(Stdio::from(writer))
-            .unwrap()
-            .status()
-            .unwrap();
-
-        assert_eq!(status.signal(), Some(13));
-        assert!(remote_has_main(&remote));
-    }
-
-    #[test]
-    fn a_first_push_writes_that_it_tracks_the_remote_to_the_stream_it_is_given() {
-        let (_dir, repo, remote) = with_an_empty_remote();
-        let (mut reader, writer) = std::io::pipe().unwrap();
-
-        let status = repo
-            .push_command(Stdio::from(writer))
-            .unwrap()
-            .status()
-            .unwrap();
-
-        assert!(status.success());
-        assert!(remote_has_main(&remote));
-        let mut written = String::new();
-        std::io::Read::read_to_string(&mut reader, &mut written).unwrap();
-        assert!(written.contains("set up to track"), "{written:?}");
-    }
-
-    #[test]
-    fn a_push_to_an_upstream_writes_nothing_to_stdout_so_it_survives_a_closed_one() {
-        let (dir, repo) = setup();
-        let _remote = add_remote(&repo);
-        fs::write(dir.path().join("lib.rs"), "fn b() {}\n").unwrap();
-        repo.commit("feat: second", Scope::Tracked, &[], &[])
-            .unwrap();
-        let (reader, writer) = std::io::pipe().unwrap();
-        drop(reader);
-
-        let status = repo
-            .push_command(Stdio::from(writer))
-            .unwrap()
-            .status()
-            .unwrap();
-
-        assert!(status.success());
-    }
-
-    #[test]
-    fn push_without_remote_explains_how_to_add_one() {
-        let (_dir, repo) = setup();
-        assert!(repo.incoming_commits().unwrap().is_empty());
-        let err = repo.push().unwrap_err();
-        assert!(err.to_string().contains("gh repo create"));
-    }
-
-    #[test]
-    fn rebases_onto_remote_commits_keeping_uncommitted_changes() {
-        let (dir, repo) = setup();
-        let remote = add_remote(&repo);
-        commit_elsewhere(&remote, "LICENSE", "MIT\n", "docs: add license");
-
-        fs::write(dir.path().join("lib.rs"), "fn b() {}\n").unwrap();
-        repo.commit("feat: local", Scope::Tracked, &[], &[])
-            .unwrap();
-        fs::write(dir.path().join("lib.rs"), "fn uncommitted() {}\n").unwrap();
-
-        let incoming = repo.incoming_commits().unwrap();
-        assert_eq!(incoming.len(), 1);
-        assert!(incoming[0].ends_with(" docs: add license"));
-        repo.rebase_onto_upstream().unwrap();
-        repo.push().unwrap();
-
-        let history = run(remote.path(), &["log", "--format=%s", "main"]);
-        assert_eq!(history, "feat: local\ndocs: add license\ninit\n");
-        let lib = fs::read_to_string(dir.path().join("lib.rs")).unwrap();
-        assert_eq!(lib, "fn uncommitted() {}\n");
-    }
-
-    #[test]
-    fn conflicting_rebase_is_cancelled() {
-        let (dir, repo) = setup();
-        let remote = add_remote(&repo);
-        commit_elsewhere(&remote, "lib.rs", "fn remote() {}\n", "fix: remote");
-
-        fs::write(dir.path().join("lib.rs"), "fn local() {}\n").unwrap();
-        repo.commit("fix: local", Scope::Tracked, &[], &[]).unwrap();
-        let before = repo.git(&["rev-parse", "HEAD"]).unwrap();
-
-        assert_eq!(repo.incoming_commits().unwrap().len(), 1);
-        let err = repo.rebase_onto_upstream().unwrap_err();
-        assert!(
-            err.to_string().contains("Merge conflict in lib.rs"),
-            "{err}"
-        );
-        assert_eq!(repo.git(&["rev-parse", "HEAD"]).unwrap(), before);
-        assert!(!repo.git_path("rebase-merge").unwrap().exists());
-        assert!(repo.changes(&[]).unwrap().is_none());
-    }
-
-    #[test]
     fn describes_a_branch_since_it_left_the_remote_base() {
         let (dir, repo) = setup();
         let remote = add_remote(&repo);
@@ -2704,7 +2564,7 @@ mod tests {
         assert_eq!(published_count(&repo, &outgoing), 2);
 
         assert!(repo.has_unpushed_commits().unwrap());
-        repo.push().unwrap();
+        push(&repo);
         assert!(!repo.has_unpushed_commits().unwrap());
         assert_eq!(published_count(&repo, &outgoing), 0);
         assert!(!repo.has_uncommitted_changes().unwrap());
@@ -2833,7 +2693,7 @@ mod tests {
         // It doesn't track origin/main, so its first push makes origin/feat/b.
         assert!(!repo.has_upstream());
         repo.commit("feat: b", Scope::Tracked, &[], &[]).unwrap();
-        repo.push().unwrap();
+        push(&repo);
         let pushed = run(remote.path(), &["log", "--format=%s", "-1", "feat/b"]);
         assert_eq!(pushed.trim(), "feat: b");
         assert_eq!(repo.branch_names().unwrap().len(), 3);

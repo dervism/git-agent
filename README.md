@@ -406,21 +406,35 @@ git-agent stops and leaves the branch as it was.
 
 ## Pushing
 
-git-agent pushes with a plain `git push`, so it works with GitHub or any other remote
-and uses your existing git credentials. The first time you push a branch that has no
-upstream, git-agent sets one: it uses `remote.pushDefault` if you've configured it,
-otherwise your only remote, otherwise `origin`. If the repository has no remote yet,
-create one on GitHub with `gh repo create --source . --push`.
+git-agent pushes the branch you're on to where a plain `git push` would send it, so it
+works with GitHub or any other remote and uses your existing git credentials. It follows
+`push.default`, `branch.<name>.pushRemote` and `remote.pushDefault`, but it sends only this
+branch, even when `push.default` is `matching`, and no tags, even with `push.followTags`
+set. To push tags, run `git push --tags`. The first time you push a branch that has no
+upstream, it goes under its own name to the branch's `pushRemote` if it has one, otherwise
+to `remote.pushDefault`, otherwise to your only remote, otherwise to `origin`, and git-agent
+makes the branch track it. If the repository has no remote yet, create one on GitHub with
+`gh repo create --source . --push`.
+
+git-agent never pushes the commits of a submodule. If your settings ask git to push or check
+them, through `push.recurseSubmodules` or `submodule.recurse` (git follows whichever of the
+two it reads last), git-agent checks that the submodule commits the branch points to are on
+the submodule's remote, and stops if they aren't. Push them from the submodule first. A
+value that git push doesn't accept in either setting stops git-agent before it fetches
+anything.
 
 If the push fails, the commit stays. Fix the problem and run `git push`.
 
 ### When the remote has new commits
 
-Before pushing, git-agent fetches from the remote. If the remote has commits you don't
-have, such as a file you edited on GitHub, it lists them and rebases your commit on
-top of them. Your history stays linear and the remote commits stay as they are. From
-the review menu, git-agent asks before it rebases; `--commit --push` rebases without
-asking. Any uncommitted changes are set aside during the rebase and restored
+Before pushing, git-agent fetches the remote it pushes to, from that remote's fetch URL, with
+`--prune`, so the remote-tracking branches of branches deleted there are removed, as with
+`git fetch --prune`; your local tags stay. For a fork, where `pushRemote` sends the branch somewhere
+other than its upstream, git-agent also fetches the upstream's remote. If the upstream has
+commits you don't have, such as a file you edited on GitHub, it lists them and rebases
+your commit on top of them. Your history stays linear and the remote commits stay as they
+are. From the review menu, git-agent asks before it rebases; `--commit --push` rebases
+without asking. Any uncommitted changes are set aside during the rebase and restored
 afterwards.
 
 ### Conflicts
@@ -657,8 +671,11 @@ and says where its changes are. A merge, or a commit that HEAD has moved on from
 where it is, and git-agent says to take the secrets out before you push it.
 
 Before every push, after any rebase onto the remote, git-agent checks each commit the
-push would send, including its message, because a secret that a later commit removes
-is still in the history. `git agent pr` checks every commit on the branch the same way
+push would send, which is every commit that none of the branches where it goes has,
+including its message, because a secret that a later commit removes is still in the history.
+A remote that pushes somewhere other than where it fetches from, such as one with a
+`pushurl` or a second `url`, is asked what each of those places has. git-agent then pushes
+the commit it checked. `git agent pr` checks every commit on the branch the same way
 before it writes the pull request. A secret on a line that your change leaves alone or
 removes doesn't stop anything; git-agent only lists it.
 

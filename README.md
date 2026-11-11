@@ -250,7 +250,13 @@ commits, ordered so that each builds on those before it. If the plan leaves out 
 or more parts, git-agent asks the model once more to place them, and keeps whichever
 plan leaves out fewer. A part still left out joins the commit with the rest of its file,
 or a last commit. When the hunks are too many to show the model one by one, it groups
-whole files instead. Commits that only change documentation go last in a new plan.
+whole files instead. In a new plan, commits that only change documentation go last, and a
+commit whose added code refers to a new file comes after the commit that adds it. A
+reference is a module's name in a Rust path, such as `use crate::safe_text`, or a new
+file's full name in any added line of code, such as `guide.md`, if no other file has that
+name. For a Rust module, the file comes first, then its `mod` line, then the code that uses
+it. Commits that need each other's new files become one commit, and git-agent says so
+before the review.
 
 ### Reviewing the plan
 

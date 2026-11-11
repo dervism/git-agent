@@ -7,21 +7,48 @@
 
 use super::lossless;
 use crate::safe_text::{NAMED_ESCAPES, one_line};
+use std::collections::HashSet;
 
 /// The readable name of the file a part of a diff is about: its new name if it
 /// was renamed or copied. `file` starts with the "diff --git" line, or a merge's
 /// "diff --cc" line, which is all it needs to hold.
 pub fn of_diff(file: &str) -> String {
-    let mut lines = file.lines();
-    let header = lines.next().unwrap_or_default();
-    let new_name = lines
-        .take_while(|line| !line.starts_with("@@"))
-        .find_map(|line| {
-            line.strip_prefix("rename to ")
-                .or_else(|| line.strip_prefix("copy to "))
-        });
+    let header = file.lines().next().unwrap_or_default();
+    let new_name = rename_line(file, &["rename to ", "copy to "]);
     let name = new_name.map_or_else(|| from_header(header), unquoted);
     one_line(&name)
+}
+
+/// The readable name a renamed or copied file had before, if `file` (a part of a diff)
+/// says that it was renamed or copied.
+pub fn source_of_diff(file: &str) -> Option<String> {
+    rename_line(file, &["rename from ", "copy from "]).map(|name| one_line(&unquoted(name)))
+}
+
+/// What follows one of `prefixes` on the first header line that starts with one.
+fn rename_line<'a>(file: &'a str, prefixes: &[&str]) -> Option<&'a str> {
+    file.lines()
+        .skip(1)
+        .take_while(|line| !line.starts_with("@@"))
+        .find_map(|line| prefixes.iter().find_map(|prefix| line.strip_prefix(prefix)))
+}
+
+/// The one of `candidates`, names of files without their folders in the form [`shown`] gives,
+/// that is the name of the file `listed` names: an entry of `git ls-tree -z --name-only`, with
+/// its NUL. A name of plain letters, digits and `._-` is already in that form, and is looked
+/// up as it is.
+pub fn candidate_in_listing(listed: &[u8], candidates: &HashSet<String>) -> Option<String> {
+    let path = listed.strip_suffix(&[0]).unwrap_or(listed);
+    let name = path.rsplit(|byte| *byte == b'/').next().unwrap_or(path);
+    let plain = name
+        .iter()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'));
+    if plain {
+        let name = std::str::from_utf8(name).ok()?;
+        return candidates.contains(name).then(|| name.to_owned());
+    }
+    let readable = shown(&lossless::to_text(name));
+    candidates.contains(&readable).then_some(readable)
 }
 
 /// `name`, as git-agent reads it from git, in the form to show people.
@@ -246,6 +273,65 @@ mod tests {
         let quoted = "diff --git a/old.txt \"b/ny\\303\\246\\t.txt\"\n\
                       rename from old.txt\nrename to \"ny\\303\\246\\t.txt\"\n";
         assert_eq!(of_diff(quoted), "nyæ\\t.txt");
+    }
+
+    #[test]
+    fn finds_the_name_a_renamed_or_copied_file_had() {
+        let renamed = "diff --git a/old æ.txt b/new.txt\nsimilarity index 90%\n\
+                       rename from old æ.txt\nrename to new.txt\n";
+        assert_eq!(source_of_diff(renamed).as_deref(), Some("old æ.txt"));
+        let copied = "diff --git a/old.txt b/new.txt\ncopy from old.txt\ncopy to new.txt\n";
+        assert_eq!(source_of_diff(copied).as_deref(), Some("old.txt"));
+        let quoted = "diff --git \"a/caf\\303\\251.rs\" \"b/sub/caf\\303\\251.rs\"\n\
+                      rename from \"caf\\303\\251.rs\"\nrename to \"sub/caf\\303\\251.rs\"\n";
+        assert_eq!(source_of_diff(quoted).as_deref(), Some("café.rs"));
+        assert_eq!(of_diff(quoted), "sub/café.rs");
+        let control = "diff --git a/a b/b\nrename from \"t\\tb\"\nrename to b\n";
+        assert_eq!(source_of_diff(control).as_deref(), Some("t\\tb"));
+    }
+
+    #[test]
+    fn has_no_source_for_a_file_that_wasnt_renamed_or_copied() {
+        assert_eq!(source_of_diff("diff --git a/x.txt b/x.txt\n"), None);
+        assert_eq!(source_of_diff(""), None);
+        let new_file = "diff --git a/x.txt b/x.txt\nnew file mode 100644\n";
+        assert_eq!(source_of_diff(new_file), None);
+    }
+
+    #[test]
+    fn doesnt_read_a_source_from_the_changed_lines() {
+        let diff =
+            "diff --git a/x.txt b/x.txt\n@@ -1 +1 @@\nrename from y.txt\n+rename from z.txt\n";
+        assert_eq!(source_of_diff(diff), None);
+    }
+
+    #[test]
+    fn finds_the_candidate_a_listed_path_names() {
+        let found = |listed: &[u8]| candidate_in_listing(listed, &candidates());
+        assert_eq!(found(b"guide.md\0").as_deref(), Some("guide.md"));
+        assert_eq!(found(b"deep/er/guide.md\0").as_deref(), Some("guide.md"));
+        assert_eq!(found(b"guide.md").as_deref(), Some("guide.md"));
+        assert_eq!(found(b"x/a-b_c.d\0").as_deref(), Some("a-b_c.d"));
+        assert_eq!(found(b"src/other.md\0"), None);
+        assert_eq!(found(b"guide.md/other.md\0"), None);
+        assert_eq!(found(b""), None);
+        assert_eq!(found(b"/\0"), None);
+    }
+
+    #[test]
+    fn finds_the_candidate_a_listed_path_names_when_its_name_isnt_plain() {
+        let found = |listed: &[u8]| candidate_in_listing(listed, &candidates());
+        let utf8 = found("src/Kjøre.txt\0".as_bytes());
+        assert_eq!(utf8.as_deref(), Some("Kjøre.txt"));
+        let tab = found(b"src/tab\there.txt\0");
+        assert_eq!(tab.as_deref(), Some("tab\\there.txt"));
+        assert_eq!(found(b"src/Kj\xf8re.txt\0"), None);
+    }
+
+    fn candidates() -> HashSet<String> {
+        ["guide.md", "Kjøre.txt", "tab\\there.txt", "a-b_c.d"]
+            .map(str::to_owned)
+            .into()
     }
 
     #[test]

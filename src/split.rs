@@ -12,6 +12,7 @@ pub mod command;
 pub mod dry_run;
 pub mod flow;
 pub mod kinds;
+pub mod references;
 pub mod signals;
 
 use crate::conversation::fit;
@@ -63,10 +64,45 @@ struct Hunk {
     body: String,
 }
 
+/// A line of a hunk that is in the file after the change.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Line<'a> {
+    Added(&'a str),
+    Kept(&'a str),
+}
+
+impl Hunk {
+    /// The lines of the hunk that are in the file after the change, in order: the added
+    /// ones, and the unchanged ones around them. Removed lines and the notes about line
+    /// endings are left out.
+    fn lines(&self) -> impl Iterator<Item = Line<'_>> {
+        self.body
+            .lines()
+            .filter_map(|line| match line.chars().next() {
+                Some('+') => Some(Line::Added(&line[1..])),
+                Some('-' | '\\') => None,
+                _ => Some(Line::Kept(line.get(1..).unwrap_or_default())),
+            })
+    }
+}
+
 impl FilePatch {
     /// Whether the file's hunks can go into different commits.
     fn splittable(&self) -> bool {
         self.status.is_none() && !self.excluded && self.hunks.len() > 1
+    }
+
+    /// The hunks of the part of the file that `unit` holds.
+    fn hunks_of(&self, unit: Unit) -> &[Hunk] {
+        match unit.hunk {
+            Some(index) => &self.hunks[index..=index],
+            None => &self.hunks[..],
+        }
+    }
+
+    /// The name a renamed or copied file had before.
+    fn source(&self) -> Option<String> {
+        names::source_of_diff(&self.header)
     }
 }
 
@@ -265,11 +301,8 @@ fn lines(files: &[FilePatch], unit: Unit) -> String {
     if file.excluded || matches!(file.status, Some("binary" | "deleted")) {
         return String::new();
     }
-    let hunks = match unit.hunk {
-        Some(index) => &file.hunks[index..=index],
-        None => &file.hunks[..],
-    };
-    let shown: String = hunks
+    let shown: String = file
+        .hunks_of(unit)
         .iter()
         .flat_map(|hunk| hunk.body.split_inclusive('\n'))
         .filter(|line| !line.starts_with('\\'))
@@ -298,6 +331,17 @@ pub struct Planned {
     pub title: String,
     /// Indexes into the units.
     pub units: Vec<usize>,
+}
+
+#[cfg(test)]
+impl Plan {
+    /// The titles of the commits, in order.
+    pub fn titles(&self) -> Vec<&str> {
+        self.commits
+            .iter()
+            .map(|commit| commit.title.as_str())
+            .collect()
+    }
 }
 
 impl Plan {
@@ -664,17 +708,22 @@ pub fn merge_failed(plan: &Plan, passed: &[bool]) -> Vec<Merged> {
 }
 
 fn merge(commits: &[Planned], from: Range<usize>) -> Merged {
-    let parts = &commits[from.clone()];
-    let titles: Vec<&str> = parts.iter().map(|commit| commit.title.as_str()).collect();
+    let parts: Vec<&Planned> = commits[from.clone()].iter().collect();
     Merged {
-        commit: Planned {
-            title: titles.join("; "),
-            units: parts
-                .iter()
-                .flat_map(|commit| commit.units.iter().copied())
-                .collect(),
-        },
+        commit: combined(&parts),
         from,
+    }
+}
+
+/// One commit that holds all of `parts`, with their titles joined.
+fn combined(parts: &[&Planned]) -> Planned {
+    let titles: Vec<&str> = parts.iter().map(|commit| commit.title.as_str()).collect();
+    Planned {
+        title: titles.join("; "),
+        units: parts
+            .iter()
+            .flat_map(|commit| commit.units.iter().copied())
+            .collect(),
     }
 }
 
@@ -691,15 +740,19 @@ pub fn merge_notes(plan: &Plan, merged: &[Merged]) -> Vec<String> {
     merged
         .iter()
         .filter(|merge| merge.from.len() > 1)
-        .map(|merge| {
-            let titles: Vec<String> = plan.commits[merge.from.clone()]
-                .iter()
-                .map(|commit| format!("\"{}\"", commit.title))
-                .collect();
-            let (last, others) = titles.split_last().expect("a merge holds commits");
-            format!("{} and {last} became one commit", others.join(", "))
-        })
+        .map(|merge| became_one(&plan.commits[merge.from.clone()].iter().collect::<Vec<_>>()))
         .collect()
+}
+
+/// Says that `parts` became one commit, by their titles, because their numbers change as
+/// they merge.
+fn became_one(parts: &[&Planned]) -> String {
+    let titles: Vec<String> = parts
+        .iter()
+        .map(|commit| format!("\"{}\"", commit.title))
+        .collect();
+    let (last, others) = titles.split_last().expect("a merge holds commits");
+    format!("{} and {last} became one commit", others.join(", "))
 }
 
 /// A patch that adds a commit's units to HEAD.
@@ -786,6 +839,25 @@ pub fn patch(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reads_the_lines_of_a_hunk_that_are_in_the_file_after_the_change() {
+        let patch = "diff --git a/f.rs b/f.rs\n--- a/f.rs\n+++ b/f.rs\n@@ -1,4 +1,4 @@\n\
+                     -use crate::safe_text;\n use crate::config;\n+let x = 1;\n\
+                     \\ No newline at end of file\n \n\n+a + b\n";
+        let files = parse(patch, &HashSet::from(["f.rs".to_owned()]));
+        let lines: Vec<Line<'_>> = files[0].hunks[0].lines().collect();
+        assert_eq!(
+            lines,
+            [
+                Line::Kept("use crate::config;"),
+                Line::Added("let x = 1;"),
+                Line::Kept(""),
+                Line::Kept(""),
+                Line::Added("a + b"),
+            ]
+        );
+    }
     use crate::git::test_support::{numbered_lines as lines, run};
     use crate::git::{Repo, Scope};
     use std::fs;

@@ -5,6 +5,7 @@ use super::check::{self, CommitCheck, Progress};
 use super::command::BuildCheck;
 use super::dry_run::{CommitPlan, Snapshot, dry_run};
 use super::kinds::{self, Kind};
+use super::references;
 use super::{Committed, FilePatch, Patch, Plan, Planned, Unit};
 use crate::cli::SplitArgs;
 use crate::config::{Config, Overrides};
@@ -24,6 +25,7 @@ use crate::staging::{self, Purpose, Staged};
 use crate::ui;
 use crate::{prompt, split};
 use anyhow::{Context, Result, bail};
+use std::collections::HashSet;
 use std::fs;
 use std::io::{self, IsTerminal};
 use std::time::Duration;
@@ -123,6 +125,8 @@ struct Work {
     changes: Changes,
     files: Vec<FilePatch>,
     snapshot: Snapshot,
+    /// The names of the files in HEAD, which a new file's name can't be taken for.
+    names_in_head: HashSet<String>,
     /// What the secret check before the model read in them, which the checks at each commit
     /// don't list again.
     found: Scanned,
@@ -159,11 +163,13 @@ fn changes_to_split(repo: &Repo, args: &SplitArgs, config: &Config) -> Result<Op
         return Ok(None);
     }
     let snapshot = Snapshot::take(repo, scope, &patch)?;
+    let names_in_head = repo.names_in_head(&references::candidate_file_names(&files))?;
     Ok(Some(Work {
         scope,
         changes,
         files,
         snapshot,
+        names_in_head,
         found,
     }))
 }
@@ -396,10 +402,19 @@ impl<S: ModelServer> Splitter<'_, S> {
         Ok(reviewed)
     }
 
-    /// A plan the user hasn't had a say in yet, with documentation last.
+    /// A plan the user hasn't had a say in yet, with documentation last, except where
+    /// a commit needs a new file that another one adds: that one comes before it.
     async fn new_plan(&self, conversation: &[Message]) -> Result<Plan> {
         let plan = self.ask_for_plan(conversation).await?;
-        Ok(kinds::docs_last(plan, &self.work.files, self.units))
+        let plan = kinds::docs_last(plan, &self.work.files, self.units);
+        let ordered = references::new_files_first(
+            plan,
+            &self.work.files,
+            self.units,
+            &self.work.names_in_head,
+        );
+        report_merged(&ordered.notes, "they use each other's new files");
+        Ok(ordered.plan)
     }
 
     /// A plan revised with the user's feedback, in the order the model gives,
@@ -981,12 +996,22 @@ mod tests {
         lines: &[&str],
         with: impl AsyncFnOnce(&Splitter<'_, FakeServer<'_>>) -> R,
     ) -> (R, usize) {
-        let (_dir, repo) = staged_three_parts();
+        with_a_splitter(staged_three_parts(), DOCS_USES_DEFS, lines, with).await
+    }
+
+    /// Runs `with` on a splitter of the changes staged in `staged`, whose model plans
+    /// `plan` and whose person types `lines`, and returns what is left.
+    async fn with_a_splitter<R>(
+        (_dir, repo): (TempDir, Repo),
+        plan: &str,
+        lines: &[&str],
+        with: impl AsyncFnOnce(&Splitter<'_, FakeServer<'_>>) -> R,
+    ) -> (R, usize) {
         let args = args(true, None);
         let config = Config::default();
         let work = changes_to_split(&repo, &args, &config).unwrap().unwrap();
         let units = split::describe(&work.files, 100_000).unwrap().units;
-        let server = ScriptedModel::new(DOCS_USES_DEFS, "feat: x").server();
+        let server = ScriptedModel::new(plan, "feat: x").server();
         let person = ScriptedPerson::typing(lines);
         let splitter = Splitter {
             repo: &repo,
@@ -1121,6 +1146,124 @@ mod tests {
     /// uses.txt, in that order: the docs first, then uses.txt before defs.txt.
     const DOCS_USES_DEFS: &str = r#"{"commits":[{"title":"Update the readme","units":[1]},
         {"title":"Add uses","units":[3]},{"title":"Add defs","units":[2]}]}"#;
+
+    /// Stages a new docs/guide.md, which main.rs includes, while HEAD has a guide.md of its
+    /// own. Its units are docs/guide.md and main.rs.
+    fn staged_guide_named_like_a_file_in_head() -> (TempDir, Repo) {
+        let (dir, repo) = isolated_repo();
+        write(dir.path(), "main.rs", "fn main() {}\n");
+        write(dir.path(), "guide.md", "old\n");
+        run(dir.path(), &["add", "--all"]);
+        run(dir.path(), &["commit", "-q", "-m", "add the program"]);
+        write(
+            dir.path(),
+            "main.rs",
+            "const G: &str = include_str!(\"guide.md\");\n",
+        );
+        fs::create_dir(dir.path().join("docs")).unwrap();
+        write(dir.path(), "docs/guide.md", "new\n");
+        run(dir.path(), &["add", "--all"]);
+        (dir, repo)
+    }
+
+    const GUIDE_AFTER_ITS_USE: &str = r#"{"commits":[{"title":"Use the guide","units":[2]},
+        {"title":"Add the guide","units":[1]}]}"#;
+
+    /// Stages main.rs declaring three modules, and their new files, of which report.rs and
+    /// staging.rs use the modules of the others.
+    fn staged_modules_that_use_each_other() -> (TempDir, Repo) {
+        let (dir, repo) = isolated_repo();
+        write(dir.path(), "main.rs", "fn main() {}\n");
+        run(dir.path(), &["add", "--all"]);
+        run(dir.path(), &["commit", "-q", "-m", "add the program"]);
+        let declarations = "mod report;\nmod safe_text;\nmod staging;\n\
+                            fn main() {\n    println!(\"{}\", staging::stage());\n}\n";
+        write(dir.path(), "main.rs", declarations);
+        write(
+            dir.path(),
+            "report.rs",
+            "use crate::safe_text::escaped;\n\npub fn report() -> String {\n    escaped()\n}\n",
+        );
+        write(
+            dir.path(),
+            "safe_text.rs",
+            "pub fn escaped() -> String {\n    String::new()\n}\n",
+        );
+        write(
+            dir.path(),
+            "staging.rs",
+            "use crate::report::report;\n\npub fn stage() -> String {\n    report()\n}\n",
+        );
+        run(dir.path(), &["add", "--all"]);
+        (dir, repo)
+    }
+
+    /// Stages a use of a new module in report.rs, its declaration in main.rs, and its file,
+    /// on top of a program that has main.rs and report.rs. Its units are main.rs, report.rs and
+    /// safe_text.rs, in that order.
+    fn staged_use_of_a_new_module() -> (TempDir, Repo) {
+        let (dir, repo) = isolated_repo();
+        let main = "mod report;\n\nfn main() {\n    println!(\"{}\", report::report());\n}\n";
+        write(dir.path(), "main.rs", main);
+        let report = "pub fn report() -> String {\n    String::new()\n}\n";
+        write(dir.path(), "report.rs", report);
+        run(dir.path(), &["add", "--all"]);
+        run(dir.path(), &["commit", "-q", "-m", "add the program"]);
+        write(dir.path(), "main.rs", &format!("mod safe_text;\n{main}"));
+        let report =
+            "use crate::safe_text::escaped;\n\npub fn report() -> String {\n    escaped()\n}\n";
+        write(dir.path(), "report.rs", report);
+        let safe_text = "pub fn escaped() -> String {\n    String::new()\n}\n";
+        write(dir.path(), "safe_text.rs", safe_text);
+        run(dir.path(), &["add", "--all"]);
+        (dir, repo)
+    }
+
+    /// A plan for [`staged_use_of_a_new_module`]: the use, the declaration, then the file.
+    const USE_FIRST: &str = r#"{"commits":[{"title":"Use the module","units":[2]},
+        {"title":"Declare the module","units":[1]},{"title":"Add the file","units":[3]}]}"#;
+
+    /// A check that compiles main.rs and its modules with rustc, as a library, keeping what
+    /// it makes in `out`, a folder that isn't in the repository.
+    fn compiles_with_rustc(out: &TempDir) -> String {
+        format!(
+            "rustc --edition 2024 --crate-type lib --emit=metadata --out-dir '{}' main.rs",
+            out.path().display()
+        )
+    }
+
+    /// A plan for [`staged_modules_that_use_each_other`], whose units are main.rs, report.rs,
+    /// safe_text.rs and staging.rs, in that order: the declarations first, the files after.
+    const DECLARATIONS_FIRST: &str = r#"{"commits":[{"title":"Declare the modules","units":[1]},
+        {"title":"Add staging","units":[4]},{"title":"Add report","units":[2]},
+        {"title":"Add safe_text","units":[3]}]}"#;
+
+    /// Stages a new README text, a `mod safe_text;` line in main.rs, and new report.rs and
+    /// safe_text.rs files, of which report.rs uses safe_text.
+    fn staged_new_module() -> (TempDir, Repo) {
+        let (dir, repo) = isolated_repo();
+        write(dir.path(), "README.md", "old\n");
+        write(dir.path(), "main.rs", "fn main() {}\n");
+        run(dir.path(), &["add", "--all"]);
+        run(dir.path(), &["commit", "-q", "-m", "add the program"]);
+        write(dir.path(), "README.md", "new\n");
+        write(dir.path(), "main.rs", "mod safe_text;\nfn main() {}\n");
+        write(dir.path(), "report.rs", "use crate::safe_text::escaped;\n");
+        write(dir.path(), "safe_text.rs", "pub fn escaped() {}\n");
+        run(dir.path(), &["add", "--all"]);
+        (dir, repo)
+    }
+
+    /// A plan for [`staged_new_module`], whose units are README.md, main.rs, report.rs and
+    /// safe_text.rs, in that order: the readme first, then the users of safe_text, then its
+    /// file.
+    const MODULE_LAST: &str = r#"{"commits":[{"title":"Update the readme","units":[1]},
+        {"title":"Add the report","units":[3]},{"title":"Declare the module","units":[2]},
+        {"title":"Add safe_text","units":[4]}]}"#;
+
+    /// Passes unless main.rs declares safe_text without its file, or report.rs is there
+    /// while main.rs doesn't declare the module it uses.
+    const NEEDS_FILE_AND_DECLARATION: &str = r#"! grep -q "mod safe_text" main.rs || test -f safe_text.rs || { echo "error: no file for safe_text"; exit 1; }; test ! -f report.rs || grep -q "mod safe_text" main.rs || { echo "error: safe_text isn't declared"; exit 1; }"#;
 
     /// Passes unless uses.txt is there without defs.txt.
     const NEEDS_DEFS: &str =
@@ -1379,8 +1522,6 @@ mod tests {
 
     #[tokio::test]
     async fn moves_docs_last_in_a_new_plan_but_keeps_the_order_of_a_refined_one() {
-        let titles =
-            |plan: &Plan| -> Vec<String> { plan.commits.iter().map(|c| c.title.clone()).collect() };
         let conversation = [Message::system(prompt::SPLIT_PROMPT)];
 
         let ((new, refined), _) = with_a_person_typing(&[], async |splitter| {
@@ -1393,11 +1534,125 @@ mod tests {
         })
         .await;
 
-        assert_eq!(titles(&new), ["Add uses", "Add defs", "Update the readme"]);
+        assert_eq!(new.titles(), ["Add uses", "Add defs", "Update the readme"]);
         assert_eq!(
-            titles(&refined),
+            refined.titles(),
             ["Update the readme", "Add uses", "Add defs"]
         );
+    }
+
+    #[tokio::test]
+    async fn puts_a_new_file_before_its_users_in_a_new_plan_but_not_in_a_refined_one() {
+        let conversation = [Message::system(prompt::SPLIT_PROMPT)];
+        let ((new, refined), _) =
+            with_a_splitter(staged_new_module(), MODULE_LAST, &[], async |splitter| {
+                let new = splitter.new_plan(&conversation).await.unwrap();
+                let refined = splitter
+                    .refined_plan(&conversation, &new, "keep it")
+                    .await
+                    .unwrap();
+                (new, refined)
+            })
+            .await;
+
+        assert_eq!(
+            new.titles(),
+            [
+                "Add safe_text",
+                "Declare the module",
+                "Add the report",
+                "Update the readme"
+            ]
+        );
+        assert_eq!(
+            refined.titles(),
+            [
+                "Update the readme",
+                "Add the report",
+                "Declare the module",
+                "Add safe_text"
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn keeps_the_order_when_a_file_in_head_has_the_name_a_line_mentions() {
+        let conversation = [Message::system(prompt::SPLIT_PROMPT)];
+        let (plan, _) = with_a_splitter(
+            staged_guide_named_like_a_file_in_head(),
+            GUIDE_AFTER_ITS_USE,
+            &[],
+            async |splitter| splitter.new_plan(&conversation).await.unwrap(),
+        )
+        .await;
+        assert_eq!(plan.titles(), ["Use the guide", "Add the guide"]);
+    }
+
+    #[tokio::test]
+    async fn puts_a_new_file_before_its_users_in_a_regenerated_plan() {
+        let (reviewed, left) = with_a_splitter(
+            staged_new_module(),
+            MODULE_LAST,
+            &["r", "c"],
+            async |splitter| {
+                let conversation = [Message::system(prompt::SPLIT_PROMPT)];
+                let plan = splitter.new_plan(&conversation).await.unwrap();
+                splitter.review_plan(plan, &conversation).await.unwrap()
+            },
+        )
+        .await;
+        let (plan, _) = reviewed.unwrap();
+        assert_eq!(left, 0);
+        assert_eq!(plan.titles()[0], "Add safe_text");
+    }
+
+    #[tokio::test]
+    async fn makes_four_commits_of_files_that_use_each_other_before_the_declarations() {
+        let (dir, repo) = staged_modules_that_use_each_other();
+        let server = ScriptedModel::new(DECLARATIONS_FIRST, "feat: change something").server();
+        let out = TempDir::new().unwrap();
+        let check = compiles_with_rustc(&out);
+        split(&repo, &args(true, Some(&check)), &server)
+            .await
+            .unwrap();
+        assert_eq!(files_of_commit(dir.path(), "HEAD~3"), ["staging.rs"]);
+        assert_eq!(files_of_commit(dir.path(), "HEAD~2"), ["report.rs"]);
+        assert_eq!(files_of_commit(dir.path(), "HEAD~1"), ["safe_text.rs"]);
+        assert_eq!(files_of_commit(dir.path(), "HEAD"), ["main.rs"]);
+        assert!(run(dir.path(), &["status", "--porcelain"]).is_empty());
+    }
+
+    #[tokio::test]
+    async fn makes_the_file_then_the_declaration_then_the_use_and_the_compiler_passes_each() {
+        let (dir, repo) = staged_use_of_a_new_module();
+        let server = ScriptedModel::new(USE_FIRST, "feat: change something").server();
+        let out = TempDir::new().unwrap();
+        let check = compiles_with_rustc(&out);
+        split(&repo, &args(true, Some(&check)), &server)
+            .await
+            .unwrap();
+        assert_eq!(files_of_commit(dir.path(), "HEAD~2"), ["safe_text.rs"]);
+        assert_eq!(files_of_commit(dir.path(), "HEAD~1"), ["main.rs"]);
+        assert_eq!(files_of_commit(dir.path(), "HEAD"), ["report.rs"]);
+        assert!(run(dir.path(), &["status", "--porcelain"]).is_empty());
+    }
+
+    #[tokio::test]
+    async fn makes_the_file_then_the_declaration_then_the_use_and_every_commit_passes() {
+        let (dir, repo) = staged_new_module();
+        let server = ScriptedModel::new(MODULE_LAST, "feat: change something").server();
+        split(
+            &repo,
+            &args(true, Some(NEEDS_FILE_AND_DECLARATION)),
+            &server,
+        )
+        .await
+        .unwrap();
+        assert_eq!(files_of_commit(dir.path(), "HEAD~3"), ["safe_text.rs"]);
+        assert_eq!(files_of_commit(dir.path(), "HEAD~2"), ["main.rs"]);
+        assert_eq!(files_of_commit(dir.path(), "HEAD~1"), ["report.rs"]);
+        assert_eq!(files_of_commit(dir.path(), "HEAD"), ["README.md"]);
+        assert!(run(dir.path(), &["status", "--porcelain"]).is_empty());
     }
 
     #[tokio::test]

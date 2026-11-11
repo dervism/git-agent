@@ -572,6 +572,25 @@ impl Repo {
             .collect())
     }
 
+    /// Which of `candidates`, names of files without their folders in the form
+    /// [`names::shown`] gives, are names of files HEAD holds. Nothing is read when there are no
+    /// candidates, and what is read isn't held: the names go by one at a time.
+    pub fn names_in_head(&self, candidates: &HashSet<String>) -> Result<HashSet<String>> {
+        if candidates.is_empty() {
+            return Ok(HashSet::new());
+        }
+        let args = ["ls-tree", "-r", "--full-tree", "--name-only", "-z", "HEAD"];
+        stream_of(self.command(&args), &args, |output| {
+            let mut found = HashSet::new();
+            let mut path = Vec::new();
+            while output.read_until(0, &mut path)? > 0 {
+                found.extend(names::candidate_in_listing(&path, candidates));
+                path.clear();
+            }
+            Ok(found)
+        })
+    }
+
     /// Writes the index as a tree and returns its hash.
     pub fn write_tree(&self) -> Result<String> {
         Ok(self.git(&["write-tree"])?.trim().to_owned())
@@ -3027,6 +3046,53 @@ mod tests {
             .unwrap();
         let expected = ["Kjøre.txt", "tab\\there.txt"].map(str::to_owned);
         assert_eq!(included, HashSet::from(expected));
+    }
+
+    #[test]
+    fn finds_the_names_of_the_candidates_among_the_files_in_head() {
+        let (dir, repo) = setup();
+        fs::create_dir_all(dir.path().join("deep/er")).unwrap();
+        for name in [
+            "Kjøre.txt",
+            "deep/guide.md",
+            "deep/er/guide.md",
+            "deep/er/tab\there.txt",
+        ] {
+            fs::write(dir.path().join(name), "en\n").unwrap();
+        }
+        run(dir.path(), &["add", "--all"]);
+        run(dir.path(), &["commit", "-q", "-m", "add files"]);
+        fs::write(dir.path().join("staged.txt"), "en\n").unwrap();
+        run(dir.path(), &["add", "--all"]);
+        let sub = Repo::open(dir.path().join("deep")).unwrap();
+        let candidates: HashSet<String> = [
+            "Kjøre.txt",
+            "guide.md",
+            "tab\\there.txt",
+            "staged.txt",
+            "deep",
+            "er",
+            "new.md",
+        ]
+        .map(str::to_owned)
+        .into();
+        let expected: HashSet<String> = ["Kjøre.txt", "guide.md", "tab\\there.txt"]
+            .map(str::to_owned)
+            .into();
+        for repo in [&repo, &sub] {
+            assert_eq!(repo.names_in_head(&candidates).unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn reads_no_names_when_there_are_no_candidates() {
+        let dir = TempDir::new().unwrap();
+        run(dir.path(), &["init", "-q", "--initial-branch", "main"]);
+        let repo = Repo::open(dir.path()).unwrap();
+        assert!(repo.names_in_head(&HashSet::new()).unwrap().is_empty());
+        let candidates = HashSet::from(["guide.md".to_owned()]);
+        let error = repo.names_in_head(&candidates).unwrap_err();
+        assert!(format!("{error:#}").contains("HEAD"), "{error:#}");
     }
 
     #[test]

@@ -48,6 +48,12 @@ fn kind_of_file(file: &FilePatch) -> Option<Kind> {
     }
 }
 
+/// Whether the file is documentation by its name, as it is now: where a renamed file came
+/// from doesn't matter to what its lines can refer to.
+pub fn is_documentation(file: &FilePatch) -> bool {
+    kind_of_path(&file.path) == Some(Kind::Docs)
+}
+
 /// `.txt` isn't documentation, because of files such as `CMakeLists.txt`.
 fn kind_of_path(path: &str) -> Option<Kind> {
     let path = Path::new(path);
@@ -249,12 +255,20 @@ mod tests {
                 commit("c", &[3]),
             ],
         };
-        let titles: Vec<String> = docs_last(plan, &files, &units)
-            .commits
-            .into_iter()
-            .map(|commit| commit.title)
-            .collect();
-        assert_eq!(titles, ["a", "c", "readme", "docs"]);
+        let ordered = docs_last(plan, &files, &units);
+        assert_eq!(ordered.titles(), ["a", "c", "readme", "docs"]);
+    }
+
+    #[test]
+    fn takes_a_renamed_file_for_documentation_by_its_new_name() {
+        let to_markdown = "diff --git a/code.rs b/moved.md\nsimilarity index 90%\n\
+                           rename from code.rs\nrename to moved.md";
+        let to_code = "diff --git a/guide.md b/guide.rs\nsimilarity index 90%\n\
+                       rename from guide.md\nrename to guide.rs";
+        let files = parsed(&[to_markdown, to_code, &changed("README.md")]);
+        assert!(is_documentation(&files[0]));
+        assert!(!is_documentation(&files[1]));
+        assert!(is_documentation(&files[2]));
     }
 
     #[test]

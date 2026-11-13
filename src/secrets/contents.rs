@@ -2,8 +2,9 @@
 //! byte in, and those `.gitattributes` marks `-diff` or `binary`. A diff shows no lines of them,
 //! so their blobs are read instead.
 
+use super::finding::{Change, FileRef, Finding, Place};
 use super::lines::{Line, Lines};
-use super::redact::{self, Change, Finding, Held, LineScan, SecretLine};
+use super::redact::{self, Held, LineScan, SecretLine};
 use crate::git::blob::BlobBatch;
 use crate::git::{Repo, diff, names};
 use anyhow::{Context, Result, bail};
@@ -27,7 +28,7 @@ const SHORTEST_RUN: usize = 8;
 #[derive(Debug, Clone, PartialEq)]
 pub struct BinaryFile {
     /// Where it is, as a finding names it.
-    pub place: String,
+    pub place: FileRef,
     /// The blob of its new content.
     pub result: String,
     /// The blobs of what it was in each parent that had it.
@@ -37,7 +38,7 @@ pub struct BinaryFile {
 /// A binary file over [`MOST_BINARY_BYTES`], which isn't checked.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Unchecked {
-    pub place: String,
+    pub place: FileRef,
     pub size: u64,
 }
 
@@ -137,7 +138,7 @@ impl BinaryFiles {
     /// can be given by its start, since only a line's start tells this anything.
     pub fn line(&mut self, line: &str) -> Result<()> {
         if diff::is_file_header(line) {
-            let place = names::of_diff(line);
+            let place = FileRef::changed(names::of_diff(line));
             let done = std::mem::replace(
                 &mut self.section,
                 Section {
@@ -166,7 +167,7 @@ impl BinaryFiles {
 /// What a diff says of one file, as far as reading it whole goes.
 #[derive(Default)]
 struct Section {
-    place: String,
+    place: FileRef,
     blobs: Option<(Vec<String>, String)>,
     hunks: bool,
     binary: bool,
@@ -369,7 +370,7 @@ fn findings_in(
         };
         let number = text.then_some(line.number);
         line.kinds.iter().map(move |kind| Finding {
-            place: file.place.clone(),
+            place: Place::File(file.place.clone()),
             line: number,
             change,
             kind: kind.clone(),
@@ -601,6 +602,7 @@ mod tests {
     use super::super::lines::test_support::line_with_keys;
     use super::super::test_support::{aws_key, github_token};
     use super::*;
+    use crate::git::CommitId;
     use crate::git::test_support::{isolated_repo, run};
     use std::fs;
     use std::path::Path;
@@ -624,8 +626,12 @@ mod tests {
     }
 
     fn file(place: &str, result: &str, parents: &[&str]) -> BinaryFile {
+        file_at(FileRef::changed(place), result, parents)
+    }
+
+    fn file_at(place: FileRef, result: &str, parents: &[&str]) -> BinaryFile {
         BinaryFile {
-            place: place.to_owned(),
+            place,
             result: result.to_owned(),
             parents: parents.iter().map(ToString::to_string).collect(),
         }
@@ -728,16 +734,16 @@ mod tests {
 
         let scanned = scan(&repo, &files, MOST_BINARY_BYTES).unwrap();
 
-        let found: Vec<(&str, Option<usize>, Change)> = scanned
+        let found: Vec<(String, Option<usize>, Change)> = scanned
             .findings
             .iter()
-            .map(|finding| (finding.place.as_str(), finding.line, finding.change))
+            .map(|finding| (finding.place.to_string(), finding.line, finding.change))
             .collect();
         assert_eq!(
             found,
             [
-                ("app.env", Some(2), Change::Added),
-                ("data.bin", None, Change::Added)
+                ("app.env".to_owned(), Some(2), Change::Added),
+                ("data.bin".to_owned(), None, Change::Added)
             ]
         );
         assert!(
@@ -803,14 +809,17 @@ mod tests {
         assert_eq!(
             scanned.unchecked,
             [Unchecked {
-                place: "big.bin".to_owned(),
+                place: FileRef::changed("big.bin"),
                 size
             }]
         );
         assert_eq!(scanned.findings.len(), 1);
         assert_eq!(
-            (scanned.findings[0].place.as_str(), scanned.findings[0].line),
-            ("big.env", Some(2))
+            (
+                scanned.findings[0].place.to_string(),
+                scanned.findings[0].line
+            ),
+            ("big.env".to_owned(), Some(2))
         );
     }
 
@@ -954,11 +963,13 @@ mod tests {
             (&new, new_bytes.as_bytes()),
             (&plain, b"\0nothing\0"),
         ]);
+        let in_commit =
+            |n: &str, path: &str| FileRef::changed(path).in_commit(&CommitId::of(&n.repeat(7)));
         let files = [
-            file("commit 1 img.bin", &new, &[&old]),
-            file("commit 2 img.bin", &old, &[&new]),
-            file("commit 3 img.bin", &new, &[&old]),
-            file("commit 3 other.bin", &plain, &[&old]),
+            file_at(in_commit("1", "img.bin"), &new, &[&old]),
+            file_at(in_commit("2", "img.bin"), &old, &[&new]),
+            file_at(in_commit("3", "img.bin"), &new, &[&old]),
+            file_at(in_commit("3", "other.bin"), &plain, &[&old]),
         ];
 
         let scanned = scan_from(&mut blobs, &files, MOST_BINARY_BYTES).unwrap();
@@ -967,19 +978,19 @@ mod tests {
         blobs.read.sort();
         assert_eq!(blobs.read, [old, new, plain]);
         assert!(blobs.streamed.is_empty());
-        let changes: Vec<(&str, Change)> = scanned
+        let changes: Vec<(String, Change)> = scanned
             .findings
             .iter()
-            .map(|finding| (finding.place.as_str(), finding.change))
+            .map(|finding| (finding.place.to_string(), finding.change))
             .collect();
         assert_eq!(
             changes,
             [
-                ("commit 1 img.bin", Change::Unchanged),
-                ("commit 1 img.bin", Change::Added),
-                ("commit 2 img.bin", Change::Unchanged),
-                ("commit 3 img.bin", Change::Unchanged),
-                ("commit 3 img.bin", Change::Added),
+                ("commit 1111111 img.bin".to_owned(), Change::Unchanged),
+                ("commit 1111111 img.bin".to_owned(), Change::Added),
+                ("commit 2222222 img.bin".to_owned(), Change::Unchanged),
+                ("commit 3333333 img.bin".to_owned(), Change::Unchanged),
+                ("commit 3333333 img.bin".to_owned(), Change::Added),
             ]
         );
     }
@@ -1009,16 +1020,22 @@ mod tests {
         assert_eq!(blobs.streamed, [big_binary, big_text]);
         let size = binary_bytes.len() as u64;
         let listed = Unchecked {
-            place: "big.bin".to_owned(),
+            place: FileRef::changed("big.bin"),
             size,
         };
         assert_eq!(scanned.unchecked, [listed]);
-        let found: Vec<(&str, Option<usize>)> = scanned
+        let found: Vec<(String, Option<usize>)> = scanned
             .findings
             .iter()
-            .map(|finding| (finding.place.as_str(), finding.line))
+            .map(|finding| (finding.place.to_string(), finding.line))
             .collect();
-        assert_eq!(found, [("small.bin", None), ("big.env", Some(2))]);
+        assert_eq!(
+            found,
+            [
+                ("small.bin".to_owned(), None),
+                ("big.env".to_owned(), Some(2))
+            ]
+        );
     }
 
     #[test]
@@ -1319,16 +1336,16 @@ mod tests {
 
         let scanned = scan_from(&mut blobs, &files, 3 * WINDOW as u64).unwrap();
 
-        let changes: Vec<(&str, Change)> = scanned
+        let changes: Vec<(String, Change)> = scanned
             .findings
             .iter()
-            .map(|finding| (finding.place.as_str(), finding.change))
+            .map(|finding| (finding.place.to_string(), finding.change))
             .collect();
         assert_eq!(
             changes,
             [
-                ("same.js", Change::Unchanged),
-                ("changed.js", Change::Added)
+                ("same.js".to_owned(), Change::Unchanged),
+                ("changed.js".to_owned(), Change::Added)
             ]
         );
     }

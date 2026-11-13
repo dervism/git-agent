@@ -16,6 +16,9 @@
 /docs/iterations/
 /docs/architecture/design/
 
+# The process site: kept on this machine until it is ready to publish
+/docs/process/
+
 # Local environment and secrets
 .env
 .env.*

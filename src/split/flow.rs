@@ -19,6 +19,7 @@ use crate::git::worktree::TempWorktree;
 use crate::git::{Changes, Repo, Scope, names};
 use crate::review::{self, Action, Choice, Decline, Person, Review, Revisions, Terminal};
 use crate::secrets::contents::Scanned;
+use crate::secrets::finding::Place;
 use crate::secrets::{AtCommit, Wording, check_changes, redact, report_secrets};
 use crate::server::{Message, ModelServer};
 use crate::staging::{self, Purpose, Staged};
@@ -193,7 +194,7 @@ async fn split_changes<S: ModelServer>(
         return Ok(());
     }
     report_what_is_split(work, described.by_file);
-    let text = redact::text(&described.text, "changes").text;
+    let text = redact::text(&described.text, &Place::text("changes")).text;
     let conversation = prompt::split_messages(&text, args.hint.as_deref());
     report_model(model, tokens_in(&conversation));
 

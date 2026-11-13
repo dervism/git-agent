@@ -43,7 +43,8 @@ use git::{Changes, CommitPatch, Repo, Scope, names};
 use github::PullRequest;
 use prompt::Work;
 use review::{Action, Choice, Decline, Person, Review, Revisions, Terminal};
-use secrets::redact::{self, Finding};
+use secrets::finding::{Finding, Place};
+use secrets::redact;
 use secrets::{
     AtCommit, Wording, added, check_changes, check_commits, list_findings, report_secrets,
     warn_about_commits,
@@ -455,7 +456,7 @@ async fn pull_request(args: &PrArgs, overrides: &Overrides) -> Result<()> {
     changes.diff = redacted.text;
     let mut findings = redacted.findings;
     for commit in &mut commits {
-        let place = redact::commit_message_place(&commit.hash);
+        let place = Place::Message(Some(commit.id.clone()));
         let redacted = redact::text(&commit.message, &place);
         commit.message = redacted.text;
         findings.extend(redacted.findings);
@@ -558,7 +559,8 @@ async fn new_branch(args: &BranchArgs, overrides: &Overrides) -> Result<()> {
     } else if let Some(reference) = branch::issue_reference(description) {
         let mut found = github::issue(repo.workdir(), &reference)?;
         ui::info(format!("🔍 {}", found.summary()));
-        let redacted = redact::text(&found.body, &format!("issue #{}", found.number));
+        let place = Place::text(format!("issue #{}", found.number));
+        let redacted = redact::text(&found.body, &place);
         found.body = redacted.text;
         report_secrets(
             &redacted.findings,
@@ -654,11 +656,34 @@ fn branch_name(repo: &Repo, text: &str) -> Result<String> {
         .with_context(|| format!("{:?} can't be made into a branch name", text.trim()))
 }
 
+/// The commits in `range` to tidy, oldest first, and the secrets in their messages and patches,
+/// each named after its commit.
+fn commits_to_tidy(
+    repo: &Repo,
+    range: &str,
+    exclude: &[String],
+) -> Result<(Vec<tidy::Commit>, Vec<Finding>)> {
+    let patches: Vec<CommitPatch> = repo
+        .commit_patches(&[range], exclude)?
+        .into_iter()
+        .rev()
+        .collect();
+    let findings = patches
+        .iter()
+        .flat_map(|commit| redact::commit(&commit.id, &commit.message, &commit.patch))
+        .collect();
+    let commits = patches
+        .into_iter()
+        .map(|commit| tidy_commit(repo, commit))
+        .collect::<Result<Vec<_>>>()?;
+    Ok((commits, findings))
+}
+
 /// `commit` as tidy shows it to the model, with the names of its files when it has no diff to
 /// show, as when `exclude` leaves out the diffs of them all.
 fn tidy_commit(repo: &Repo, commit: CommitPatch) -> Result<tidy::Commit> {
     let mut tidied = tidy::Commit {
-        short: commit.hash,
+        short: commit.id.short().to_owned(),
         message: commit.message,
         patch: commit.patch,
         left_out: Vec::new(),
@@ -725,12 +750,7 @@ async fn tidy_commits(args: &TidyArgs, overrides: &Overrides) -> Result<()> {
             "there is a merge among the commits to tidy; git-agent tidies a straight line of commits"
         );
     }
-    let commits = repo
-        .commit_patches(&[&range], &config.exclude)?
-        .into_iter()
-        .rev()
-        .map(|commit| tidy_commit(&repo, commit))
-        .collect::<Result<Vec<_>>>()?;
+    let (commits, findings) = commits_to_tidy(&repo, &range, &config.exclude)?;
     if !tidy::lists_all(&hashes, &commits) {
         bail!(
             "git's log of the commits to tidy doesn't match the commits themselves, so git-agent \
@@ -745,10 +765,6 @@ async fn tidy_commits(args: &TidyArgs, overrides: &Overrides) -> Result<()> {
         commits[commits.len() - 1].short,
         safe_text::one_line(commits[commits.len() - 1].subject())
     ));
-    let findings: Vec<Finding> = commits
-        .iter()
-        .flat_map(|commit| redact::commit(&commit.short, &commit.message, &commit.patch))
-        .collect();
     let added = added(&findings);
     if !added.is_empty() {
         ui::warn(format!(
@@ -769,7 +785,7 @@ async fn tidy_commits(args: &TidyArgs, overrides: &Overrides) -> Result<()> {
         .budget()
         .user_message_bytes(prompt::TIDY_PROMPT)
         .saturating_sub(notes_bytes(args.hint.as_deref()));
-    let text = redact::text(&tidy::describe(&commits, room), "commits").text;
+    let text = redact::text(&tidy::describe(&commits, room), &Place::text("commits")).text;
     let conversation = prompt::tidy_messages(&text, args.hint.as_deref());
     report_model(&model, tokens_in(&conversation));
     let tidier = Tidier {
@@ -939,7 +955,7 @@ impl Tidier<'_> {
             changes.diff = redact::diff(&changes.diff).text;
             let mut hint = format!(
                 "The commit's current message doesn't say what it does:\n{}",
-                redact::text(&commit.message, "message").text
+                redact::text(&commit.message, &Place::text("message")).text
             );
             if let Some(extra) = &args.hint {
                 hint = format!("{hint}\n{extra}");
@@ -1062,7 +1078,7 @@ async fn explain_lines(args: &WhyArgs, overrides: &Overrides) -> Result<()> {
     if let Some(latest) = history.first() {
         status.push_str(&format!(
             ", last changed in {} ({}, {})",
-            latest.short,
+            latest.id,
             safe_text::one_line(&latest.author),
             latest.date
         ));
@@ -1080,14 +1096,15 @@ async fn explain_lines(args: &WhyArgs, overrides: &Overrides) -> Result<()> {
         )));
     }
 
-    let excerpt = redact::text(&why::excerpt(&source, lines.0, lines.1), &target.path);
-    let blame = redact::text(&why::blame_summary(&blamed, &summaries), "git blame");
+    let file = Place::file(&target.path);
+    let excerpt = redact::text(&why::excerpt(&source, lines.0, lines.1), &file);
+    let blame = redact::text(
+        &why::blame_summary(&blamed, &summaries),
+        &Place::text("git blame"),
+    );
     let mut findings = [excerpt.findings, blame.findings].concat();
     for change in &mut history {
-        let message = redact::text(
-            &change.message,
-            &redact::commit_message_place(&change.short),
-        );
+        let message = redact::text(&change.message, &Place::Message(Some(change.id.clone())));
         change.message = message.text;
         let patch = redact::diff(&change.patch);
         change.patch = patch.text;
@@ -1096,7 +1113,7 @@ async fn explain_lines(args: &WhyArgs, overrides: &Overrides) -> Result<()> {
             patch
                 .findings
                 .into_iter()
-                .map(|finding| finding.in_commit(&change.short)),
+                .map(|finding| finding.in_commit(&change.id)),
         );
     }
     report_secrets(
@@ -1189,7 +1206,7 @@ fn look_up(repo: &Repo, target: &why::Target) -> Result<Option<Known>> {
         }
     };
     let mut history =
-        why::parse_history(&repo.line_history(&target.path, &range, why::HISTORY_LIMIT + 1)?);
+        why::parse_history(&repo.line_history(&target.path, &range, why::HISTORY_LIMIT + 1)?)?;
     let complete = history.len() <= why::HISTORY_LIMIT;
     history.truncate(why::HISTORY_LIMIT);
     Ok(Some(Known {
@@ -1237,7 +1254,7 @@ async fn explain_commits(args: &ExplainArgs, overrides: &Overrides) -> Result<()
     changes.diff = redacted.text;
     let mut findings = redacted.findings;
     for commit in &mut commits {
-        let place = redact::commit_message_place(&commit.hash);
+        let place = Place::Message(Some(commit.id.clone()));
         let redacted = redact::text(&commit.message, &place);
         commit.message = redacted.text;
         findings.extend(redacted.findings);
@@ -1455,9 +1472,10 @@ mod tests {
         fs::write(dir.path().join(name), "v1\n").unwrap();
         run(dir.path(), &["add", "--", name]);
         run(dir.path(), &["commit", "-q", "-m", "chore: add the file"]);
-        let hash = run(dir.path(), &["rev-parse", "--short", "HEAD"]);
+        let full = run(dir.path(), &["rev-parse", "HEAD"]);
+        let short = run(dir.path(), &["rev-parse", "--short", "HEAD"]);
         let commit = CommitPatch {
-            hash: hash.trim().to_owned(),
+            id: git::CommitId::new(full.trim(), short.trim()).unwrap(),
             message: "chore: add the file".to_owned(),
             patch: String::new(),
         };

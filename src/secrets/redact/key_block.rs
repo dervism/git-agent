@@ -1,8 +1,8 @@
 //! A private key's block: what a line is to it, whole or read a piece at a time, and how a text,
 //! or one side of a diff, follows a block from line to line.
 
-use super::Change;
 use crate::safe_text::Unhidden;
+use crate::secrets::finding::Change;
 use regex_lite::Regex;
 use std::sync::LazyLock;
 

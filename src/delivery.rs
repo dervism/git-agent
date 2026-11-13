@@ -3,6 +3,7 @@
 use crate::config::OnSecrets;
 use crate::git::{Destination, Repo, Scope};
 use crate::secrets::contents::Scanned;
+use crate::secrets::finding::Place;
 use crate::secrets::{self, AtCommit, Wording};
 use crate::ui;
 use anyhow::{Context, Result, anyhow, bail};
@@ -96,8 +97,8 @@ pub fn commit(repo: &Repo, commit: &NewCommit, at: AtCommit) -> Result<()> {
     refuse_unknown_commit_args(commit.git_args)?;
     let arguments = commit.git_args.join(" ");
     let texts = [
-        ("message", commit.message),
-        ("arguments", arguments.as_str()),
+        (Place::Message(None), commit.message),
+        (Place::Arguments, arguments.as_str()),
     ];
     let checked = secrets::check_before_commit(repo, commit.scope, &texts, at, &BEFORE_COMMIT)?;
     let before = repo.head_commit()?;

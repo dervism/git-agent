@@ -7,6 +7,8 @@
 //! `your-api-key` and references such as `${TOKEN}` are left alone, and so are
 //! secrets in formats none of the rules know.
 
+use super::finding::{Change, Finding, Place};
+use crate::git::CommitId;
 use crate::safe_text::without_hidden;
 use key_block::{
     KeyBlock, KeyBlockFacts, LongLineFacts, Taken, is_key_data, is_key_header, starts_key_block,
@@ -24,59 +26,15 @@ pub use key_block::LongLineScan;
 
 pub const REDACTED: &str = "[REDACTED]";
 
-/// A secret that was replaced.
-#[derive(Debug, Clone, PartialEq)]
-pub struct Finding {
-    /// The file it is in, or what the text is, e.g. "commit 1a2b3c4".
-    pub place: String,
-    /// Its line in the file's new version, or in the old version for a removed
-    /// line. `None` in plain text, whose lines may not match any file's.
-    pub line: Option<usize>,
-    pub change: Change,
-    /// What it looks like, e.g. "GitHub token".
-    pub kind: String,
-}
-
-impl Finding {
-    /// The finding as one in the commit `hash`, which its place then names.
-    pub fn in_commit(self, hash: &str) -> Self {
-        Self {
-            place: commit_place(hash, &self.place),
-            ..self
-        }
-    }
-}
-
-/// How a finding names `place` in the commit `hash`: its message, or a file of its patch.
-pub fn commit_place(hash: &str, place: &str) -> String {
-    format!("commit {hash} {place}")
-}
-
-/// How a finding names the message of the commit `hash`.
-pub fn commit_message_place(hash: &str) -> String {
-    commit_place(hash, "message")
-}
-
-/// The secrets in a commit's message and patch. Findings name the commit.
-pub fn commit(hash: &str, message: &str, patch: &str) -> Vec<Finding> {
-    let mut findings = text(message, &commit_message_place(hash)).findings;
+/// The secrets in `commit`'s message and patch. Findings name the commit.
+pub fn commit(commit: &CommitId, message: &str, patch: &str) -> Vec<Finding> {
+    let mut findings = text(message, &Place::Message(Some(commit.clone()))).findings;
     findings.extend(
         diff_findings(patch)
             .into_iter()
-            .map(|finding| finding.in_commit(hash)),
+            .map(|finding| finding.in_commit(commit)),
     );
     findings
-}
-
-/// What a change does to the line a secret is on.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Change {
-    /// The change adds the line, or the secret is in a commit message.
-    Added,
-    /// The line is shown around a change, which leaves it as it was.
-    Unchanged,
-    /// The change removes the line, and the secret with it.
-    Removed,
 }
 
 pub struct Redacted {
@@ -472,9 +430,8 @@ pub fn kinds_in(text: &str) -> Vec<String> {
     line.kinds(taken)
 }
 
-/// Replaces the secrets in plain text, such as a commit message. Findings name
-/// the text as `place`.
-pub fn text(text: &str, place: &str) -> Redacted {
+/// Replaces the secrets in plain text, such as a commit message. Findings are at `place`.
+pub fn text(text: &str, place: &Place) -> Redacted {
     let mut block = KeyBlock::default();
     let mut out = String::with_capacity(text.len());
     let mut kinds = Vec::new();
@@ -489,7 +446,7 @@ pub fn text(text: &str, place: &str) -> Redacted {
     let findings = kinds
         .into_iter()
         .map(|kind| Finding {
-            place: place.to_owned(),
+            place: place.clone(),
             line: None,
             change: PLAIN,
             kind,
@@ -713,7 +670,7 @@ mod tests {
     fn finds_a_secret_split_by_an_invisible_character() {
         let key = crate::secrets::test_support::aws_key();
         let hidden = format!("key = \"{}\u{200b}{}\"\n", &key[..8], &key[8..]);
-        let redacted = text(&hidden, "message");
+        let redacted = text(&hidden, &Place::text("message"));
         assert_eq!(redacted.findings.len(), 1, "{:?}", redacted.findings);
         assert!(!redacted.text.contains("AKIA"), "{}", redacted.text);
         let patch = format!("diff --git a/x b/x\n--- a/x\n+++ b/x\n@@ -0,0 +1 @@\n+{hidden}");
@@ -727,7 +684,7 @@ mod tests {
         let redacted = diff(&patch);
         assert!(redacted.findings.is_empty());
         assert_eq!(redacted.text, patch);
-        assert_eq!(text(&line[1..], "message").text, &line[1..]);
+        assert_eq!(text(&line[1..], &Place::text("message")).text, &line[1..]);
     }
 
     /// OpenSSH's names for two of its security key algorithms, and usage text with a password
@@ -738,7 +695,7 @@ mod tests {
     const AFP_USAGE: &str = concat!("afp:", "//user[:pass]@host");
 
     fn redacted(line: &str) -> (String, Vec<String>) {
-        let result = text(line, "test");
+        let result = text(line, &Place::text("test"));
         let kinds = result
             .findings
             .into_iter()
@@ -1016,10 +973,10 @@ mod tests {
     fn code_that_mentions_a_key_marker_is_not_a_key() {
         let code =
             "if pem.starts_with(\"-----BEGIN PRIVATE KEY-----\") {\n    return decode(pem);\n}\n";
-        assert_eq!(text(code, "test").text, code);
+        assert_eq!(text(code, &Place::text("test")).text, code);
         let message = "expected '-----BEGIN PRIVATE KEY-----'\\\n    , found something else\n";
-        assert_eq!(text(message, "test").text, message);
-        assert!(text(message, "test").findings.is_empty());
+        assert_eq!(text(message, &Place::text("test")).text, message);
+        assert!(text(message, &Place::text("test")).findings.is_empty());
     }
 
     /// A key's BEGIN or END line, put together so this file doesn't look like
@@ -1033,7 +990,7 @@ mod tests {
         let (begin, end, data) = (marker("BEGIN"), marker("END"), noise(64));
         let code =
             format!("const KEY: &str = \"{begin}\\n\\\n{data}\\n\\\n{data}\\n\\\n{end}\";\n");
-        let result = text(&code, "test");
+        let result = text(&code, &Place::text("test"));
         assert_eq!(
             result.text,
             format!("const KEY: &str = \"{begin}\\n\\\n{REDACTED}\n{end}\";\n")
@@ -1050,7 +1007,7 @@ mod tests {
             noise(64),
             marker("END")
         );
-        let result = text(&key, "test");
+        let result = text(&key, &Place::text("test"));
         assert!(result.text.contains("Proc-Type: 4,ENCRYPTED\n"));
         assert!(result.text.contains(&format!("\n{REDACTED}\n-----END")));
         assert!(!result.text.contains(&noise(64)));
@@ -1092,14 +1049,17 @@ mod tests {
     fn names_the_text_in_findings_for_plain_text() {
         let result = text(
             &format!("fix: rotate the key\n\nold key: sk-proj-{}\n", noise(40)),
-            "commit 1a2b3c4",
+            &Place::Message(Some(CommitId::of("1a2b3c4"))),
         );
         assert_eq!(
             result.text,
             format!("fix: rotate the key\n\nold key: {REDACTED}\n")
         );
         assert_eq!(result.findings.len(), 1);
-        assert_eq!(result.findings[0].place, "commit 1a2b3c4");
+        assert_eq!(
+            result.findings[0].place.to_string(),
+            "commit 1a2b3c4 message"
+        );
         assert_eq!(result.findings[0].line, None);
     }
 
@@ -1264,9 +1224,9 @@ mod tests {
             noise(20)
         );
         let message = format!("ci: deploy\n\nUses sk-proj-{} for now.", noise(40));
-        let found: Vec<_> = commit("1a2b3c4", &message, &patch)
+        let found: Vec<_> = commit(&CommitId::of("1a2b3c4"), &message, &patch)
             .into_iter()
-            .map(|finding| (finding.place, finding.line, finding.change))
+            .map(|finding| (finding.place.to_string(), finding.line, finding.change))
             .collect();
         assert_eq!(
             found,

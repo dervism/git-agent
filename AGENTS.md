@@ -92,6 +92,7 @@ The modules the commands share:
 | `git/names.rs` | How git writes file names, and the readable form git-agent shows them in. |
 | `git/lossless.rs` | Text that holds any bytes, so a patch of a file that isn't UTF-8 reaches `git apply` unchanged. |
 | `git/worktree.rs` | `TempWorktree`: a temporary checkout that leaves the user's work tree, index and branches alone. |
+| `git/commit_id.rs` | `CommitId`: a commit, the same as another by its full hash, shown by the abbreviation git gives it. |
 | `temp.rs` | `PrivateDir`: a temporary folder that only your user account can enter. |
 | `github.rs` | Pull requests and issues through the GitHub CLI, `gh`. |
 | `prompt.rs` | Builds the conversation sent to the model for every command, and cleans up its replies. |
@@ -99,7 +100,14 @@ The modules the commands share:
 | `providers.rs` | The servers and providers git-agent knows the address of. |
 | `models.rs` | Choosing the model, and the context size to fit the prompt into. |
 | `fit.rs` | Shortens a diff to a size limit. |
-| `redact.rs` | Finds secrets in text before it goes to a model, and replaces them with `[REDACTED]`. |
+| `secrets.rs` | The secret checks: refusing or warning when a commit, a push or a pull request would add secrets. |
+| `secrets/finding.rs` | What a scan finds and where (`Finding`, `Place`), as the scans, the checks and the flows name it. |
+| `secrets/redact.rs` | Finds secrets in text before it goes to a model, and replaces them with `[REDACTED]`. |
+| `secrets/redact/diff_scan.rs` | Scans a diff a line at a time, following each side of a hunk. |
+| `secrets/redact/key_block.rs` | A private key's block, followed from line to line. |
+| `secrets/publication.rs` | Reads what a commit or a push publishes for secrets, as git streams it. |
+| `secrets/contents.rs` | Reads the whole content of files a diff shows only as binary. |
+| `secrets/lines.rs` | Text read a line at a time in bounded memory, a long line in windows that overlap. |
 | `api_keys.rs` | API keys in the macOS Keychain, so they are never written to a file. |
 | `config.rs` | The settings, and the order of the places they come from. |
 | `config/file.rs` | The config file as the user wrote it (`ConfigFile`): only the settings they set. |

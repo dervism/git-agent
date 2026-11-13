@@ -4,9 +4,10 @@
 //! scanned in windows (`lines`).
 
 use super::contents::{BinaryFile, BinaryFiles};
+use super::finding::{Change, Finding, Place};
 use super::lines::{Line, Lines};
-use super::redact::{self, Change, DiffScan, Finding, Held, LineScan};
-use crate::git::{LogLine, LogMarks, UNREADABLE_LOG};
+use super::redact::{DiffScan, Held, LineScan};
+use crate::git::{CommitId, LogLine, LogMarks, UNREADABLE_LOG};
 use anyhow::{Result, bail};
 use std::io::BufRead;
 
@@ -36,7 +37,7 @@ pub fn read_log(output: &mut dyn BufRead, marks: &LogMarks) -> Result<Found> {
     while let Some(line) = lines.next_line()? {
         let (Line::Whole(bytes) | Line::Long(bytes)) = &line;
         match marks.line(bytes)? {
-            LogLine::Commit(hash) => log.start_commit(hash)?,
+            LogLine::Commit(commit) => log.start_commit(commit)?,
             LogLine::MessageEnd => log.message_end(),
             LogLine::Text => log.text(line, &mut lines)?,
         }
@@ -103,10 +104,10 @@ struct LogRead {
 }
 
 impl LogRead {
-    /// Starts the commit `hash`, after the one before it.
-    fn start_commit(&mut self, hash: String) -> Result<()> {
+    /// Starts `commit`, after the one before it.
+    fn start_commit(&mut self, commit: CommitId) -> Result<()> {
         self.finish_commit()?;
-        self.commit = Some(CommitRead::new(hash));
+        self.commit = Some(CommitRead::new(commit));
         Ok(())
     }
 
@@ -143,16 +144,16 @@ impl LogRead {
 
 /// The commit being read: its message until it ends, then its patch.
 struct CommitRead {
-    hash: String,
+    commit: CommitId,
     message: Option<MessageRead>,
     in_message: Vec<Finding>,
     patch: DiffRead,
 }
 
 impl CommitRead {
-    fn new(hash: String) -> Self {
+    fn new(commit: CommitId) -> Self {
         Self {
-            hash,
+            commit,
             message: Some(MessageRead::default()),
             in_message: Vec::new(),
             patch: DiffRead::default(),
@@ -161,7 +162,7 @@ impl CommitRead {
 
     fn message_end(&mut self) {
         if let Some(message) = self.message.take() {
-            self.in_message = message.findings(&redact::commit_message_place(&self.hash));
+            self.in_message = message.findings(&Place::Message(Some(self.commit.clone())));
         }
     }
 
@@ -177,7 +178,7 @@ impl CommitRead {
     fn finish(mut self) -> Result<Found> {
         self.message_end();
         let Self {
-            hash,
+            commit,
             in_message,
             patch,
             ..
@@ -186,9 +187,9 @@ impl CommitRead {
         let in_patch = patch
             .findings
             .into_iter()
-            .map(|finding| finding.in_commit(&hash));
+            .map(|finding| finding.in_commit(&commit));
         let binary = patch.binary.into_iter().map(|file| BinaryFile {
-            place: redact::commit_place(&hash, &file.place),
+            place: file.place.in_commit(&commit),
             ..file
         });
         Ok(Found {
@@ -236,11 +237,11 @@ impl MessageRead {
     }
 
     /// The secrets found, as findings in `place`.
-    fn findings(self, place: &str) -> Vec<Finding> {
+    fn findings(self, place: &Place) -> Vec<Finding> {
         self.kinds
             .into_iter()
             .map(|kind| Finding {
-                place: place.to_owned(),
+                place: place.clone(),
                 line: None,
                 change: Change::Added,
                 kind,
@@ -457,8 +458,8 @@ mod tests {
 
         assert_eq!(read.findings, whole(&diff).0);
         assert_eq!(read.findings.len(), 1);
-        let place = "commit 1a2b3c4 message";
-        assert_eq!(message.findings, redact::text(&block, place).findings);
+        let place = Place::Message(Some(CommitId::of("1a2b3c4")));
+        assert_eq!(message.findings, redact::text(&block, &place).findings);
         assert_eq!(message.findings.len(), 1);
     }
 
@@ -560,17 +561,20 @@ mod tests {
             ]
         );
         assert_eq!(kinds_of(&data), [found(Change::Added, "private key")]);
-        let place = "commit 1a2b3c4 message";
-        assert_eq!(read.findings, redact::text(&message, place).findings);
+        let place = Place::Message(Some(CommitId::of("1a2b3c4")));
+        assert_eq!(read.findings, redact::text(&message, &place).findings);
         assert_eq!(read.findings.len(), 1);
     }
 
-    /// A log with each commit's hash, message and patch, as git writes it in
-    /// [`LogMarks::plain`]'s marks: git's separators as they are.
+    /// A log with each commit's hashes, message and patch, as git writes it in
+    /// [`LogMarks::plain`]'s marks: git's separators as they are. A commit's full hash is its
+    /// short one followed by zeros, as [`CommitId::of`] makes it.
     fn log(commits: &[(&str, &str, &str)]) -> String {
         commits
             .iter()
-            .map(|(hash, message, patch)| format!("\u{1e}{hash}\n{message}\n\u{1f}\n{patch}"))
+            .map(|(hash, message, patch)| {
+                format!("\u{1e}{hash:0<40} {hash}\n{message}\n\u{1f}\n{patch}")
+            })
             .collect()
     }
 
@@ -602,11 +606,17 @@ mod tests {
 
         let each: Vec<Finding> = commits
             .iter()
-            .flat_map(|(hash, message, patch)| redact::commit(hash, message.trim(), patch))
+            .flat_map(|(hash, message, patch)| {
+                redact::commit(&CommitId::of(hash), message.trim(), patch)
+            })
             .collect();
         assert_eq!(read.findings, each);
         assert_eq!(read.findings.len(), 3);
-        let binary: Vec<&str> = read.binary.iter().map(|file| file.place.as_str()).collect();
+        let binary: Vec<String> = read
+            .binary
+            .iter()
+            .map(|file| file.place.to_string())
+            .collect();
         assert_eq!(binary, ["commit 5d6e7f8 x.dat"]);
         assert!(log_of("").unwrap().findings.is_empty());
     }
@@ -620,7 +630,8 @@ mod tests {
 
         let read = log_of(&log(&[("1a2b3c4", &message, ""), ("5d6e7f8", "", "")])).unwrap();
 
-        let trimmed = redact::text(message.trim(), "commit 1a2b3c4 message").findings;
+        let place = Place::Message(Some(CommitId::of("1a2b3c4")));
+        let trimmed = redact::text(message.trim(), &place).findings;
         assert_eq!(read.findings, trimmed);
         assert_eq!(read.findings.len(), 2);
     }
@@ -671,10 +682,10 @@ mod tests {
 
         let read = repo.published_commits(&["HEAD~3..HEAD"], read_log).unwrap();
 
-        let places: Vec<(&str, Option<usize>)> = read
+        let places: Vec<(String, Option<usize>)> = read
             .findings
             .iter()
-            .map(|finding| (finding.place.as_str(), finding.line))
+            .map(|finding| (finding.place.to_string(), finding.line))
             .collect();
         let short = &bare[..7];
         assert_eq!(places.len(), 2, "{places:?}");

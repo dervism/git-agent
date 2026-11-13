@@ -1,6 +1,7 @@
 //! Wrapper around the `git` command line.
 
 pub mod blob;
+mod commit_id;
 pub mod diff;
 pub mod lossless;
 pub mod names;
@@ -8,6 +9,7 @@ mod push;
 mod settings;
 pub mod worktree;
 
+pub use commit_id::CommitId;
 pub use push::Destination;
 
 use crate::safe_text::{one_line, without_styles};
@@ -45,7 +47,7 @@ pub struct Changes {
 /// A commit on a branch.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Commit {
-    pub hash: String,
+    pub id: CommitId,
     pub author: String,
     /// The author date, e.g. 2025-10-02.
     pub date: String,
@@ -94,7 +96,7 @@ impl IndexEntry {
 /// A commit's message and patch, as pushing it would publish them.
 #[derive(Debug)]
 pub struct CommitPatch {
-    pub hash: String,
+    pub id: CommitId,
     pub message: String,
     pub patch: String,
 }
@@ -862,6 +864,7 @@ impl Repo {
             "--no-color",
             "--no-ext-diff",
             "--no-textconv",
+            "--no-show-signature",
             "--irreversible-delete",
             "--ignore-submodules=none",
             "--submodule=short",
@@ -978,35 +981,26 @@ impl Repo {
     /// first, without merges.
     pub fn commits(&self, revisions: &[&str]) -> Result<Vec<Commit>> {
         let marks = LogMarks::new();
-        let format = format!("--format={}%h%n%an%n%as%n%s%n%b", marks.record_format());
-        let mut args = vec!["log", "--reverse", "--no-merges", &format];
+        let format = format!("--format={}%H%n%h%n%an%n%as%n%s%n%b", marks.record_format());
+        let mut args = vec![
+            "log",
+            "--reverse",
+            "--no-merges",
+            "--no-show-signature",
+            &format,
+        ];
         args.extend_from_slice(revisions);
         args.push("--");
         let log = MarkedLog {
             text: self.git_readable(&args)?,
             marks,
         };
-        let commits = log.records(1).into_iter().filter_map(|parts| {
-            let mut lines = parts.first()?.trim().lines();
-            let hash = lines.next().filter(|hash| !hash.is_empty())?;
-            let author = lines.next().unwrap_or_default();
-            let date = lines.next().unwrap_or_default();
-            let mut message = format!("- {}", lines.next().unwrap_or_default());
-            for line in lines {
-                message.push('\n');
-                if !line.trim().is_empty() {
-                    message.push_str("  ");
-                    message.push_str(line.trim_end());
-                }
-            }
-            Some(Commit {
-                hash: hash.to_owned(),
-                author: author.to_owned(),
-                date: date.to_owned(),
-                message: message.trim_end().to_owned(),
-            })
-        });
-        Ok(commits.collect())
+        log.records(1)
+            .iter()
+            .filter_map(|parts| parts.first().map(|text| text.trim()))
+            .filter(|text| !text.is_empty())
+            .map(commit_of_record)
+            .collect()
     }
 
     /// The changes between two commits, or what `git diff` shows for a range
@@ -1375,7 +1369,7 @@ impl Repo {
         let marks = LogMarks::new();
         let field = marks.field_format();
         let format = format!(
-            "--format={}%h{field}%an{field}%as{field}%B{field}",
+            "--format={}%H{field}%h{field}%an{field}%as{field}%B{field}",
             marks.record_format()
         );
         let text = self.git_readable(&[
@@ -1383,6 +1377,7 @@ impl Repo {
             "--no-color",
             "--no-ext-diff",
             "--no-textconv",
+            "--no-show-signature",
             &format!("--max-count={limit}"),
             &format,
             &format!("-L{range}:{path}"),
@@ -1793,8 +1788,8 @@ pub const UNREADABLE_LOG: &str =
 /// What a line of a log in [`LogMarks::stream_format`] is.
 #[derive(Debug, PartialEq)]
 pub enum LogLine {
-    /// The start of a commit, with its short hash.
-    Commit(String),
+    /// The start of a commit.
+    Commit(CommitId),
     /// The end of the commit's message, after which its patch comes.
     MessageEnd,
     /// A line of a message or of a patch.
@@ -1821,17 +1816,16 @@ impl MarkedLog {
     /// record that doesn't start with a commit's hash, as when the marks didn't come out as
     /// written, rather than read a commit as none.
     fn patches(&self) -> Result<Vec<CommitPatch>> {
-        self.records(3)
+        self.records(4)
             .into_iter()
             .filter(|parts| parts.iter().any(|part| !part.trim().is_empty()))
             .map(|parts| {
                 let mut parts = parts.into_iter();
-                let hash = parts.next().unwrap_or_default().trim();
-                if !is_commit_hash(hash) {
-                    bail!(UNREADABLE_LOG);
-                }
+                let full = parts.next().unwrap_or_default().trim();
+                let short = parts.next().unwrap_or_default();
+                let id = CommitId::new(full, short).context(UNREADABLE_LOG)?;
                 Ok(CommitPatch {
-                    hash: hash.to_owned(),
+                    id,
                     message: parts.next().unwrap_or_default().trim().to_owned(),
                     patch: parts.next().unwrap_or_default().to_owned(),
                 })
@@ -1879,12 +1873,13 @@ impl LogMarks {
     /// as written, rather than read a commit as none.
     pub fn line(&self, line: &[u8]) -> Result<LogLine> {
         let line = line.strip_suffix(b"\n").unwrap_or(line);
-        if let Some(hash) = line.strip_prefix(self.record.as_bytes()) {
-            let hash = std::str::from_utf8(hash)
+        if let Some(hashes) = line.strip_prefix(self.record.as_bytes()) {
+            let id = std::str::from_utf8(hashes)
                 .ok()
-                .filter(|hash| is_commit_hash(hash))
+                .and_then(|hashes| hashes.split_once(' '))
+                .and_then(|(full, short)| CommitId::new(full, short))
                 .context(UNREADABLE_LOG)?;
-            return Ok(LogLine::Commit(hash.to_owned()));
+            return Ok(LogLine::Commit(id));
         }
         Ok(if line == self.field.as_bytes() {
             LogLine::MessageEnd
@@ -1897,7 +1892,7 @@ impl LogMarks {
     /// on a line of its own, the record's before the hash, and the field's after the message.
     fn stream_format(&self) -> String {
         format!(
-            "--format={}%h%n%B%n{}",
+            "--format={}%H %h%n%B%n{}",
             self.record_format(),
             self.field_format()
         )
@@ -1916,7 +1911,10 @@ impl LogMarks {
     /// The `--format` of a commit's hash and message, before its patch.
     fn patch_format(&self) -> String {
         let field = self.field_format();
-        format!("--format={}%h{field}%B{field}", self.record_format())
+        format!(
+            "--format={}%H{field}%h{field}%B{field}",
+            self.record_format()
+        )
     }
 }
 
@@ -2051,6 +2049,34 @@ fn object_hash(hash: &str) -> Result<&str> {
     } else {
         bail!("git-agent read {hash:?} where a full object hash belongs")
     }
+}
+
+/// The commit a record of [`Repo::commits`]'s log holds: its hashes, author, date, subject and
+/// body, each on lines of their own. Fails on a record without a commit's hashes, as when the marks
+/// didn't come out as written, rather than read a commit as none.
+fn commit_of_record(text: &str) -> Result<Commit> {
+    let mut lines = text.lines();
+    let id = lines
+        .next()
+        .zip(lines.next())
+        .and_then(|(full, short)| CommitId::new(full, short))
+        .context(UNREADABLE_LOG)?;
+    let author = lines.next().unwrap_or_default();
+    let date = lines.next().unwrap_or_default();
+    let mut message = format!("- {}", lines.next().unwrap_or_default());
+    for line in lines {
+        message.push('\n');
+        if !line.trim().is_empty() {
+            message.push_str("  ");
+            message.push_str(line.trim_end());
+        }
+    }
+    Ok(Commit {
+        id,
+        author: author.to_owned(),
+        date: date.to_owned(),
+        message: message.trim_end().to_owned(),
+    })
 }
 
 /// Whether `text` is a commit's hash, short or full: 4 to 64 hex digits.
@@ -2331,9 +2357,10 @@ mod tests {
         let (record, field) = (&marks.record, &marks.field);
         let line = |text: &str| marks.line(text.as_bytes());
 
+        let full = format!("1a2b3c4{}", "0".repeat(33));
         assert_eq!(
-            line(&format!("{record}1a2b3c4\n")).unwrap(),
-            LogLine::Commit("1a2b3c4".to_owned())
+            line(&format!("{record}{full} 1a2b3c4\n")).unwrap(),
+            LogLine::Commit(CommitId::of("1a2b3c4"))
         );
         assert_eq!(line(&format!("{field}\n")).unwrap(), LogLine::MessageEnd);
         assert_eq!(line(field).unwrap(), LogLine::MessageEnd);
@@ -2347,14 +2374,20 @@ mod tests {
         ] {
             assert_eq!(line(&text).unwrap(), LogLine::Text, "{text:?}");
         }
-        for text in [format!("{record}\n"), format!("{record}not-a-hash\n")] {
+        for text in [
+            format!("{record}\n"),
+            format!("{record}not-a-hash\n"),
+            format!("{record}1a2b3c4\n"),
+            format!("{record}{full} 9f9f9f9\n"),
+            format!("{record}{full} \n"),
+        ] {
             let error = line(&text).unwrap_err().to_string();
             assert!(error.contains("a commit in it has no hash"), "{text:?}");
         }
         assert!(
             marks
                 .stream_format()
-                .ends_with(&format!("%h%n%B%n{}", marks.field_format()))
+                .ends_with(&format!("%H %h%n%B%n{}", marks.field_format()))
         );
     }
 
@@ -2557,7 +2590,7 @@ mod tests {
                 "- test: cover c"
             ]
         );
-        assert!(commits.iter().all(|c| c.hash.len() >= 7));
+        assert!(commits.iter().all(|c| c.id.short().len() >= 7));
 
         let changes = repo.branch_changes(&base, &[]).unwrap();
         assert!(changes.diff.contains("+fn b() {}") && changes.diff.contains("new.rs"));
@@ -2625,7 +2658,8 @@ mod tests {
 
         let hunks = why::parse_hunks(&repo.uncommitted_hunks("core.rs").unwrap());
         assert_eq!(why::head_line(&hunks, 3), Some(2));
-        let history = why::parse_history(&repo.line_history("core.rs", "2,2", 10).unwrap());
+        let history =
+            why::parse_history(&repo.line_history("core.rs", "2,2", 10).unwrap()).unwrap();
         let subjects: Vec<&str> = history.iter().map(|c| c.message.as_str()).collect();
         assert_eq!(subjects.first(), Some(&"fix: rename b"));
         assert_eq!(subjects.last(), Some(&"feat: add b and c"));
@@ -2817,7 +2851,7 @@ mod tests {
 
         let patches = repo.commit_patches(&["-1"], &[]).unwrap();
         assert_eq!(patches.len(), 1);
-        assert_eq!(patches[0].hash, head.trim());
+        assert_eq!(patches[0].id.short(), head.trim());
         assert!(
             patches[0].message.contains("exec echo injected"),
             "{patches:?}"
@@ -2831,7 +2865,7 @@ mod tests {
         );
         let commits = repo.commits(&["--max-count=1", "HEAD"]).unwrap();
         assert_eq!(commits.len(), 1);
-        assert_eq!(commits[0].hash, head.trim());
+        assert_eq!(commits[0].id.short(), head.trim());
         assert!(commits[0].message.ends_with("tail"), "{commits:?}");
     }
 
@@ -3648,14 +3682,111 @@ mod tests {
 
     /// Output whose marks didn't come out as written, as with a log encoding such as UTF-16,
     /// fails rather than read as no commits.
+    /// A record of [`Repo::commits`]'s log names its commit by both hashes, and fails the read
+    /// rather than be skipped when they don't fit: a record that isn't one, as when the marks
+    /// didn't come out as written.
+    #[test]
+    fn reads_a_commit_from_its_record_and_refuses_one_without_its_hashes() {
+        let full = format!("1a2b3c4{}", "0".repeat(33));
+        let commit = commit_of_record(&format!(
+            "{full}\n1a2b3c4\nAnn\n2025-10-02\nfeat: add b\n\nb replaces a.  "
+        ))
+        .unwrap();
+        assert_eq!(commit.id, CommitId::of("1a2b3c4"));
+        assert_eq!(commit.author, "Ann");
+        assert_eq!(commit.message, "- feat: add b\n\n  b replaces a.");
+        for broken in [
+            "Good \"git\" signature for ann@example.com".to_owned(),
+            format!("{full}\n9f9f9f9\nAnn"),
+            "1a2b3c4\n1a2b3c4\nAnn".to_owned(),
+            full.clone(),
+        ] {
+            let error = commit_of_record(&broken).unwrap_err().to_string();
+            assert!(error.contains("a commit in it has no hash"), "{broken:?}");
+        }
+    }
+
+    /// Signs every commit in `dir` with a new SSH key whose comment names ann@example.com, and has
+    /// `git log` show each signature's check, before the record git-agent asks for.
+    fn sign_commits_and_show_signatures(dir: &Path) {
+        let key = dir.join(".git").join("signing-key");
+        let made = Command::new("ssh-keygen")
+            .args([
+                "-q",
+                "-t",
+                "ed25519",
+                "-N",
+                "",
+                "-C",
+                "ann@example.com",
+                "-f",
+            ])
+            .arg(&key)
+            .status()
+            .expect("ssh-keygen, to sign the commits");
+        assert!(made.success());
+        run(dir, &["config", "gpg.format", "ssh"]);
+        run(dir, &["config", "user.signingkey", &key.to_string_lossy()]);
+        run(dir, &["config", "commit.gpgsign", "true"]);
+        run(dir, &["config", "log.showSignature", "true"]);
+    }
+
+    /// The logs git-agent reads ask git not to show signatures, so no reader fails, or takes a
+    /// signature's check, which names the signer, for part of a message or a patch.
+    #[test]
+    fn reads_signed_commits_whatever_log_show_signature_says() {
+        let (dir, repo) = isolated_repo();
+        let dir = dir.path();
+        sign_commits_and_show_signatures(dir);
+        for text in ["fn b() {}\n", "fn c() {}\n"] {
+            fs::write(dir.join("lib.rs"), text).unwrap();
+            run(dir, &["commit", "-q", "-am", "change lib"]);
+        }
+        let shown = run(dir, &["log", "-1"]);
+        assert!(
+            shown.contains("ignature"),
+            "git shows no signature check: {shown}"
+        );
+
+        let commits = repo.commits(&["HEAD~2..HEAD"]).unwrap();
+        let patches = repo.commit_patches(&["HEAD~2..HEAD"], &[]).unwrap();
+        let lines = repo.line_history("lib.rs", "1,1", 10).unwrap();
+        let history = crate::why::parse_history(&lines).unwrap();
+
+        assert_eq!((commits.len(), patches.len(), history.len()), (2, 2, 3));
+        let texts = commits
+            .iter()
+            .map(|commit| commit.message.as_str())
+            .chain(
+                patches
+                    .iter()
+                    .flat_map(|patch| [patch.message.as_str(), &patch.patch]),
+            )
+            .chain(
+                history
+                    .iter()
+                    .flat_map(|change| [change.message.as_str(), &change.patch]),
+            );
+        for text in texts {
+            assert!(
+                !text.contains("ignature") && !text.contains("ann@example.com"),
+                "{text}"
+            );
+        }
+    }
+
     #[test]
     fn refuses_a_list_of_commits_with_a_record_that_has_no_hash() {
         let patches = |text: &str| MarkedLog::plain(text).patches();
-        let read = patches("\u{1e}1a2b3c4\u{1f}subject\n\u{1f}diff --git a/x b/x\n").unwrap();
+        let full = format!("1a2b3c4{}", "0".repeat(33));
+        let read = patches(&format!(
+            "\u{1e}{full}\u{1f}1a2b3c4\u{1f}subject\n\u{1f}diff --git a/x b/x\n"
+        ))
+        .unwrap();
         assert_eq!(read.len(), 1);
         assert_eq!(
-            (read[0].hash.as_str(), read[0].message.as_str()),
-            ("1a2b3c4", "subject")
+            (read[0].id.clone(), read[0].message.as_str()),
+            (CommitId::of("1a2b3c4"), "subject")
         );
         assert!(patches("").unwrap().is_empty());
         assert!(patches("\n").unwrap().is_empty());
@@ -3664,6 +3795,8 @@ mod tests {
             "\u{1e}not a hash\u{1f}subject\u{1f}",
             "\u{1e}\u{1f}subject\u{1f}diff --git a/x b/x",
             "\u{1e}1a2\u{1f}subject\u{1f}",
+            "\u{1e}1a2b3c4\u{1f}subject\u{1f}diff --git a/x b/x",
+            &format!("\u{1e}{full}\u{1f}9f9f9f9\u{1f}subject\u{1f}"),
         ] {
             assert!(patches(broken).is_err(), "{broken:?}");
         }
@@ -3716,8 +3849,11 @@ mod tests {
         assert_eq!(subjects, ["feat: b", "chore: bump the lockfile"]);
         assert!(patches[1].patch.trim().is_empty(), "{:?}", patches[1].patch);
         assert!(patches[0].patch.contains("+fn b() {}"));
-        assert_eq!(repo.files_of(&patches[1].hash).unwrap(), ["Cargo.lock"]);
-        assert_eq!(repo.files_of(&patches[0].hash).unwrap(), ["lib.rs"]);
+        assert_eq!(
+            repo.files_of(patches[1].id.short()).unwrap(),
+            ["Cargo.lock"]
+        );
+        assert_eq!(repo.files_of(patches[0].id.short()).unwrap(), ["lib.rs"]);
         let first = run(dir, &["rev-list", "--max-parents=0", "HEAD"]);
         assert_eq!(repo.files_of(first.trim()).unwrap(), ["lib.rs"]);
     }

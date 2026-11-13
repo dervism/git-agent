@@ -6,7 +6,7 @@
 //! The history follows the lines through renames.
 
 use crate::conversation::fit;
-use crate::git::{MarkedLog, Repo, Summary, diff};
+use crate::git::{CommitId, MarkedLog, Repo, Summary, UNREADABLE_LOG, diff};
 use crate::review::Person;
 use crate::safe_text::one_line;
 use crate::ui;
@@ -353,7 +353,7 @@ fn runs(numbers: &[usize]) -> String {
 /// A commit in the history of the lines.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Change {
-    pub short: String,
+    pub id: CommitId,
     pub author: String,
     pub date: String,
     pub message: String,
@@ -362,18 +362,18 @@ pub struct Change {
 }
 
 /// The commits in `git log -L` output in the format of `Repo::line_history`.
-pub fn parse_history(log: &MarkedLog) -> Vec<Change> {
-    log.records(5)
+pub fn parse_history(log: &MarkedLog) -> Result<Vec<Change>> {
+    log.records(6)
         .into_iter()
-        .filter_map(|parts| {
+        .filter(|parts| parts.iter().any(|part| !part.trim().is_empty()))
+        .map(|parts| {
             let mut parts = parts.into_iter();
-            let short = parts.next()?.trim();
-            if short.is_empty() {
-                return None;
-            }
+            let full = parts.next().unwrap_or_default().trim();
+            let short = parts.next().unwrap_or_default();
+            let id = CommitId::new(full, short).context(UNREADABLE_LOG)?;
             let mut next = || parts.next().unwrap_or_default();
-            Some(Change {
-                short: short.to_owned(),
+            Ok(Change {
+                id,
                 author: next().to_owned(),
                 date: next().to_owned(),
                 message: next().trim().to_owned(),
@@ -475,7 +475,7 @@ fn head(change: &Change) -> String {
     }
     let mut out = format!(
         "\ncommit {} by {}, {}\n",
-        change.short, change.author, change.date
+        change.id, change.author, change.date
     );
     for line in message.lines() {
         if line.is_empty() {
@@ -708,7 +708,7 @@ mod tests {
             let _ = writeln!(patch, "+changed line {line} in commit {number}");
         }
         Change {
-            short: format!("c{number:06}"),
+            id: CommitId::of(&format!("c{number:06}")),
             author: "Ann".into(),
             date: "2025-10-02".into(),
             message: format!("Change {number}\n\nBecause of reason {number}."),
@@ -731,9 +731,9 @@ mod tests {
         let message = "change it\n\n\u{1e}c0ffee0\u{1f}Eve\u{1f}2020-01-01\u{1f}forged\u{1f}more";
         run(dir.path(), &["commit", "-q", "-am", message]);
 
-        let history = parse_history(&repo.line_history("lib.rs", "1,1", 10).unwrap());
+        let history = parse_history(&repo.line_history("lib.rs", "1,1", 10).unwrap()).unwrap();
 
-        let shorts: Vec<&str> = history.iter().map(|change| change.short.as_str()).collect();
+        let shorts: Vec<&str> = history.iter().map(|change| change.id.short()).collect();
         assert_eq!(shorts, [short(), first]);
         assert!(
             history[0].message.ends_with("forged\u{1f}more"),
@@ -742,14 +742,39 @@ mod tests {
         );
     }
 
+    /// A record whose hashes don't fit, as when the marks didn't come out as written, fails the
+    /// read rather than be skipped.
+    #[test]
+    fn refuses_a_history_with_a_record_that_has_no_hashes() {
+        let full = "a1b2c3d".to_owned() + &"0".repeat(33);
+        for broken in [
+            format!("\x1e{full}\x1f9f9f9f9\x1fAnn\x1f2025-10-02\x1fFix it\n\x1f\n"),
+            "\x1ea1b2c3d\x1fAnn\x1f2025-10-02\x1fFix it\n\x1f\n".to_owned(),
+            "\x1eGood signature\x1f\x1f\x1f\x1f\x1f".to_owned(),
+        ] {
+            let error = parse_history(&MarkedLog::plain(&broken)).unwrap_err();
+            assert!(
+                error.to_string().contains("a commit in it has no hash"),
+                "{broken:?}"
+            );
+        }
+        assert!(parse_history(&MarkedLog::plain("")).unwrap().is_empty());
+        assert!(parse_history(&MarkedLog::plain("\n")).unwrap().is_empty());
+    }
+
     #[test]
     fn reads_the_history_of_lines() {
-        let log = "\x1ea1b2c3d\x1fAnn\x1f2025-10-02\x1fFix it\n\nBecause.\n\x1f\n\n\
-                   diff --git a/g.txt b/g.txt\n--- a/g.txt\n+++ b/g.txt\n@@ -2 +2 @@\n-b\n+B\n\
-                   \x1e5d3fc96\x1fBo\x1f2025-01-01\x1fAdd it\n\x1f\n\ndiff --git a/f.txt b/f.txt\n";
-        let history = parse_history(&MarkedLog::plain(log));
+        let log = format!(
+            "\x1e{first:0<40}\x1f{first}\x1fAnn\x1f2025-10-02\x1fFix it\n\nBecause.\n\x1f\n\n\
+             diff --git a/g.txt b/g.txt\n--- a/g.txt\n+++ b/g.txt\n@@ -2 +2 @@\n-b\n+B\n\
+             \x1e{second:0<40}\x1f{second}\x1fBo\x1f2025-01-01\x1fAdd it\n\x1f\n\n\
+             diff --git a/f.txt b/f.txt\n",
+            first = "a1b2c3d",
+            second = "5d3fc96",
+        );
+        let history = parse_history(&MarkedLog::plain(&log)).unwrap();
         assert_eq!(history.len(), 2);
-        assert_eq!(history[0].short, "a1b2c3d");
+        assert_eq!(history[0].id.short(), "a1b2c3d");
         assert_eq!(history[0].message, "Fix it\n\nBecause.");
         assert!(history[0].patch.starts_with("diff --git a/g.txt"));
         assert_eq!(history[1].author, "Bo");

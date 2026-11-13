@@ -2,9 +2,10 @@
 //! side of a hunk, the result and every parent, followed as a text of its own.
 
 use super::key_block::{KeyBlock, KeyBlockFacts, LongLineFacts, LongLineScan, Taken};
-use super::{Change, Finding, Redacted, ScannedLine, Windows};
+use super::{Redacted, ScannedLine, Windows};
 use crate::git::diff::is_file_header;
 use crate::git::names;
+use crate::secrets::finding::{Change, Finding, Place};
 
 /// Replaces the secrets in a diff. Findings name the file and the line.
 pub fn diff(diff: &str) -> Redacted {
@@ -142,7 +143,7 @@ impl DiffScan {
 
     fn found(&mut self, change: Change, number: usize, kinds: Vec<String>) {
         self.findings.extend(kinds.into_iter().map(|kind| Finding {
-            place: self.path.clone(),
+            place: Place::file(self.path.clone()),
             line: Some(number),
             change,
             kind,
@@ -405,7 +406,7 @@ mod tests {
             "diff --git \"a/Kj\\303\\270re.txt\" \"b/Kj\\303\\270re.txt\"\n",
         ] {
             let found = diff(&format!("{header}@@ -1 +1 @@\n+token = {secret}\n"));
-            assert_eq!(found.findings[0].place, "Kjøre.txt");
+            assert_eq!(found.findings[0].place, Place::file("Kjøre.txt"));
         }
     }
 
@@ -425,15 +426,15 @@ mod tests {
         let found: Vec<_> = result
             .findings
             .iter()
-            .map(|finding| (finding.place.as_str(), finding.line, finding.change))
+            .map(|finding| (finding.place.to_string(), finding.line, finding.change))
             .collect();
         assert_eq!(
             found,
             [
-                ("src/a.rs", Some(11), Change::Removed),
-                ("src/a.rs", Some(11), Change::Added),
-                ("src/a.rs", Some(12), Change::Unchanged),
-                (".env", Some(2), Change::Added)
+                ("src/a.rs".to_owned(), Some(11), Change::Removed),
+                ("src/a.rs".to_owned(), Some(11), Change::Added),
+                ("src/a.rs".to_owned(), Some(12), Change::Unchanged),
+                (".env".to_owned(), Some(2), Change::Added)
             ]
         );
         assert_eq!(diff_findings(&diff), result.findings);
@@ -444,7 +445,7 @@ mod tests {
         super::diff(diff)
             .findings
             .into_iter()
-            .map(|finding| (finding.place, finding.line, finding.change))
+            .map(|finding| (finding.place.to_string(), finding.line, finding.change))
             .collect()
     }
 
@@ -648,7 +649,7 @@ mod tests {
         let found: Vec<(String, Option<usize>, Change)> = scan
             .findings()
             .into_iter()
-            .map(|finding| (finding.place, finding.line, finding.change))
+            .map(|finding| (finding.place.to_string(), finding.line, finding.change))
             .collect();
         let at = |line| ("x.env".to_owned(), Some(line), Change::Added);
         assert_eq!(found, [at(2), at(3)]);

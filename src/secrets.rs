@@ -7,6 +7,7 @@
 //! diff or history is held whole. A file a diff shows only as binary is read whole (`contents`).
 
 pub mod contents;
+pub mod finding;
 mod lines;
 mod publication;
 pub mod redact;
@@ -16,8 +17,8 @@ use crate::git::{Repo, Scope};
 use crate::ui;
 use anyhow::{Result, bail};
 use contents::{MOST_BINARY_BYTES, Scanned, Unchecked};
+use finding::{Change, Finding, Place};
 use publication::Found;
-use redact::{Change, Finding};
 
 /// How to make a check pass when its findings aren't secrets.
 const ADVICE: &str = "If they aren't real secrets, add --on-secrets warn, or choose Warn under \
@@ -94,7 +95,7 @@ pub struct AtCommit<'a> {
 pub fn check_before_commit(
     repo: &Repo,
     scope: Scope,
-    texts: &[(&str, &str)],
+    texts: &[(Place, &str)],
     at: AtCommit,
     wording: &Wording,
 ) -> Result<Scanned> {
@@ -293,14 +294,13 @@ fn warning(findings: &[Finding], reported: &[Finding], warned: &str) -> Option<S
     (!new.is_empty()).then(|| format!("{warned}:\n{}", list_findings(&new)))
 }
 
-/// Whether `reported` holds the same kind of secret, changed in the same way, in the same
-/// place. A finding in a commit is also held by one in its file, as a diff of several commits
-/// names it.
+/// Whether `reported` holds the same kind of secret, changed in the same way, in a place that
+/// holds the finding's: the same place, or the file of the changes that a commit's file is.
 fn covered(finding: &Finding, reported: &[Finding]) -> bool {
     reported.iter().any(|shown| {
         shown.kind == finding.kind
             && shown.change == finding.change
-            && same_place(&shown.place, &finding.place)
+            && shown.place.holds(&finding.place)
     })
 }
 
@@ -315,7 +315,7 @@ fn new_findings(findings: &[Finding], before: &[Finding]) -> Vec<Finding> {
                 old.kind == finding.kind
                     && old.change == finding.change
                     && old.line == finding.line
-                    && same_place(&old.place, &finding.place)
+                    && old.place.holds(&finding.place)
             })
         })
         .cloned()
@@ -327,19 +327,9 @@ fn new_findings(findings: &[Finding], before: &[Finding]) -> Vec<Finding> {
 fn new_unchecked(unchecked: &[Unchecked], before: &[Unchecked]) -> Vec<Unchecked> {
     unchecked
         .iter()
-        .filter(|file| !before.iter().any(|old| same_place(&old.place, &file.place)))
+        .filter(|file| !before.iter().any(|old| old.place.holds(&file.place)))
         .cloned()
         .collect()
-}
-
-/// Whether `before`, a place as a check of changes names it, is `place`, or the same file or
-/// message of a commit (`commit <hash> <before>`).
-fn same_place(before: &str, place: &str) -> bool {
-    let in_commit = place
-        .strip_prefix("commit ")
-        .and_then(|rest| rest.split_once(' '))
-        .map(|(_, file)| file);
-    before == place || Some(before) == in_commit
 }
 
 /// Prints a warning, or fails with a refusal.
@@ -371,7 +361,7 @@ pub fn list_findings(findings: &[&Finding]) -> String {
         .map(|finding| {
             let place = match finding.line {
                 Some(line) => format!("{}:{line}", finding.place),
-                None => finding.place.clone(),
+                None => finding.place.to_string(),
             };
             let change = match finding.change {
                 Change::Added => "",
@@ -390,7 +380,7 @@ pub fn list_findings(findings: &[&Finding]) -> String {
 /// What the tests of the secret checks share.
 #[cfg(test)]
 pub mod test_support {
-    use super::redact::Change;
+    use super::finding::Change;
 
     /// An AWS access key's shape, built at run time so that the source holds no key.
     pub fn aws_key() -> String {
@@ -727,7 +717,9 @@ mod tests {
     use super::test_support::{aws_key, key_begin, key_data, key_end};
     use super::*;
     use crate::config::DEFAULT_EXCLUDE;
+    use crate::git::CommitId;
     use crate::git::test_support::{isolated_repo, move_pointer, run, with_submodule};
+    use finding::FileRef;
     use std::fs;
     use std::path::Path;
     use tempfile::TempDir;
@@ -753,9 +745,24 @@ mod tests {
         warned: "going on",
     };
 
-    fn finding(place: &str, line: Option<usize>, change: Change) -> Finding {
+    /// The file at `path` among the changes.
+    fn changed(path: &str) -> Place {
+        Place::file(path)
+    }
+
+    /// The file at `path` in the commit abbreviated `hash`.
+    fn in_commit(hash: &str, path: &str) -> Place {
+        Place::File(FileRef::changed(path).in_commit(&CommitId::of(hash)))
+    }
+
+    /// The message of the commit abbreviated `hash`.
+    fn message_of(hash: &str) -> Place {
+        Place::Message(Some(CommitId::of(hash)))
+    }
+
+    fn finding(place: Place, line: Option<usize>, change: Change) -> Finding {
         Finding {
-            place: place.to_owned(),
+            place,
             line,
             change,
             kind: "GitHub token".to_owned(),
@@ -812,9 +819,9 @@ mod tests {
     #[test]
     fn lists_each_finding_with_its_place_and_what_the_change_does_to_it() {
         let findings = [
-            finding("src/a.rs", Some(3), Change::Added),
-            finding("commit 1a2b3c4 message", None, Change::Unchanged),
-            finding("b.env", Some(9), Change::Removed),
+            finding(changed("src/a.rs"), Some(3), Change::Added),
+            finding(message_of("1a2b3c4"), None, Change::Unchanged),
+            finding(changed("b.env"), Some(9), Change::Removed),
         ];
         assert_eq!(
             list_findings(&findings.iter().collect::<Vec<_>>()),
@@ -827,7 +834,7 @@ mod tests {
     #[test]
     fn lists_the_first_five_and_counts_the_rest() {
         let findings: Vec<Finding> = (1..=6)
-            .map(|line| finding("a.rs", Some(line), Change::Added))
+            .map(|line| finding(changed("a.rs"), Some(line), Change::Added))
             .collect();
         let all: Vec<&Finding> = findings.iter().collect();
         let five = list_findings(&all[..5]);
@@ -844,8 +851,8 @@ mod tests {
     #[test]
     fn refuses_every_secret_a_change_adds_and_nothing_else() {
         let left_alone = [
-            finding("a.rs", Some(1), Change::Unchanged),
-            finding("a.rs", Some(2), Change::Removed),
+            finding(changed("a.rs"), Some(1), Change::Unchanged),
+            finding(changed("a.rs"), Some(2), Change::Removed),
         ];
         assert!(added(&left_alone).is_empty());
         let verdict_on = |findings: &[Finding], reported: &[Finding]| {
@@ -855,8 +862,8 @@ mod tests {
         assert_eq!(verdict_on(&[], &[]), Verdict::Clean);
 
         let findings = [
-            finding("a.rs", Some(1), Change::Unchanged),
-            finding(".env", Some(2), Change::Added),
+            finding(changed("a.rs"), Some(1), Change::Unchanged),
+            finding(changed(".env"), Some(2), Change::Added),
         ];
         assert_eq!(added(&findings), [&findings[1]]);
         let refusal = Verdict::Refuse(refused(&["   .env:2  GitHub token"]));
@@ -868,9 +875,9 @@ mod tests {
     #[test]
     fn warns_about_the_secrets_a_change_adds_that_the_flow_does_not_list() {
         let findings = [
-            finding("a.rs", Some(1), Change::Removed),
-            finding("Cargo.lock", Some(4), Change::Added),
-            finding("a.rs", Some(3), Change::Added),
+            finding(changed("a.rs"), Some(1), Change::Removed),
+            finding(changed("Cargo.lock"), Some(4), Change::Added),
+            finding(changed("a.rs"), Some(3), Change::Added),
         ];
         let verdict_on =
             |reported: &[Finding]| verdict(&findings, OnSecrets::Warn, reported, &WORDING);
@@ -893,39 +900,63 @@ mod tests {
 
     #[test]
     fn takes_a_finding_in_a_commit_for_the_same_one_in_its_file() {
-        let added = |place: &str| finding(place, Some(2), Change::Added);
-        let in_commit = added("commit 1a2b3c4 src/my file.rs");
+        let added = |place: Place| finding(place, Some(2), Change::Added);
+        let committed = added(in_commit("1a2b3c4", "src/my file.rs"));
         let other_kind = Finding {
             kind: "AWS access key".to_owned(),
-            ..added("src/my file.rs")
+            ..added(changed("src/my file.rs"))
         };
         let cases = [
-            (added("src/my file.rs"), true),
-            (added("commit 1a2b3c4 src/my file.rs"), true),
-            (added("commit 5d6e7f8 src/my file.rs"), false),
-            (added("my file.rs"), false),
-            (finding("src/my file.rs", Some(2), Change::Unchanged), false),
+            (added(changed("src/my file.rs")), true),
+            (added(in_commit("1a2b3c4", "src/my file.rs")), true),
+            (added(in_commit("5d6e7f8", "src/my file.rs")), false),
+            (added(changed("my file.rs")), false),
+            (
+                finding(changed("src/my file.rs"), Some(2), Change::Unchanged),
+                false,
+            ),
             (other_kind, false),
         ];
         for (shown, held) in cases {
             let reported = std::slice::from_ref(&shown);
-            assert_eq!(covered(&in_commit, reported), held, "{shown:?}");
+            assert_eq!(covered(&committed, reported), held, "{shown:?}");
         }
-        assert!(!covered(&in_commit, &[]));
+        assert!(!covered(&committed, &[]));
+    }
+
+    /// A file named like a message or the arguments is a file: it never holds them, nor they it,
+    /// in a warning or at a commit.
+    #[test]
+    fn a_file_named_message_or_arguments_is_only_a_file() {
+        let at = |place: Place| finding(place, None, Change::Added);
+        let pairs = [
+            (changed("message"), message_of("1a2b3c4")),
+            (in_commit("1a2b3c4", "message"), message_of("1a2b3c4")),
+            (changed("message"), Place::Message(None)),
+            (changed("arguments"), Place::Arguments),
+            (in_commit("1a2b3c4", "arguments"), Place::Arguments),
+        ];
+        for (file, text) in pairs {
+            for (shown, later) in [(at(file.clone()), at(text.clone())), (at(text), at(file))] {
+                assert!(!covered(&later, std::slice::from_ref(&shown)), "{shown:?}");
+                let before = std::slice::from_ref(&shown);
+                assert_eq!(new_findings(std::slice::from_ref(&later), before), [later]);
+            }
+        }
     }
 
     #[test]
     fn takes_any_other_finding_for_one_in_the_same_place_on_any_line() {
-        let message = finding("commit 1a2b3c4 message", None, Change::Added);
+        let message = finding(message_of("1a2b3c4"), None, Change::Added);
         assert!(covered(&message, std::slice::from_ref(&message)));
-        let in_file = finding("a.rs", Some(1), Change::Added);
+        let in_file = finding(changed("a.rs"), Some(1), Change::Added);
         assert!(covered(
             &in_file,
-            &[finding("a.rs", Some(9), Change::Added)]
+            &[finding(changed("a.rs"), Some(9), Change::Added)]
         ));
         assert!(!covered(
             &in_file,
-            &[finding("b.rs", Some(1), Change::Added)]
+            &[finding(changed("b.rs"), Some(1), Change::Added)]
         ));
     }
 
@@ -934,19 +965,19 @@ mod tests {
     #[test]
     fn lists_at_a_commit_only_what_the_check_before_it_did_not_find() {
         let before = [
-            finding("a.env", Some(2), Change::Added),
-            finding("message", None, Change::Added),
+            finding(changed("a.env"), Some(2), Change::Added),
+            finding(Place::Message(None), None, Change::Added),
         ];
         let found = [
-            finding("a.env", Some(2), Change::Added),
-            finding("a.env", Some(3), Change::Added),
-            finding("commit 1a2b3c4 a.env", Some(2), Change::Added),
-            finding("commit 1a2b3c4 message", None, Change::Added),
-            finding("b.env", Some(2), Change::Added),
-            finding("a.env", Some(2), Change::Unchanged),
+            finding(changed("a.env"), Some(2), Change::Added),
+            finding(changed("a.env"), Some(3), Change::Added),
+            finding(in_commit("1a2b3c4", "a.env"), Some(2), Change::Added),
+            finding(message_of("1a2b3c4"), None, Change::Added),
+            finding(changed("b.env"), Some(2), Change::Added),
+            finding(changed("a.env"), Some(2), Change::Unchanged),
             Finding {
                 kind: "AWS access key".to_owned(),
-                ..finding("a.env", Some(2), Change::Added)
+                ..finding(changed("a.env"), Some(2), Change::Added)
             },
         ];
 
@@ -961,18 +992,21 @@ mod tests {
     /// it, in the same place or as the commit's file.
     #[test]
     fn lists_at_a_commit_only_the_binary_files_not_listed_before() {
-        let file = |place: &str| Unchecked {
-            place: place.to_owned(),
+        let file = |place: FileRef| Unchecked {
+            place,
             size: MOST_BINARY_BYTES + 1,
         };
-        let before = [file("big.bin")];
+        let before = [file(FileRef::changed("big.bin"))];
         let found = [
-            file("big.bin"),
-            file("commit 1a2b3c4 big.bin"),
-            file("other.bin"),
+            file(FileRef::changed("big.bin")),
+            file(FileRef::changed("big.bin").in_commit(&CommitId::of("1a2b3c4"))),
+            file(FileRef::changed("other.bin")),
         ];
 
-        assert_eq!(new_unchecked(&found, &before), [file("other.bin")]);
+        assert_eq!(
+            new_unchecked(&found, &before),
+            [file(FileRef::changed("other.bin"))]
+        );
         assert_eq!(new_unchecked(&found, &[]), found);
     }
 
@@ -1430,7 +1464,7 @@ mod tests {
         let found = found_in_commits(&repo, &["HEAD"]).unwrap().findings;
 
         assert_eq!(warning(&found, &[], "going on"), Some(shown));
-        let in_file = finding("deploy.env", Some(1), Change::Added);
+        let in_file = finding(changed("deploy.env"), Some(1), Change::Added);
         let reported = [Finding {
             kind: "AWS access key".to_owned(),
             ..in_file
@@ -1644,7 +1678,7 @@ mod tests {
         assert!(scanned.findings.is_empty());
         let size = MOST_BINARY_BYTES + 1;
         let big = Unchecked {
-            place: "big.bin".to_owned(),
+            place: FileRef::changed("big.bin"),
             size,
         };
         assert_eq!(scanned.unchecked, [big]);
@@ -1654,7 +1688,7 @@ mod tests {
     #[test]
     fn lists_the_binary_files_too_large_to_check() {
         let file = |n: u64| Unchecked {
-            place: format!("pkg{n}/data.bin"),
+            place: FileRef::changed(format!("pkg{n}/data.bin")),
             size: MOST_BINARY_BYTES + n * 1024 * 1024,
         };
         assert_eq!(unchecked_verdict(&[]), Verdict::Clean);
@@ -1707,16 +1741,15 @@ mod tests {
 
         let found = found_in_commits(&repo, &OUTGOING).unwrap().findings;
 
-        let place = format!("commit {hash} data.bin");
+        let shown: Vec<_> = found
+            .iter()
+            .map(|finding| (finding.place.to_string(), finding.line, finding.change))
+            .collect();
         assert_eq!(
-            found,
-            [Finding {
-                place,
-                line: None,
-                change: Change::Unchanged,
-                kind: "AWS access key".to_owned()
-            }]
+            shown,
+            [(format!("commit {hash} data.bin"), None, Change::Unchanged)]
         );
+        assert_eq!(found[0].kind, "AWS access key");
         assert!(check_push(&repo, OnSecrets::Reject).is_ok());
     }
 

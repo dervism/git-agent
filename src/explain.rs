@@ -43,7 +43,7 @@ pub fn listed(commit: &Commit) -> String {
     let (subject, body) = message.split_once('\n').unwrap_or((message, ""));
     let mut text = format!(
         "- {} {subject} ({}, {})",
-        commit.hash, commit.author, commit.date
+        commit.id, commit.author, commit.date
     );
     if !body.is_empty() {
         text.push('\n');
@@ -379,7 +379,7 @@ mod tests {
     #[test]
     fn lists_a_commit_with_its_hash_and_author() {
         let commit = Commit {
-            hash: "a1b2c3d".into(),
+            id: crate::git::CommitId::of("a1b2c3d"),
             author: "Ann".into(),
             date: "2025-10-02".into(),
             message: "- feat: add b\n  b replaces a.".into(),

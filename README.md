@@ -761,15 +761,15 @@ Run `git agent config` to change settings in a menu:
 ```text
 git-agent settings · ~/.config/git-agent/config.toml
 ? Setting:
-> Provider        LM Studio · http://localhost:1234/v1
+> Provider        LM Studio · http://localhost:1234/v1 (default)
   Model           automatic: the model loaded on the server
   API key         none (local servers usually need none)
   Context length  automatic: asked from the server
-  Output limit    16,000 tokens (sent only to Anthropic)
+  Output limit    16,000 tokens (default, sent only to Anthropic)
   Temperature     automatic: 0.4 on local servers
-  Timeout         300 seconds
-  Secrets         reject: don't commit or push them
-  Excluded files  common lockfiles
+  Timeout         300 seconds (default)
+  Secrets         reject: don't commit or push them (default)
+  Excluded files  common lockfiles (default)
   System prompt   default: Conventional Commits
   Done
 ```
@@ -778,13 +778,18 @@ Move with the arrow keys and press Enter to change a setting. git-agent saves ea
 change to the config file right away. Esc goes back one step, and quits from the main
 menu. Excluded files and the system prompt open in your git editor. The menu writes
 the same commented file as `git agent config init`, so comments you added to the file
-yourself are not kept.
+yourself are not kept. It writes only the settings you changed and the ones the file
+already sets. "(default)" in the menu marks a setting that the file doesn't set and that
+has a default value; Model, Context length and Temperature say "automatic" instead, and
+System prompt says "default". Output limit, Timeout and Secrets, like Context length and
+Temperature, offer the default or a value of your own, and choosing the default removes
+the setting from the file.
 
 These commands work with the settings too:
 
 ```sh
 git agent config            # change settings in a menu
-git agent config init       # write a commented config file with the defaults
+git agent config init       # write a config file; only flags are saved
 git agent config show       # print the effective settings
 git agent models            # list models on the server; * marks the one git-agent uses
 ```
@@ -799,6 +804,21 @@ Settings come from these sources, and later ones override earlier ones:
 4. Command-line flags
 
 API keys come from `--api-key`, then `GIT_AGENT_API_KEY`, then the macOS keychain.
+
+The config file holds only what you set. `git agent config init` writes every setting as
+a comment. A line that starts with `#` is not set. git-agent uses the value the line
+shows, unless the text above it calls it an example. Remove the `#` to set it.
+
+Settings that you give to `config init` as flags, such as `--model`, are written as set.
+Environment variables and API keys are not written, because you may set them for one
+shell only. `config init` lists the settings it saved. A setting that the file leaves out
+gets the default of the git-agent you run, so a better default in a later release
+reaches you.
+
+A file from an earlier release lists every setting. In any file, a system prompt or an
+excluded files list that is still the default counts as unset. The other lines, such as
+`timeout_secs = 300`, stay set, because git-agent can't tell them from a choice. Delete a
+line to use the default again.
 
 ### Settings
 

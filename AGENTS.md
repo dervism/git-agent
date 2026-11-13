@@ -81,6 +81,7 @@ The modules for single commands:
 | `untracked.rs` | The check of untracked files before `--all` stages them. |
 | `staging.rs` | What happens before the changes are read: refusing unresolved conflicts, staging for `--all`, and warning about submodule changes the diff hides. |
 | `menu.rs` | `git agent config`: the interactive settings menu. |
+| `menu/answer.rs` | What the user chose in one step of the menu, and how it changes the config file. |
 
 The modules the commands share:
 
@@ -101,6 +102,11 @@ The modules the commands share:
 | `redact.rs` | Finds secrets in text before it goes to a model, and replaces them with `[REDACTED]`. |
 | `api_keys.rs` | API keys in the macOS Keychain, so they are never written to a file. |
 | `config.rs` | The settings, and the order of the places they come from. |
+| `config/file.rs` | The config file as the user wrote it (`ConfigFile`): only the settings they set. |
+| `config/released.rs` | The defaults earlier releases wrote into config files, which count as not set. |
+| `config/render.rs` | Writes the config file, with each setting that isn't set as a commented line. |
+| `config/write.rs` | Replaces a file whole, readable only by its owner. |
+| `config/parse_error.rs` | Says what is wrong with a config file without repeating what it holds. |
 | `ui.rs` | Terminal output and the review prompt. Everything it prints goes through one gate that escapes control characters. |
 | `safe_text.rs` | Escapes or removes the characters that could change the terminal or hide text. |
 
@@ -133,7 +139,9 @@ need git create throwaway repositories and run the real `git`. None of them need
 server. `api_keys::tests::keychain_round_trip` is ignored, because it needs the macOS
 Keychain. `split::signals::tests::signals_end_the_program_after_a_check_while_it_waits` is
 ignored on macOS only, because it starts a copy of the test binary, which Gatekeeper can stall
-there; CI runs it on Linux.
+there; CI runs it on Linux. `cli::tests::environment_variables_are_used_but_not_saved` is
+ignored on macOS for the same reason: it starts a copy of the test binary, as the signals test
+does, and CI runs it on Linux.
 
 On macOS, Gatekeeper assesses each freshly built program a test run starts, such as the test
 binary and the hook scripts the tests write. Under load that can stall the machine. Add the app

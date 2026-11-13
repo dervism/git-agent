@@ -1,0 +1,67 @@
+# git-agent configuration
+#
+# Command-line flags and environment variables override these values.
+
+# Base URL of an OpenAI-compatible API, including the /v1 suffix.
+#   LM Studio:  http://localhost:1234/v1
+#   Ollama:     http://localhost:11434/v1
+#   llama.cpp:  http://localhost:8080/v1
+# Overridden by --base-url / GIT_AGENT_BASE_URL.
+base_url = "http://localhost:1234/v1"
+
+# Model ID as listed by `git-agent models`. When it isn't set, git-agent uses
+# the model that is loaded on the server, or the only model the server has.
+# Overridden by --model / GIT_AGENT_MODEL.
+# model = "qwen/qwen3-8b"
+
+# API key sent as a Bearer token. Local servers usually don't need one.
+# Prefer the GIT_AGENT_API_KEY environment variable to storing it here.
+# api_key = ""
+
+# Sampling temperature from 0.0 to 2.0. Lower values give more predictable
+# messages, higher values more varied ones when regenerating.
+temperature = 0.4
+
+# Seconds to wait for the model to answer.
+timeout_secs = 300
+
+# The model's context window in tokens. git-agent shortens large diffs to fit
+# it, leaving room for the reply. When it isn't set, git-agent asks the server
+# (LM Studio, Ollama, llama.cpp and vLLM report it) or assumes 4096
+# tokens. Set it if your server doesn't report it, or lower it to keep prompts
+# small and fast.
+# Overridden by --context-length / GIT_AGENT_CONTEXT_LENGTH.
+# context_length = 32768
+
+# Files whose content is left out of the diff sent to the model. They still
+# appear in the list of changed files. Patterns without a "/" match the file
+# name in any directory; "*" wildcards are allowed.
+exclude = [
+    "Cargo.lock",
+    "package-lock.json",
+    "yarn.lock",
+    "pnpm-lock.yaml",
+    "bun.lockb",
+    "poetry.lock",
+    "uv.lock",
+    "Pipfile.lock",
+    "composer.lock",
+    "Gemfile.lock",
+    "go.sum",
+]
+
+# Instructions given to the model before the diff.
+system_prompt = '''
+You write git commit messages for changes a developer is about to commit.
+
+Format:
+- A subject line in the imperative mood, at most 72 characters, with no trailing period. Start it with a Conventional Commits type (feat, fix, refactor, perf, docs, test, build, ci or chore) and an optional scope, e.g. "fix(parser): handle empty input".
+- Then a blank line and a body explaining what changed and why, wrapped at 72 characters. Use "- " bullets for several distinct changes. Omit the body for trivial changes.
+
+Guidelines:
+- Describe the intent and effect of the change, not a file-by-file narration of the diff.
+- Mention lockfiles and generated files only if they are the main change.
+- Do not invent motivation that the diff and the author's notes do not support.
+
+Reply with the commit message only: no introduction, no Markdown headings, no code fences.
+'''

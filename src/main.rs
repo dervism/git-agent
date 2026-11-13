@@ -32,7 +32,7 @@ use anyhow::{Context, Result, bail};
 use cli::{
     BranchArgs, Command, ConfigCommand, ExplainArgs, GenerateArgs, PrArgs, TidyArgs, WhyArgs,
 };
-use config::{Config, OnSecrets, Overrides};
+use config::{Config, ConfigFile, OnSecrets, Overrides};
 use conversation::models::{self, Model};
 use conversation::{
     commit_message, connect, discuss, generate_message, initial_messages, notes_bytes,
@@ -237,7 +237,7 @@ async fn main() -> ExitCode {
         Some(Command::Config { command: None }) => menu::run(&overrides).await,
         Some(Command::Config {
             command: Some(ConfigCommand::Init { force }),
-        }) => init_config(&overrides, force),
+        }) => config_init(&cli.settings, force),
         Some(Command::Config {
             command: Some(ConfigCommand::Show),
         }) => show_config(&overrides),
@@ -1358,8 +1358,23 @@ async fn list_models(overrides: &Overrides) -> Result<()> {
     Ok(())
 }
 
-fn init_config(overrides: &Overrides, force: bool) -> Result<()> {
-    let path = config::resolve_path(overrides)
+/// What `config init` says when a variable or an API key gave something it didn't write.
+const INIT_SAVES_ONLY_FLAGS: &str = "   `config init` saves only settings given as flags, never environment variables or an API key.";
+
+/// `git agent config init`: writes the settings given as flags, and says so when others were
+/// given that it doesn't write.
+fn config_init(settings: &cli::SettingArgs, force: bool) -> Result<()> {
+    init_config(&settings.flag_overrides(), force)?;
+    if settings.gives_what_init_does_not_save() {
+        ui::info(INIT_SAVES_ONLY_FLAGS);
+    }
+    Ok(())
+}
+
+/// Writes the config file with the settings in `flags`, which are the ones given as flags,
+/// and says what it wrote.
+fn init_config(flags: &Overrides, force: bool) -> Result<()> {
+    let path = config::resolve_path(flags)
         .context("could not find a config directory; set HOME or pass --config")?;
     if path.exists() && !force {
         bail!(
@@ -1367,11 +1382,26 @@ fn init_config(overrides: &Overrides, force: bool) -> Result<()> {
             path.display()
         );
     }
-    let mut config = Config::default();
-    config.apply(overrides);
-    config.save(&path)?;
-    ui::info(format!("Wrote {}", path.display()));
+    let file = ConfigFile::from_overrides(flags).validated()?;
+    file.save(&path)?;
+    init_report(&path, &file).into_iter().for_each(ui::info);
     Ok(())
+}
+
+/// The lines that tell what `config init` wrote: the names of the settings it saved, and no
+/// values, since a value can be a URL with a password.
+fn init_report(path: &Path, file: &ConfigFile) -> Vec<String> {
+    let names = file.set_names();
+    let saved = (!names.is_empty()).then(|| format!("   Saved from flags: {}", names.join(", ")));
+    let warns = (file.on_secrets == Some(OnSecrets::Warn)).then(|| {
+        "   `on_secrets = \"warn\"`: git-agent will only warn about secrets it finds, \
+         and won't stop a commit or push."
+            .to_owned()
+    });
+    [Some(format!("Wrote {}", path.display())), saved, warns]
+        .into_iter()
+        .flatten()
+        .collect()
 }
 
 fn show_config(overrides: &Overrides) -> Result<()> {
@@ -1720,5 +1750,174 @@ mod tests {
             run(dir.path(), &["log", "-1", "--format=%B"]).trim_end(),
             message
         );
+    }
+
+    /// Runs `git agent config init` with `args` in `dir`, as the command line would.
+    fn init_with(dir: &TempDir, args: &[&str], force: bool) -> Result<ConfigFile> {
+        let path = dir.path().join("config.toml");
+        let path_text = path.to_str().unwrap();
+        let mut line = vec!["git-agent", "--config", path_text, "config", "init"];
+        line.extend_from_slice(args);
+        let cli = cli::try_parse_from(line).unwrap();
+        init_config(&cli.settings.flag_overrides(), force)?;
+        Ok(ConfigFile::read(&path)?.unwrap())
+    }
+
+    fn init_in(dir: &TempDir, model: Option<&str>, force: bool) -> Result<ConfigFile> {
+        match model {
+            Some(model) => init_with(dir, &["--model", model], force),
+            None => init_with(dir, &[], force),
+        }
+    }
+
+    #[test]
+    fn init_writes_no_setting_as_a_value_when_none_is_given() {
+        let dir = TempDir::new().unwrap();
+        assert_eq!(init_in(&dir, None, false).unwrap(), ConfigFile::default());
+        let text = fs::read_to_string(dir.path().join("config.toml")).unwrap();
+        assert!(text.contains("\n# timeout_secs = 300\n"), "{text}");
+        assert!(text.contains("\n# system_prompt = '''\n"), "{text}");
+    }
+
+    #[test]
+    fn init_writes_only_the_settings_the_flags_give() {
+        let dir = TempDir::new().unwrap();
+        let file = init_in(&dir, Some("some-model"), false).unwrap();
+        assert_eq!(
+            file,
+            ConfigFile {
+                model: Some("some-model".into()),
+                ..ConfigFile::default()
+            }
+        );
+        let blank = TempDir::new().unwrap();
+        assert_eq!(
+            init_in(&blank, Some("  "), false).unwrap(),
+            ConfigFile::default()
+        );
+    }
+
+    #[test]
+    fn init_writes_every_setting_a_flag_gives_wherever_the_flag_stands() {
+        let flags = [
+            "--base-url",
+            "http://localhost:1/v1",
+            "--model",
+            "m",
+            "--context-length",
+            "8192",
+            "--max-output-tokens",
+            "4096",
+            "--temperature",
+            "0.7",
+            "--on-secrets",
+            "warn",
+        ];
+        let expected = ConfigFile {
+            base_url: Some("http://localhost:1/v1".into()),
+            model: Some("m".into()),
+            context_length: Some(8192),
+            max_output_tokens: Some(4096),
+            temperature: Some(0.7),
+            on_secrets: Some(OnSecrets::Warn),
+            ..ConfigFile::default()
+        };
+        let dir = TempDir::new().unwrap();
+        assert_eq!(init_with(&dir, &flags, false).unwrap(), expected);
+
+        let before = TempDir::new().unwrap();
+        let path = before.path().join("config.toml");
+        let mut line = vec!["git-agent"];
+        line.extend(flags);
+        line.extend(["--config", path.to_str().unwrap(), "config", "init"]);
+        let cli = cli::try_parse_from(line).unwrap();
+        init_config(&cli.settings.flag_overrides(), false).unwrap();
+        assert_eq!(ConfigFile::read(&path).unwrap().unwrap(), expected);
+    }
+
+    #[test]
+    fn init_keeps_an_existing_file_unless_forced() {
+        let dir = TempDir::new().unwrap();
+        init_in(&dir, Some("first"), false).unwrap();
+        assert!(init_in(&dir, Some("second"), false).is_err());
+        let path = dir.path().join("config.toml");
+        assert_eq!(
+            ConfigFile::read(&path).unwrap().unwrap().model.as_deref(),
+            Some("first")
+        );
+        let forced = init_in(&dir, Some("second"), true).unwrap();
+        assert_eq!(forced.model.as_deref(), Some("second"));
+    }
+
+    #[test]
+    fn init_writes_nothing_when_a_flag_is_not_valid() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("config.toml");
+        let bad = ["--base-url", "nope", "--max-output-tokens", "10"];
+        let error = init_with(&dir, &bad, false).unwrap_err();
+        assert!(error.to_string().contains("must"), "{error}");
+        assert!(!path.exists());
+
+        init_in(&dir, Some("kept"), false).unwrap();
+        assert!(init_with(&dir, &bad, true).is_err());
+        assert_eq!(
+            ConfigFile::read(&path).unwrap().unwrap().model.as_deref(),
+            Some("kept")
+        );
+    }
+
+    #[test]
+    fn init_reports_the_names_of_what_it_saved_and_no_values() {
+        let path = Path::new("c.toml");
+        let nothing = init_report(path, &ConfigFile::default());
+        assert_eq!(nothing, ["Wrote c.toml"]);
+
+        let password = format!("pw{}", "M3".repeat(5));
+        let file = ConfigFile {
+            base_url: Some(format!("https://user:{password}@example.com/v1")),
+            model: Some("some-model".into()),
+            temperature: Some(0.7),
+            ..ConfigFile::default()
+        };
+        let lines = init_report(path, &file);
+        assert_eq!(lines[0], "Wrote c.toml");
+        assert_eq!(
+            lines[1],
+            "   Saved from flags: base_url, model, temperature"
+        );
+        assert_eq!(lines.len(), 2);
+        let all = lines.join("\n");
+        for value in [password.as_str(), "some-model", "0.7", "example.com"] {
+            assert!(!all.contains(value), "{value}");
+        }
+    }
+
+    #[test]
+    fn init_says_when_secrets_are_only_warned_about() {
+        let file = ConfigFile {
+            on_secrets: Some(OnSecrets::Warn),
+            ..ConfigFile::default()
+        };
+        let lines = init_report(Path::new("c.toml"), &file);
+        assert_eq!(lines[1], "   Saved from flags: on_secrets");
+        assert!(lines[2].contains("only warn about secrets"), "{lines:?}");
+        let reject = ConfigFile {
+            on_secrets: Some(OnSecrets::Reject),
+            ..ConfigFile::default()
+        };
+        assert_eq!(init_report(Path::new("c.toml"), &reject).len(), 2);
+    }
+
+    #[test]
+    fn init_given_only_the_environments_settings_saves_nothing() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("config.toml");
+        let from_environment = cli::SettingArgs::for_test_from_environment(&path);
+        config_init(&from_environment, false).unwrap();
+        assert_eq!(
+            ConfigFile::read(&path).unwrap().unwrap(),
+            ConfigFile::default()
+        );
+        assert!(from_environment.gives_what_init_does_not_save());
     }
 }

@@ -108,7 +108,29 @@ pub struct SettingArgs {
         value_enum
     )]
     pub on_secrets: Option<SecretsAction>,
+
+    /// The settings that were given as flags, as opposed to the environment. `None` until
+    /// [`try_parse_from`] has read the command line; clap's own `parse` can't know them.
+    #[arg(skip)]
+    given_as_flags: Option<Vec<&'static str>>,
 }
+
+const MODEL: &str = "model";
+const CONTEXT_LENGTH: &str = "context_length";
+const MAX_OUTPUT_TOKENS: &str = "max_output_tokens";
+const BASE_URL: &str = "base_url";
+const TEMPERATURE: &str = "temperature";
+const ON_SECRETS: &str = "on_secrets";
+
+/// The ids of the settings that `config init` can write.
+const SAVED_SETTINGS: [&str; 6] = [
+    MODEL,
+    CONTEXT_LENGTH,
+    MAX_OUTPUT_TOKENS,
+    BASE_URL,
+    TEMPERATURE,
+    ON_SECRETS,
+];
 
 impl SettingArgs {
     /// The settings as the config takes them.
@@ -123,6 +145,62 @@ impl SettingArgs {
             temperature: self.temperature,
             on_secrets: self.on_secrets.map(OnSecrets::from),
         }
+    }
+
+    /// The settings given as flags on this command line, which `config init` writes into the
+    /// file. A setting that only an environment variable gives is left out, since the
+    /// variable may be set for one run or one shell. The config file's own location stays.
+    ///
+    /// Panics when this came from clap's own `parse` and not from [`try_parse_from`].
+    pub fn flag_overrides(&self) -> Overrides {
+        let given = self
+            .given_as_flags
+            .as_ref()
+            .expect("the command line was read by cli::try_parse_from");
+        let flag = |id: &str| given.contains(&id);
+        let all = self.overrides();
+        Overrides {
+            config: all.config,
+            model: all.model.filter(|_| flag(MODEL)),
+            context_length: all.context_length.filter(|_| flag(CONTEXT_LENGTH)),
+            max_output_tokens: all.max_output_tokens.filter(|_| flag(MAX_OUTPUT_TOKENS)),
+            base_url: all.base_url.filter(|_| flag(BASE_URL)),
+            api_key: None,
+            temperature: all.temperature.filter(|_| flag(TEMPERATURE)),
+            on_secrets: all.on_secrets.filter(|_| flag(ON_SECRETS)),
+        }
+    }
+
+    /// Settings that an environment variable gives and no flag, for tests.
+    #[cfg(test)]
+    pub fn for_test_from_environment(config: &std::path::Path) -> Self {
+        Self {
+            config: Some(config.to_path_buf()),
+            model: Some("from-the-environment".into()),
+            on_secrets: Some(SecretsAction::Warn),
+            given_as_flags: Some(Vec::new()),
+            ..Self::default()
+        }
+    }
+
+    /// Whether the command line or the environment gives something that `config init` does
+    /// not write: a setting that only an environment variable gives, or an API key.
+    pub fn gives_what_init_does_not_save(&self) -> bool {
+        let given = |overrides: &Overrides| {
+            [
+                overrides.model.is_some(),
+                overrides.context_length.is_some(),
+                overrides.max_output_tokens.is_some(),
+                overrides.base_url.is_some(),
+                overrides.temperature.is_some(),
+                overrides.on_secrets.is_some(),
+            ]
+            .into_iter()
+            .filter(|given| *given)
+            .count()
+        };
+        let all = self.overrides();
+        all.api_key.is_some() || given(&all) != given(&self.flag_overrides())
     }
 }
 
@@ -310,7 +388,8 @@ pub enum Command {
 
 #[derive(Subcommand, Debug)]
 pub enum ConfigCommand {
-    /// Write a config file with the current settings and explanatory comments
+    /// Write a config file with explanatory comments; only settings given as command-line flags
+    /// are saved, never environment variables
     Init {
         /// Overwrite an existing file
         #[arg(long)]
@@ -350,7 +429,24 @@ where
 {
     let mut matches = Cli::command().try_get_matches_from(args)?;
     refuse_misplaced_options(&matches)?;
-    Cli::from_arg_matches_mut(&mut matches).map_err(|error| error.format(&mut Cli::command()))
+    let given_as_flags = SAVED_SETTINGS
+        .into_iter()
+        .filter(|id| given_as_flag(&matches, id))
+        .collect();
+    let mut cli = Cli::from_arg_matches_mut(&mut matches)
+        .map_err(|error| error.format(&mut Cli::command()))?;
+    cli.settings.given_as_flags = Some(given_as_flags);
+    Ok(cli)
+}
+
+/// Whether the setting `id` was given on the command line, before or after a subcommand,
+/// and not through its environment variable.
+fn given_as_flag(matches: &ArgMatches, id: &str) -> bool {
+    let here = matches.try_contains_id(id).unwrap_or(false)
+        && matches.value_source(id) == Some(ValueSource::CommandLine);
+    here || matches
+        .subcommand()
+        .is_some_and(|(_, inner)| given_as_flag(inner, id))
 }
 
 /// `git agent --all split` would run `split` without `--all`, so the default
@@ -937,5 +1033,186 @@ mod tests {
             ),
             "{usage}"
         );
+    }
+
+    /// What a setting's flag puts in `flag_overrides`, apart from the config file's place.
+    fn saved_by(overrides: &Overrides) -> Vec<&'static str> {
+        [
+            (overrides.model.is_some(), "model"),
+            (overrides.context_length.is_some(), "context_length"),
+            (overrides.max_output_tokens.is_some(), "max_output_tokens"),
+            (overrides.base_url.is_some(), "base_url"),
+            (overrides.temperature.is_some(), "temperature"),
+            (overrides.on_secrets.is_some(), "on_secrets"),
+        ]
+        .into_iter()
+        .filter_map(|(saved, name)| saved.then_some(name))
+        .collect()
+    }
+
+    #[test]
+    fn a_flag_is_saved_before_and_after_config_init() {
+        let expected = [
+            ("--model", "model"),
+            ("--context-length", "context_length"),
+            ("--max-output-tokens", "max_output_tokens"),
+            ("--base-url", "base_url"),
+            ("--temperature", "temperature"),
+            ("--on-secrets", "on_secrets"),
+        ];
+        for (flag, name) in expected {
+            let setting = SETTINGS.iter().find(|setting| setting[0] == flag).unwrap();
+            for call in [
+                [&setting[..], &["config", "init"]].concat(),
+                [&["config"][..], setting, &["init"]].concat(),
+                [&["config", "init"], &setting[..]].concat(),
+            ] {
+                let cli = parse(&call).unwrap();
+                assert_eq!(saved_by(&cli.settings.flag_overrides()), [name], "{call:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_config_files_place_is_kept_and_an_api_key_is_never_saved() {
+        let cli = parse(&["--config", "f.toml", "--api-key", "k", "config", "init"]).unwrap();
+        let flags = cli.settings.flag_overrides();
+        assert_eq!(flags.config, Some(PathBuf::from("f.toml")));
+        assert_eq!(flags.api_key, None);
+        assert_eq!(cli.settings.overrides().api_key.as_deref(), Some("k"));
+        assert!(saved_by(&flags).is_empty());
+    }
+
+    #[test]
+    fn a_command_line_without_flags_saves_nothing() {
+        let cli = parse(&["config", "init"]).unwrap();
+        assert!(saved_by(&cli.settings.flag_overrides()).is_empty());
+    }
+
+    #[test]
+    fn every_saved_setting_is_an_argument_clap_knows() {
+        let command = Cli::command();
+        for id in SAVED_SETTINGS {
+            assert!(
+                command.get_arguments().any(|arg| arg.get_id() == id),
+                "{id}"
+            );
+        }
+        let mut distinct = SAVED_SETTINGS.to_vec();
+        distinct.dedup();
+        assert_eq!(distinct.len(), SAVED_SETTINGS.len());
+    }
+
+    #[test]
+    #[should_panic(expected = "cli::try_parse_from")]
+    #[allow(clippy::disallowed_methods)]
+    fn clap_s_own_parse_does_not_know_which_settings_were_flags() {
+        let cli = Cli::try_parse_from(["git-agent", "config", "init"]).unwrap();
+        cli.settings.flag_overrides();
+    }
+
+    #[test]
+    fn says_when_something_is_given_that_init_does_not_save() {
+        let says = |args: &[&str]| {
+            parse(args)
+                .unwrap()
+                .settings
+                .gives_what_init_does_not_save()
+        };
+        assert!(!says(&["config", "init"]));
+        assert!(!says(&[
+            "config",
+            "init",
+            "--model",
+            "m",
+            "--on-secrets",
+            "warn"
+        ]));
+        assert!(says(&["config", "init", "--api-key", "k"]));
+        assert!(says(&["config", "--api-key", "k", "init", "--model", "m"]));
+        let from_the_environment = SettingArgs {
+            on_secrets: Some(SecretsAction::Warn),
+            given_as_flags: Some(Vec::new()),
+            ..SettingArgs::default()
+        };
+        assert!(from_the_environment.gives_what_init_does_not_save());
+    }
+
+    #[test]
+    fn a_setting_that_did_not_come_from_a_flag_is_used_but_not_saved() {
+        let from_the_environment = SettingArgs {
+            given_as_flags: Some(Vec::new()),
+            on_secrets: Some(SecretsAction::Warn),
+            model: Some("m".into()),
+            ..SettingArgs::default()
+        };
+        assert_eq!(
+            from_the_environment.overrides().on_secrets,
+            Some(OnSecrets::Warn)
+        );
+        assert!(saved_by(&from_the_environment.flag_overrides()).is_empty());
+    }
+
+    const ENVIRONMENT_VARIABLE: &str = "GIT_AGENT_TEST_ENVIRONMENT_HELPER";
+
+    /// The run of `environment_variables_are_used_but_not_saved`, in a process that has
+    /// `GIT_AGENT_ON_SECRETS` and `GIT_AGENT_MODEL` set. Does nothing without its variable.
+    #[test]
+    #[ignore = "run by environment_variables_are_used_but_not_saved"]
+    fn environment_helper() {
+        if std::env::var_os(ENVIRONMENT_VARIABLE).is_none() {
+            return;
+        }
+        let from_env = parse(&["config", "init"]).unwrap();
+        assert_eq!(
+            from_env.settings.overrides().on_secrets,
+            Some(OnSecrets::Warn)
+        );
+        assert_eq!(
+            from_env.settings.overrides().model.as_deref(),
+            Some("from-env")
+        );
+        assert!(saved_by(&from_env.settings.flag_overrides()).is_empty());
+
+        let both = parse(&["config", "init", "--on-secrets", "reject"]).unwrap();
+        assert_eq!(
+            both.settings.overrides().on_secrets,
+            Some(OnSecrets::Reject)
+        );
+        assert_eq!(saved_by(&both.settings.flag_overrides()), ["on_secrets"]);
+        assert_eq!(
+            both.settings.flag_overrides().on_secrets,
+            Some(OnSecrets::Reject)
+        );
+    }
+
+    /// Environment variables only reach clap through the process, so this runs `environment_helper`
+    /// in a copy of the test binary. Gatekeeper on macOS can stall such a copy at its start, so it
+    /// runs on Linux, as CI does, and not on macOS.
+    #[test]
+    #[cfg_attr(
+        target_os = "macos",
+        ignore = "starts a copy of the test binary, which Gatekeeper on macOS can stall"
+    )]
+    fn environment_variables_are_used_but_not_saved() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--ignored",
+                "--exact",
+                "--nocapture",
+                "cli::tests::environment_helper",
+            ])
+            .env(ENVIRONMENT_VARIABLE, "1")
+            .env("GIT_AGENT_ON_SECRETS", "warn")
+            .env("GIT_AGENT_MODEL", "from-env")
+            .output()
+            .unwrap();
+        let text = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success(),
+            "{text}\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(text.contains("1 passed"), "{text}");
     }
 }

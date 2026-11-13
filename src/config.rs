@@ -5,13 +5,19 @@
 //! API keys never come from the file: they come from a flag, the environment,
 //! or the macOS keychain (see `api_keys.rs`).
 
+mod file;
+mod parse_error;
+mod released;
+mod render;
+mod write;
+
+pub use file::ConfigFile;
+
 use crate::{api_keys, providers};
-use anyhow::{Context, Result, bail};
+use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
-use std::env;
-use std::fs;
-use std::io::ErrorKind;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
+use std::{env, mem};
 
 pub const DEFAULT_BASE_URL: &str = "http://localhost:1234/v1";
 /// Context length assumed when neither the config nor the server gives one.
@@ -76,6 +82,9 @@ pub struct Overrides {
 /// What git-agent does when the changes it would commit, or the commits it
 /// would push or open a pull request for, add what look like secrets. Either
 /// way, the model gets them replaced (see `redact.rs`).
+///
+/// The default applies to every config file that doesn't set `on_secrets`, so changing it
+/// changes what git-agent does for all of those users.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum OnSecrets {
@@ -95,8 +104,9 @@ impl OnSecrets {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
+/// The settings in force: what the config file, the environment and the flags say, and the
+/// defaults for the rest. [`ConfigFile`] holds only what the file sets.
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Config {
     pub base_url: String,
     /// `None` uses the model loaded on the server.
@@ -148,14 +158,14 @@ impl Config {
     pub fn load(overrides: &Overrides) -> Result<Loaded> {
         let path = resolve_path(overrides);
         let file = match &path {
-            Some(path) => Self::read_file(path)?,
+            Some(path) => ConfigFile::read(path)?,
             None => None,
         };
         if file.is_none() && overrides.config.is_some() {
             bail!("config file {} does not exist", path.unwrap().display());
         }
         let file_found = file.is_some();
-        let mut config = file.unwrap_or_default();
+        let mut config = file.map(ConfigFile::resolve).unwrap_or_default();
         config.apply(overrides);
         if config.api_key.is_none() {
             config.api_key = api_keys::get(&config.base_url)?;
@@ -168,44 +178,20 @@ impl Config {
         })
     }
 
-    /// The settings in the file at `path`, or `None` if there is no file.
-    pub fn read_file(path: &Path) -> Result<Option<Self>> {
-        let text = match fs::read_to_string(path) {
-            Ok(text) => text,
-            Err(err) if err.kind() == ErrorKind::NotFound => return Ok(None),
-            Err(err) => {
-                return Err(err).with_context(|| format!("failed to read {}", path.display()));
-            }
-        };
-        let config = toml::from_str(&text)
-            .with_context(|| format!("invalid config file {}", path.display()))?;
-        Ok(Some(config))
-    }
-
+    /// Applies flags and `GIT_AGENT_*` variables. A blank model among them clears the model, so
+    /// git-agent uses the one loaded on the server whatever the file says.
     pub fn apply(&mut self, overrides: &Overrides) {
-        if let Some(base_url) = &overrides.base_url {
-            self.base_url = base_url.clone();
-        }
-        if let Some(model) = &overrides.model {
-            self.model = Some(model.clone());
-        }
-        if let Some(api_key) = &overrides.api_key {
-            self.api_key = Some(api_key.clone());
-        }
-        if let Some(temperature) = overrides.temperature {
-            self.temperature = Some(temperature);
-        }
-        if let Some(context_length) = overrides.context_length {
-            self.context_length = Some(context_length);
-        }
-        if let Some(tokens) = overrides.max_output_tokens {
-            self.max_output_tokens = tokens;
-        }
-        if let Some(on_secrets) = overrides.on_secrets {
-            self.on_secrets = on_secrets;
-        }
-        self.model = self.model.take().filter(|model| !model.trim().is_empty());
-        self.api_key = self.api_key.take().filter(|key| !key.trim().is_empty());
+        let api_key = overrides.api_key.clone().or_else(|| self.api_key.take());
+        let clears_model = overrides
+            .model
+            .as_deref()
+            .is_some_and(|model| model.trim().is_empty());
+        let applied = mem::take(self).overlaid(ConfigFile::from_overrides(overrides));
+        *self = Self {
+            api_key: api_key.filter(|key| !key.trim().is_empty()),
+            model: applied.model.filter(|_| !clears_model),
+            ..applied
+        };
     }
 
     fn validate(&self) -> Result<()> {
@@ -221,10 +207,7 @@ impl Config {
             );
         }
         if !(self.base_url.starts_with("http://") || self.base_url.starts_with("https://")) {
-            bail!(
-                "base_url must start with http:// or https:// (got {:?})",
-                self.base_url
-            );
+            bail!("base_url must start with http:// or https://");
         }
         if let Some(temperature) = self.temperature
             && !(0.0..=2.0).contains(&temperature)
@@ -240,16 +223,6 @@ impl Config {
     pub fn effective_temperature(&self) -> Option<f32> {
         let local = providers::is_local(&self.base_url).then_some(LOCAL_TEMPERATURE);
         self.temperature.or(local)
-    }
-
-    /// Writes the settings to `path` as a commented file, creating its directory.
-    pub fn save(&self, path: &Path) -> Result<()> {
-        if let Some(dir) = path.parent() {
-            fs::create_dir_all(dir)
-                .with_context(|| format!("failed to create {}", dir.display()))?;
-        }
-        fs::write(path, template(self))
-            .with_context(|| format!("failed to write {}", path.display()))
     }
 }
 
@@ -272,141 +245,22 @@ fn default_path() -> Option<PathBuf> {
     Some(config_dir.join("git-agent").join("config.toml"))
 }
 
-/// A commented config file containing `config`'s values.
-pub fn template(config: &Config) -> String {
-    let exclude: String = config
-        .exclude
-        .iter()
-        .map(|pattern| format!("    {},\n", toml_string(pattern)))
-        .collect();
-    let system_prompt = if config.system_prompt.contains("'''") {
-        toml_string(&config.system_prompt)
-    } else {
-        format!("'''\n{}\n'''", config.system_prompt.trim())
-    };
-    let model = match &config.model {
-        Some(model) => format!("model = {}", toml_string(model)),
-        None => "# model = \"qwen/qwen3-8b\"".to_owned(),
-    };
-    let context_length = match config.context_length {
-        Some(tokens) => format!("context_length = {tokens}"),
-        None => "# context_length = 32768".to_owned(),
-    };
-    let temperature = match config.temperature {
-        Some(temperature) => format!("temperature = {temperature}"),
-        None => "# temperature = 0.4".to_owned(),
-    };
-    format!(
-        r#"# git-agent configuration
-#
-# Change these settings with `git agent config`, or edit this file. Command-line
-# flags and environment variables override these values.
-
-# Base URL of an OpenAI-compatible API, including the /v1 suffix.
-#   LM Studio:  http://localhost:1234/v1
-#   Ollama:     http://localhost:11434/v1
-#   OpenAI:     https://api.openai.com/v1
-# `git agent config` lists more providers.
-# Overridden by --base-url / GIT_AGENT_BASE_URL.
-base_url = {base_url}
-
-# Model ID as listed by `git-agent models`. When it isn't set, git-agent uses
-# the model that is loaded on the server, or the only model the server has.
-# Overridden by --model / GIT_AGENT_MODEL.
-{model}
-
-# API keys are never stored in this file. On macOS, `git agent config` saves
-# them in the keychain. Otherwise, set the GIT_AGENT_API_KEY environment variable.
-
-# Sampling temperature from 0.0 to 2.0. Lower values give more predictable
-# messages. When it isn't set, git-agent uses {local_temperature} on local servers and
-# leaves it to the provider in the cloud, since many cloud models accept only
-# their default. Anthropic's API takes no temperature at all.
-{temperature}
-
-# Seconds to wait for the model to answer.
-timeout_secs = {timeout_secs}
-
-# Most tokens the model may write in one reply, thinking included. git-agent
-# sends it to Anthropic, whose API needs a limit; OpenAI-compatible servers use
-# their own. It is also the most room git-agent keeps free for the reply. Much
-# higher values can make a reply take longer than `timeout_secs`.
-# Overridden by --max-output-tokens / GIT_AGENT_MAX_OUTPUT_TOKENS.
-max_output_tokens = {max_output_tokens}
-
-# The model's context window in tokens. git-agent shortens large diffs to fit
-# it, leaving room for the reply. When it isn't set, git-agent asks the server
-# (LM Studio, Ollama, llama.cpp, vLLM, Anthropic and OpenRouter report it) or
-# assumes {fallback} tokens. Set it if your server doesn't report it, or lower it to keep prompts
-# small and fast.
-# Overridden by --context-length / GIT_AGENT_CONTEXT_LENGTH.
-{context_length}
-
-# What git-agent does when the changes it would commit, or the commits it would
-# push or open a pull request for, add what look like secrets, such as API keys,
-# private keys or passwords:
-#   "reject"  don't commit, push or create the pull request
-#   "warn"    list them and carry on
-# Either way, the model gets [REDACTED] in their place.
-# Overridden by --on-secrets / GIT_AGENT_ON_SECRETS.
-on_secrets = {on_secrets}
-
-# Files whose content is left out of the diff sent to the model. They still
-# appear in the list of changed files. Patterns without a "/" match the file
-# name in any directory; "*" wildcards are allowed.
-exclude = [
-{exclude}]
-
-# Instructions given to the model before the diff.
-system_prompt = {system_prompt}
-"#,
-        base_url = toml_string(&config.base_url),
-        timeout_secs = config.timeout_secs,
-        max_output_tokens = config.max_output_tokens,
-        on_secrets = toml_string(config.on_secrets.as_str()),
-        local_temperature = LOCAL_TEMPERATURE,
-        fallback = FALLBACK_CONTEXT_LENGTH,
-    )
-}
-
-fn toml_string(value: &str) -> String {
-    toml::Value::String(value.to_owned()).to_string()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn round_trip(config: &Config) -> Config {
-        let mut parsed: Config = toml::from_str(&template(config)).unwrap();
-        parsed.system_prompt = parsed.system_prompt.trim().to_owned();
-        parsed
-    }
-
-    #[test]
-    fn template_round_trips() {
-        let mut config = Config::default();
-        config.system_prompt = config.system_prompt.trim().to_owned();
-        assert_eq!(round_trip(&config), config);
-
-        let config = Config {
-            model: Some("qwen/qwen3-8b".into()),
-            temperature: Some(0.4),
-            context_length: Some(32768),
-            max_output_tokens: 32000,
-            on_secrets: OnSecrets::Warn,
-            exclude: vec!["*.min.js".into(), "docs/generated/**".into()],
-            ..config
-        };
-        assert_eq!(round_trip(&config), config);
+    fn parse(text: &str) -> Result<Config> {
+        ConfigFile::parse(text).map(ConfigFile::resolve)
     }
 
     #[test]
     fn rejects_secrets_unless_told_to_warn() {
         assert_eq!(Config::default().on_secrets, OnSecrets::Reject);
-        let config: Config = toml::from_str("on_secrets = \"warn\"").unwrap();
-        assert_eq!(config.on_secrets, OnSecrets::Warn);
-        assert!(toml::from_str::<Config>("on_secrets = \"ignore\"").is_err());
+        assert_eq!(
+            parse("on_secrets = \"warn\"").unwrap().on_secrets,
+            OnSecrets::Warn
+        );
+        assert!(parse("on_secrets = \"ignore\"").is_err());
 
         let mut config = Config::default();
         config.apply(&Overrides {
@@ -418,12 +272,22 @@ mod tests {
 
     #[test]
     fn never_reads_or_writes_api_keys() {
-        assert!(toml::from_str::<Config>("api_key = \"sk-secret\"").is_err());
-        let config = Config {
+        assert!(ConfigFile::parse("api_key = \"sk-secret\"").is_err());
+        let overrides = Overrides {
             api_key: Some("sk-secret".into()),
-            ..Config::default()
+            ..Overrides::default()
         };
-        assert!(!template(&config).contains("sk-secret"));
+        let file = ConfigFile::from_overrides(&overrides);
+        assert!(!render::render(&file).contains("sk-secret"));
+
+        let mut config = Config::default();
+        config.apply(&overrides);
+        assert_eq!(config.api_key.as_deref(), Some("sk-secret"));
+        assert!(
+            !toml::to_string_pretty(&config)
+                .unwrap()
+                .contains("sk-secret")
+        );
     }
 
     #[test]
@@ -443,15 +307,16 @@ mod tests {
 
     #[test]
     fn missing_keys_fall_back_to_defaults() {
-        let config: Config = toml::from_str("model = \"llama3\"").unwrap();
+        let config = parse("model = \"llama3\"").unwrap();
         assert_eq!(config.model.as_deref(), Some("llama3"));
         assert_eq!(config.base_url, DEFAULT_BASE_URL);
         assert_eq!(config.context_length, None);
+        assert_eq!(parse("").unwrap(), Config::default());
     }
 
     #[test]
     fn rejects_unknown_keys() {
-        assert!(toml::from_str::<Config>("modle = \"llama3\"").is_err());
+        assert!(parse("modle = \"llama3\"").is_err());
     }
 
     #[test]
@@ -481,6 +346,117 @@ mod tests {
             ..Overrides::default()
         });
         assert_eq!(blank.model, None);
+    }
+
+    #[test]
+    fn a_blank_model_flag_clears_the_files_model() {
+        let from_file = || Config {
+            model: Some("from-file".into()),
+            ..Config::default()
+        };
+        for blank in ["", " "] {
+            let mut config = from_file();
+            config.apply(&Overrides {
+                model: Some(blank.into()),
+                ..Overrides::default()
+            });
+            assert_eq!(config.model, None, "{blank:?}");
+        }
+        let mut untouched = from_file();
+        untouched.apply(&Overrides::default());
+        assert_eq!(untouched.model.as_deref(), Some("from-file"));
+    }
+
+    #[test]
+    fn flags_leave_what_they_do_not_name_alone() {
+        let before = Config {
+            base_url: "https://example.com/v1".into(),
+            model: Some("from-file".into()),
+            api_key: Some("key".into()),
+            temperature: Some(0.9),
+            timeout_secs: 12,
+            max_output_tokens: 2048,
+            context_length: Some(9000),
+            on_secrets: OnSecrets::Warn,
+            exclude: vec!["*.min.js".into()],
+            system_prompt: "mine".into(),
+        };
+        let mut after = before.clone();
+        after.apply(&Overrides::default());
+        assert_eq!(after, before);
+    }
+
+    fn load_file(text: &str, overrides: Overrides) -> Result<Loaded> {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, text).unwrap();
+        Config::load(&Overrides {
+            config: Some(path),
+            api_key: Some("test-key".into()),
+            ..overrides
+        })
+    }
+
+    #[test]
+    fn loads_the_file_over_the_defaults_and_the_flags_over_the_file() {
+        let text = "timeout_secs = 60\nmodel = \"from-file\"\n";
+        let loaded = load_file(text, Overrides::default()).unwrap();
+        assert!(loaded.file_found);
+        assert_eq!(loaded.config.timeout_secs, 60);
+        assert_eq!(loaded.config.model.as_deref(), Some("from-file"));
+        assert_eq!(loaded.config.system_prompt, DEFAULT_SYSTEM_PROMPT);
+
+        let flags = Overrides {
+            model: Some("from-flag".into()),
+            ..Overrides::default()
+        };
+        let loaded = load_file(text, flags).unwrap();
+        assert_eq!(loaded.config.model.as_deref(), Some("from-flag"));
+        assert_eq!(loaded.config.timeout_secs, 60);
+    }
+
+    #[test]
+    fn loads_a_file_an_older_release_wrote_with_the_default_prompt() {
+        let text =
+            format!("timeout_secs = 300\nsystem_prompt = '''\n{DEFAULT_SYSTEM_PROMPT}\n'''\n");
+        let loaded = load_file(&text, Overrides::default()).unwrap();
+        assert_eq!(
+            loaded.config,
+            Config {
+                api_key: Some("test-key".into()),
+                ..Config::default()
+            }
+        );
+    }
+
+    #[test]
+    fn refuses_a_missing_file_that_was_asked_for_and_a_bad_setting_in_a_file() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let missing = Overrides {
+            config: Some(dir.path().join("config.toml")),
+            api_key: Some("test-key".into()),
+            ..Overrides::default()
+        };
+        assert!(Config::load(&missing).is_err());
+        assert!(load_file("max_output_tokens = 10", Overrides::default()).is_err());
+    }
+
+    #[test]
+    fn a_bad_base_url_is_refused_without_being_shown() {
+        let password = format!("pw{}", "K4".repeat(6));
+        for url in [
+            format!("user:{password}@host/v1"),
+            format!("ftp://user:{password}@host/v1"),
+            password.clone(),
+        ] {
+            let config = Config {
+                base_url: url,
+                ..Config::default()
+            };
+            let error = config.validate().unwrap_err().to_string();
+            assert!(error.contains("http:// or https://"), "{error}");
+            assert!(!error.contains(&password), "{error}");
+        }
     }
 
     #[test]

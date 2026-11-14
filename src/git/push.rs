@@ -1042,6 +1042,15 @@ mod tests {
         assert_eq!(repo.branch_tips("origin").unwrap(), [main]);
     }
 
+    /// Sets up a remote `name` at `url` that fetches every branch, as `git remote add` does. git
+    /// 2.54 refuses to add one whose name starts another's, such as `origin/mirror`, but uses one
+    /// that its settings, or an older git, made.
+    fn configure_remote(dir: &Path, name: &str, url: &str) {
+        run(dir, &["config", &format!("remote.{name}.url"), url]);
+        let fetch = format!("+refs/heads/*:refs/remotes/{name}/*");
+        run(dir, &["config", &format!("remote.{name}.fetch"), &fetch]);
+    }
+
     /// The branches of a remote named after another, such as `origin/mirror`, sit under
     /// `refs/remotes/origin/` too, but don't count as `origin`'s.
     #[test]
@@ -1050,9 +1059,10 @@ mod tests {
         let _origin = add_remote(&repo);
         let first = head(&repo);
         let mirror = bare();
-        run(
-            dir.path(),
-            &["remote", "add", "origin/mirror", path(&mirror)],
+        configure_remote(dir.path(), "origin/mirror", path(&mirror));
+        assert_eq!(
+            run(dir.path(), &["remote"]).lines().collect::<Vec<_>>(),
+            ["origin", "origin/mirror"]
         );
         let later = commit(dir.path(), &repo, "fn b() {}\n", "feat: b");
         run(

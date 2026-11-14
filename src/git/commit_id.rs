@@ -37,6 +37,11 @@ impl CommitId {
         Self::new(&full, short).expect("a test commit's hash")
     }
 
+    /// The commit's full hash.
+    pub fn full(&self) -> &str {
+        &self.full
+    }
+
     /// The abbreviation git gives the commit.
     pub fn short(&self) -> &str {
         &self.short

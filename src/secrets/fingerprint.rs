@@ -18,6 +18,12 @@ pub struct Fingerprint {
 }
 
 impl Fingerprint {
+    /// Whether it was made of only part of what it stands for, such as a private key that a hunk
+    /// cuts off before its end.
+    pub fn is_partial(self) -> bool {
+        self.partial
+    }
+
     /// A partial print that no other is equal to, for a secret whose text a scan never had all of.
     pub fn unmatched() -> Self {
         static MADE: AtomicU64 = AtomicU64::new(0);

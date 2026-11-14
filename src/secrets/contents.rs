@@ -2,7 +2,7 @@
 //! byte in, and those `.gitattributes` marks `-diff` or `binary`. A diff shows no lines of them,
 //! so their blobs are read instead.
 
-use super::finding::{Change, FileRef, Finding, Place};
+use super::finding::{Change, FileRef, Finding, Place, Scanned, Unchecked};
 use super::fingerprint::{Fingerprint, Fingerprinting, Key};
 use super::lines::{Line, Lines};
 use super::redact::{self, Held, LineScan, Secret, SecretLine, give_prints};
@@ -33,20 +33,6 @@ pub struct BinaryFile {
     pub result: String,
     /// The blobs of what it was in each parent that had it.
     pub parents: Vec<String>,
-}
-
-/// A binary file over [`MOST_BINARY_BYTES`], which isn't checked.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct Unchecked {
-    pub place: FileRef,
-    pub size: u64,
-}
-
-/// What a check read: the secrets it found, and the files it couldn't check.
-#[derive(Debug, Default, PartialEq)]
-pub struct Scanned {
-    pub findings: Vec<Finding>,
-    pub unchecked: Vec<Unchecked>,
 }
 
 /// What a blob holds, as far as secrets go.
@@ -229,6 +215,7 @@ fn scan_from(blobs: &mut impl Blobs, files: &[BinaryFile], cap: u64) -> Result<S
                 Content::TooLarge(size) => scanned.unchecked.push(Unchecked {
                     place: file.place.clone(),
                     size: *size,
+                    blob: file.result.clone(),
                 }),
             }
             contents.done_with(file);
@@ -818,7 +805,8 @@ mod tests {
             scanned.unchecked,
             [Unchecked {
                 place: FileRef::changed("big.bin"),
-                size
+                size,
+                blob: binary,
             }]
         );
         assert_eq!(scanned.findings.len(), 1);
@@ -1024,13 +1012,13 @@ mod tests {
 
         let scanned = scan_from(&mut blobs, &files, 100).unwrap();
 
-        assert_eq!(blobs.read, [small]);
-        assert_eq!(blobs.streamed, [big_binary, big_text]);
-        let size = binary_bytes.len() as u64;
         let listed = Unchecked {
             place: FileRef::changed("big.bin"),
-            size,
+            size: binary_bytes.len() as u64,
+            blob: big_binary.clone(),
         };
+        assert_eq!(blobs.read, [small]);
+        assert_eq!(blobs.streamed, [big_binary, big_text]);
         assert_eq!(scanned.unchecked, [listed]);
         let found: Vec<(String, Option<usize>)> = scanned
             .findings

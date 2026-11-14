@@ -136,7 +136,21 @@ fn stdio_cloned_from(stream: BorrowedFd<'_>) -> io::Result<Stdio> {
 
 /// The one way to stderr for everything the user reads there.
 fn to_stderr(line: &str) {
+    if heard_by_a_test(line) {
+        return;
+    }
     let _ = write_line(&mut io::stderr(), line, color_enabled());
+}
+
+/// Whether a test on this thread hears `line` rather than the terminal.
+#[cfg(test)]
+fn heard_by_a_test(line: &str) -> bool {
+    test_support::kept(line)
+}
+
+#[cfg(not(test))]
+fn heard_by_a_test(_: &str) -> bool {
+    false
 }
 
 /// The program that reads git-agent's output has closed it, as `head` does once it has read
@@ -365,9 +379,90 @@ pub fn edit_line(label: &str, text: &str) -> Result<Option<String>> {
         .filter(|edited| !edited.is_empty()))
 }
 
+/// What the tests use to read what a flow says on stderr.
+#[cfg(test)]
+pub mod test_support {
+    use std::cell::RefCell;
+
+    thread_local! {
+        static SAID: RefCell<Option<Vec<String>>> = const { RefCell::new(None) };
+    }
+
+    /// Keeps `line` instead of writing it, while this thread is [`listen`]ing. Returns whether it
+    /// kept it.
+    pub(super) fn kept(line: &str) -> bool {
+        SAID.with_borrow_mut(|said| said.as_mut().map(|lines| lines.push(line.to_owned())))
+            .is_some()
+    }
+
+    /// Keeps what this thread says on stderr, line by line, until the guard is dropped. Panics
+    /// when the thread listens already, since the inner guard would end what the outer one hears.
+    pub fn listen() -> Said {
+        SAID.with_borrow_mut(|said| {
+            assert!(said.is_none(), "this thread listens already");
+            *said = Some(Vec::new());
+        });
+        Said
+    }
+
+    /// Hears what this thread says on stderr while it lives.
+    pub struct Said;
+
+    impl Said {
+        /// What was said since [`listen`], each call to the gate as one entry.
+        pub fn lines(&self) -> Vec<String> {
+            SAID.with_borrow(|said| said.clone().unwrap_or_default())
+        }
+
+        /// The warnings said, without their `warning:` label.
+        pub fn warnings(&self) -> Vec<String> {
+            let label = super::yellow("warning:");
+            self.lines()
+                .iter()
+                .filter_map(|line| line.strip_prefix(&format!("{label} ")).map(str::to_owned))
+                .collect()
+        }
+    }
+
+    impl Drop for Said {
+        fn drop(&mut self) {
+            SAID.set(None);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// While a test listens, what goes to stderr is kept, each warning also without its label;
+    /// once it stops, nothing is.
+    #[test]
+    fn a_test_hears_what_is_said_on_stderr_while_it_listens() {
+        info("before");
+        let said = test_support::listen();
+        info("one");
+        warn("two\nlines");
+        assert_eq!(
+            said.lines(),
+            [
+                "one".to_owned(),
+                format!("{} two\nlines", yellow("warning:"))
+            ]
+        );
+        assert_eq!(said.warnings(), ["two\nlines"]);
+        drop(said);
+        info("after");
+        let again = test_support::listen();
+        assert!(again.lines().is_empty());
+    }
+
+    #[test]
+    #[should_panic(expected = "this thread listens already")]
+    fn a_test_listens_once_at_a_time() {
+        let _outer = test_support::listen();
+        let _inner = test_support::listen();
+    }
 
     /// What [`for_terminal`] makes of `text`.
     fn shown(text: &str, color: bool) -> String {

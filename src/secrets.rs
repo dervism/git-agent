@@ -6,6 +6,7 @@
 //! streams it (`publication`), a line at a time and a long line in windows (`lines`), so that no
 //! diff or history is held whole. A file a diff shows only as binary is read whole (`contents`).
 
+mod checks;
 pub mod contents;
 pub mod finding;
 pub mod fingerprint;
@@ -14,11 +15,14 @@ mod publication;
 pub mod redact;
 
 use crate::config::OnSecrets;
-use crate::git::{Repo, Scope};
+use crate::git::{CommitId, CommitMade, Repo, Scope};
 use crate::ui;
-use anyhow::{Result, bail};
-use contents::{MOST_BINARY_BYTES, Scanned, Unchecked};
-use finding::{Change, Finding, Place};
+use anyhow::{Context, Result, bail};
+pub use checks::Checks;
+use checks::Earlier;
+use contents::MOST_BINARY_BYTES;
+pub use finding::Scanned;
+use finding::{Change, Finding, Place, Unchecked};
 use publication::Found;
 use std::collections::HashSet;
 
@@ -82,71 +86,128 @@ pub fn check_changes(
     Ok(scanned)
 }
 
-/// What the checks at a commit go by: the setting, and what an earlier check read, which they
-/// don't list again.
-#[derive(Clone, Copy)]
-pub struct AtCommit<'a> {
-    pub on_secrets: OnSecrets,
-    pub before: &'a Scanned,
+/// A commit about to be made: the changes of `scope`, its message, and the arguments it's made
+/// with.
+pub struct NextCommit<'a> {
+    pub scope: Scope,
+    pub message: &'a str,
+    pub arguments: &'a str,
 }
 
-/// Checks what a commit of `scope` will hold just before it's made, with what it adds besides,
-/// its message and arguments, as `(place, text)`: what changed or was staged since the check
-/// before the model, and the text the review settled on. Returns what it read, for the check of
-/// the commit once it's made.
+/// What a commit made: the commits new since it began on HEAD and the branches, which hold the
+/// commit git made and any its hooks made, wherever they left them; and the commit HEAD was at,
+/// `None` on a branch without commits.
+pub struct CommitsMade<'a> {
+    pub on: Option<&'a str>,
+    pub commits: &'a [CommitMade],
+}
+
+impl CommitsMade<'_> {
+    /// The commits made on the commit HEAD was at: the commit git made, and any a hook made there
+    /// too.
+    pub fn made_on_parent(&self) -> impl Iterator<Item = &CommitMade> {
+        self.commits.iter().filter(|commit| commit.made_on(self.on))
+    }
+}
+
+/// What the checks say when they couldn't read what a commit made.
+pub const UNCHECKED_COMMIT: &str = "git-agent couldn't check the commit git made";
+
+/// Checks what the `next` commit will hold just before it's made: what changed or was staged since
+/// the check before the model, which read `before`, and the text the review settled on. Returns
+/// what it read, for the check of the commit once it's made.
 pub fn check_before_commit(
     repo: &Repo,
-    scope: Scope,
-    texts: &[(Place, &str)],
-    at: AtCommit,
+    next: NextCommit,
+    before: &Scanned,
+    checks: &Checks,
     wording: &Wording,
 ) -> Result<Scanned> {
-    let changes = found_in_changes(repo, scope)?;
-    let typed = texts
-        .iter()
-        .flat_map(|(place, text)| redact::text(text, place).findings);
+    let changes = found_in_changes(repo, next.scope)?;
+    let message = redact::text(next.message, &Place::Message(None)).findings;
+    let arguments = redact::text(next.arguments, &Place::Arguments).findings;
     let read = Scanned {
-        findings: changes.findings.into_iter().chain(typed).collect(),
+        findings: changes
+            .findings
+            .into_iter()
+            .chain(message)
+            .chain(arguments)
+            .collect(),
         unchecked: changes.unchecked,
     };
-    decide_at_commit(&read, at, wording)?;
+    decide_at_commit(&read, before, checks.on_secrets(), wording)?;
     Ok(read)
 }
 
-/// Checks the commits `range` (`git log` arguments) that a commit just made, as hooks can change
-/// what's committed after the check before it. Fails under reject on a secret it adds.
+/// Checks the commits `made` holds, since hooks can change what's committed after the check before
+/// it. It compares them with what that check read, `checked`, as in each commit made on
+/// `made.on`. Fails under reject on a secret they add, and on a read that fails, as
+/// [`UNCHECKED_COMMIT`] says; otherwise the run's `checks` keep what it read.
 pub fn check_made_commit(
     repo: &Repo,
-    range: &[&str],
-    at: AtCommit,
+    made: CommitsMade,
+    checked: &Scanned,
+    checks: &mut Checks,
     wording: &Wording,
 ) -> Result<()> {
-    decide_at_commit(&found_in_commits(repo, range)?, at, wording)
+    if made.commits.is_empty() {
+        return Ok(());
+    }
+    let commits: Vec<CommitId> = made
+        .commits
+        .iter()
+        .map(|commit| commit.id.clone())
+        .collect();
+    let read = repo
+        .read_commits(&commits, publication::read_log)
+        .and_then(|found| with_binary_files(repo, found))
+        .context(UNCHECKED_COMMIT)?;
+    let made_on_parent: Vec<CommitId> = made
+        .made_on_parent()
+        .map(|commit| commit.id.clone())
+        .collect();
+    let bound = checked.in_commits(&made_on_parent);
+    decide_at_commit(&read, &bound, checks.on_secrets(), wording)?;
+    checks.record(read);
+    Ok(())
 }
 
 /// Lists the binary files too large to check, and warns about or refuses the secrets, that
-/// `read` holds and the earlier check didn't.
-fn decide_at_commit(read: &Scanned, at: AtCommit, wording: &Wording) -> Result<()> {
+/// `read` holds and `before`, what the earlier check read, doesn't.
+fn decide_at_commit(
+    read: &Scanned,
+    before: &Scanned,
+    on_secrets: OnSecrets,
+    wording: &Wording,
+) -> Result<()> {
     settle(unchecked_verdict(&new_unchecked(
         &read.unchecked,
-        &at.before.unchecked,
+        &before.unchecked,
     )))?;
-    let fresh = new_findings(&read.findings, &at.before.findings);
-    settle(verdict(&fresh, at.on_secrets, &[], wording))
+    let fresh = new_findings(&read.findings, &before.findings);
+    settle(verdict(&fresh, on_secrets, &[], wording))
 }
 
-/// Checks the messages and every file of the commits `range` (`git log` arguments) publishes.
-/// `reported` holds the findings the flow lists itself, which a warning leaves out.
+/// Checks the messages and every file of the commits `range` (`git log` arguments) publishes, as
+/// the run's `checks` say, and has them keep what it read. `reported` holds the findings the flow
+/// lists itself, which a warning leaves out.
 pub fn check_commits(
     repo: &Repo,
     range: &[&str],
-    on_secrets: OnSecrets,
     reported: &[Finding],
+    checks: &mut Checks,
     wording: &Wording,
 ) -> Result<()> {
     let scanned = found_in_commits(repo, range)?;
     settle(unchecked_verdict(&scanned.unchecked))?;
-    settle(verdict(&scanned.findings, on_secrets, reported, wording))
+    settle(verdict(
+        &scanned.findings,
+        checks.on_secrets(),
+        reported,
+        wording,
+    ))?;
+    checks.record(scanned);
+    Ok(())
 }
 
 /// Warns, whatever the setting, about the secrets the commits `range` publishes add, apart
@@ -164,15 +225,14 @@ pub fn warn_about_commits(
 
 /// Checks the commits a push of `commit` would send to each place it goes to: those that none of
 /// the commits `published` for that place holds, the branches it has. One verdict covers all of
-/// them. Its warning lists every secret they add, even one the flow listed before: a finding names
-/// a file rather than the secret, so leaving out what the flow listed could hide another secret of
-/// the same kind in an older commit. Without any place, it checks as for one that has nothing yet,
-/// so that no commit goes unchecked.
+/// them. Its warning leaves out what the run's `checks` of commits found in the same commits, and
+/// lists every other secret they add. Without any place, it checks as for one that has nothing
+/// yet, so that no commit goes unchecked.
 pub fn check_outgoing(
     repo: &Repo,
     commit: &str,
     published: &[Vec<String>],
-    on_secrets: OnSecrets,
+    checks: &Checks,
 ) -> Result<()> {
     let nowhere = [Vec::new()];
     let places = if published.is_empty() {
@@ -188,8 +248,16 @@ pub fn check_outgoing(
         })
         .collect::<Result<Vec<Scanned>>>()?;
     let scanned = each_once(scanned);
-    settle(unchecked_verdict(&scanned.unchecked))?;
-    settle(verdict(&scanned.findings, on_secrets, &[], &PUSH))
+    settle(unchecked_verdict(&new_unchecked(
+        &scanned.unchecked,
+        checks.unchecked(),
+    )))?;
+    settle(verdict(
+        &scanned.findings,
+        checks.on_secrets(),
+        checks.findings(),
+        &PUSH,
+    ))
 }
 
 /// The secrets in every file of what a commit of `scope` will hold.
@@ -286,47 +354,31 @@ fn refusal(findings: &[Finding], wording: &Wording) -> Option<String> {
 /// The warning that lists the secrets `findings` add and `reported` doesn't hold, if there are
 /// any.
 fn warning(findings: &[Finding], reported: &[Finding], warned: &str) -> Option<String> {
+    let earlier = Earlier::findings(reported);
     let new: Vec<&Finding> = added(findings)
         .into_iter()
-        .filter(|finding| !covered(finding, reported))
+        .filter(|finding| !earlier.holds(finding))
         .collect();
     (!new.is_empty()).then(|| format!("{warned}:\n{}", list_findings(&new)))
 }
 
-/// Whether `reported` holds the same kind of secret, changed in the same way, in a place that
-/// holds the finding's: the same place, or the file of the changes that a commit's file is.
-fn covered(finding: &Finding, reported: &[Finding]) -> bool {
-    reported.iter().any(|shown| {
-        shown.kind == finding.kind
-            && shown.change == finding.change
-            && shown.place.holds(&finding.place)
-    })
-}
-
-/// Those of `findings` that `before` doesn't hold on the same line, so that a check at a commit
-/// lists only what's new since the check before it. A finding in the commit made is matched with
-/// one in its file, or in its message, before the commit was.
+/// Those of `findings` that `before` doesn't hold, so that a check at a commit lists only what's
+/// new since the check before it.
 fn new_findings(findings: &[Finding], before: &[Finding]) -> Vec<Finding> {
+    let earlier = Earlier::findings(before);
     findings
         .iter()
-        .filter(|finding| {
-            !before.iter().any(|old| {
-                old.kind == finding.kind
-                    && old.change == finding.change
-                    && old.line == finding.line
-                    && old.place.holds(&finding.place)
-            })
-        })
+        .filter(|finding| !earlier.holds(finding))
         .cloned()
         .collect()
 }
 
-/// Those of `unchecked` that `before` doesn't list, in the same place or the commit's file of
-/// that name.
+/// Those of `unchecked` that `before` doesn't hold: the same content in a place that holds it.
 fn new_unchecked(unchecked: &[Unchecked], before: &[Unchecked]) -> Vec<Unchecked> {
+    let earlier = Earlier::files(before);
     unchecked
         .iter()
-        .filter(|file| !before.iter().any(|old| old.place.holds(&file.place)))
+        .filter(|file| !earlier.holds(file))
         .cloned()
         .collect()
 }
@@ -380,10 +432,32 @@ pub fn list_findings(findings: &[&Finding]) -> String {
 #[cfg(test)]
 pub mod test_support {
     use super::finding::Change;
+    use super::{Checks, PUSH, check_outgoing};
+    use crate::git::Repo;
+    use crate::ui;
+
+    /// What a push of HEAD to a place that has nothing yet warns about, in a run whose `checks`
+    /// came before.
+    pub fn push_warnings(repo: &Repo, checks: &Checks) -> Vec<String> {
+        let head = repo.head_commit().unwrap().unwrap();
+        let said = ui::test_support::listen();
+        check_outgoing(repo, &head, &[], checks).unwrap();
+        said.warnings()
+    }
+
+    /// The warning of a push that lists `shown`, one finding per line.
+    pub fn push_listing(shown: &[String]) -> String {
+        format!("{}:\n{}", PUSH.warned, shown.join("\n"))
+    }
 
     /// An AWS access key's shape, built at run time so that the source holds no key.
     pub fn aws_key() -> String {
         format!("AKIA{}", "Q".repeat(16))
+    }
+
+    /// Another AWS access key's shape than [`aws_key`], built at run time.
+    pub fn other_aws_key() -> String {
+        format!("AKIA{}", "R".repeat(16))
     }
 
     /// A random-looking string of `len` letters and digits, so no real-looking secret is
@@ -713,12 +787,17 @@ pub mod test_support {
 
 #[cfg(test)]
 mod tests {
-    use super::test_support::{aws_key, key_begin, key_data, key_end};
+    use super::test_support::{
+        aws_key, key_begin, key_data, key_end, other_aws_key, push_listing, push_warnings,
+    };
     use super::*;
     use crate::config::DEFAULT_EXCLUDE;
     use crate::git::CommitId;
-    use crate::git::test_support::{isolated_repo, move_pointer, run, with_submodule};
+    use crate::git::test_support::{
+        isolated_repo, move_pointer, run, short_head, tips_of, with_submodule,
+    };
     use finding::FileRef;
+    use finding::test_support::{in_commit, print_of};
     use std::fs;
     use std::path::Path;
     use tempfile::TempDir;
@@ -729,13 +808,18 @@ mod tests {
 
     /// The check of a push of HEAD, with every remote's branches counted as published.
     fn check_push(repo: &Repo, on_secrets: OnSecrets) -> Result<()> {
+        check_push_after(repo, &Checks::new(on_secrets))
+    }
+
+    /// The check of a push of HEAD, as [`check_push`], in a run whose `checks` came before.
+    fn check_push_after(repo: &Repo, checks: &Checks) -> Result<()> {
         let head = repo.head_commit().unwrap().unwrap();
         let tips = run(
             repo.workdir(),
             &["for-each-ref", "--format=%(objectname)", "refs/remotes/"],
         );
         let published: Vec<String> = tips.lines().map(str::to_owned).collect();
-        check_outgoing(repo, &head, &[published], on_secrets)
+        check_outgoing(repo, &head, &[published], checks)
     }
 
     const WORDING: Wording = Wording {
@@ -749,11 +833,6 @@ mod tests {
         Place::file(path)
     }
 
-    /// The file at `path` in the commit abbreviated `hash`.
-    fn in_commit(hash: &str, path: &str) -> Place {
-        Place::File(FileRef::changed(path).in_commit(&CommitId::of(hash)))
-    }
-
     /// The message of the commit abbreviated `hash`.
     fn message_of(hash: &str) -> Place {
         Place::Message(Some(CommitId::of(hash)))
@@ -761,7 +840,7 @@ mod tests {
 
     fn finding(place: Place, line: Option<usize>, change: Change) -> Finding {
         Finding {
-            print: fingerprint::Key::for_run().of(b"a GitHub token"),
+            print: print_of("a GitHub token", false),
             place,
             line,
             change,
@@ -781,9 +860,7 @@ mod tests {
     fn commit_at(dir: &Path, path: &str, text: &str, message: &str) -> String {
         stage(dir, path, text);
         run(dir, &["commit", "-q", "-m", message]);
-        run(dir, &["rev-parse", "--short", "HEAD"])
-            .trim()
-            .to_owned()
+        short_head(dir)
     }
 
     fn commit_file(dir: &Path, text: &str, message: &str) -> String {
@@ -812,6 +889,12 @@ mod tests {
         format!("stopped:\n{}\nFix it. {ADVICE}", shown.join("\n"))
     }
 
+    /// The check of the commits `range` under reject, with nothing the flow lists itself.
+    fn reject_commits(repo: &Repo, range: &[&str]) -> Result<()> {
+        let mut checks = Checks::new(OnSecrets::Reject);
+        check_commits(repo, range, &[], &mut checks, &WORDING)
+    }
+
     fn check_staged(repo: &Repo, scope: Scope) -> Result<Scanned> {
         check_changes(repo, scope, OnSecrets::Reject, &[], &WORDING)
     }
@@ -837,6 +920,61 @@ mod tests {
         let all = each_once(scans.into());
         assert_eq!(all.findings.len(), 150_000);
         assert!(started.elapsed().as_secs() < 30, "{:?}", started.elapsed());
+    }
+
+    /// One secret in 20,000 files, or on 20,000 lines of one, in an older commit and in a commit the
+    /// run read: each is looked up in time that doesn't grow with how many share its print. Under a
+    /// second here in a debug build, well inside the bound.
+    #[test]
+    fn looks_up_many_copies_of_one_secret_quickly() {
+        let in_files = |commit: &str| -> Vec<Finding> {
+            (1..=20_000)
+                .map(|n| {
+                    finding(
+                        in_commit(commit, &format!("{n}.env")),
+                        Some(1),
+                        Change::Added,
+                    )
+                })
+                .collect()
+        };
+        let on_lines = |commit: &str| -> Vec<Finding> {
+            (1..=20_000)
+                .map(|line| finding(in_commit(commit, "a.env"), Some(line), Change::Added))
+                .collect()
+        };
+        let started = std::time::Instant::now();
+
+        for copies in [in_files, on_lines] {
+            let (older, read) = (copies("1a2b3c4"), copies("5d6e7f8"));
+            let warned = warning(&older, &read, "going on").unwrap();
+            assert_eq!(new_findings(&older, &read).len(), 20_000);
+            assert!(warned.ends_with("… and 19995 more"), "{warned}");
+            assert!(new_findings(&read, &read).is_empty());
+        }
+        assert!(started.elapsed().as_secs() < 10, "{:?}", started.elapsed());
+    }
+
+    /// 20,000 files of one blob too large to check in an older commit, and as many in a commit the
+    /// run read: each is looked up as quickly.
+    #[test]
+    fn looks_up_many_files_of_one_blob_quickly() {
+        let files = |commit: &str| -> Vec<Unchecked> {
+            let commit = CommitId::of(commit);
+            (0..20_000)
+                .map(|n| Unchecked {
+                    place: FileRef::changed(format!("data/{n}.bin")).in_commit(&commit),
+                    size: MOST_BINARY_BYTES + 1,
+                    blob: "a".repeat(40),
+                })
+                .collect()
+        };
+        let (older, read) = (files("1a2b3c4"), files("5d6e7f8"));
+        let started = std::time::Instant::now();
+
+        assert_eq!(new_unchecked(&older, &read).len(), 20_000);
+        assert!(new_unchecked(&read, &read).is_empty());
+        assert!(started.elapsed().as_secs() < 10, "{:?}", started.elapsed());
     }
 
     #[test]
@@ -921,32 +1059,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn takes_a_finding_in_a_commit_for_the_same_one_in_its_file() {
-        let added = |place: Place| finding(place, Some(2), Change::Added);
-        let committed = added(in_commit("1a2b3c4", "src/my file.rs"));
-        let other_kind = Finding {
-            kind: "AWS access key".to_owned(),
-            ..added(changed("src/my file.rs"))
-        };
-        let cases = [
-            (added(changed("src/my file.rs")), true),
-            (added(in_commit("1a2b3c4", "src/my file.rs")), true),
-            (added(in_commit("5d6e7f8", "src/my file.rs")), false),
-            (added(changed("my file.rs")), false),
-            (
-                finding(changed("src/my file.rs"), Some(2), Change::Unchanged),
-                false,
-            ),
-            (other_kind, false),
-        ];
-        for (shown, held) in cases {
-            let reported = std::slice::from_ref(&shown);
-            assert_eq!(covered(&committed, reported), held, "{shown:?}");
-        }
-        assert!(!covered(&committed, &[]));
-    }
-
     /// A file named like a message or the arguments is a file: it never holds them, nor they it,
     /// in a warning or at a commit.
     #[test]
@@ -961,40 +1073,66 @@ mod tests {
         ];
         for (file, text) in pairs {
             for (shown, later) in [(at(file.clone()), at(text.clone())), (at(text), at(file))] {
-                assert!(!covered(&later, std::slice::from_ref(&shown)), "{shown:?}");
                 let before = std::slice::from_ref(&shown);
+                let listed = format!("w:\n{}", list_findings(&[&later]));
+                assert_eq!(
+                    warning(std::slice::from_ref(&later), before, "w"),
+                    Some(listed)
+                );
                 assert_eq!(new_findings(std::slice::from_ref(&later), before), [later]);
             }
         }
     }
 
+    /// The warning of a pull request lists a key that a later commit replaced: the flow's own
+    /// list, from the branch's overall diff, holds only the key that replaced it.
     #[test]
-    fn takes_any_other_finding_for_one_in_the_same_place_on_any_line() {
-        let message = finding(message_of("1a2b3c4"), None, Change::Added);
-        assert!(covered(&message, std::slice::from_ref(&message)));
-        let in_file = finding(changed("a.rs"), Some(1), Change::Added);
-        assert!(covered(
-            &in_file,
-            &[finding(changed("a.rs"), Some(9), Change::Added)]
-        ));
-        assert!(!covered(
-            &in_file,
-            &[finding(changed("b.rs"), Some(1), Change::Added)]
-        ));
+    fn lists_a_key_that_a_later_commit_of_a_pull_request_replaced() {
+        let (dir, repo) = isolated_repo();
+        let base = run(dir.path(), &["rev-parse", "HEAD"]).trim().to_owned();
+        let first = commit_file(dir.path(), &format!("aws {}\n", aws_key()), "add a key");
+        commit_file(
+            dir.path(),
+            &format!("aws {}\n", other_aws_key()),
+            "replace it",
+        );
+        let overall = run(dir.path(), &["diff", &base, "HEAD"]);
+        let reported = redact::diff(&overall).findings;
+        let range = format!("{base}..HEAD");
+
+        let mut checks = Checks::new(OnSecrets::Warn);
+
+        let said = ui::test_support::listen();
+        check_commits(&repo, &[&range], &reported, &mut checks, &WORDING).unwrap();
+
+        let shown = format!("going on:\n   commit {first} deploy.env:1  AWS access key");
+        assert_eq!(said.warnings(), [shown]);
+        drop(said);
+        assert_eq!(push_warnings(&repo, &checks), Vec::<String>::new());
     }
 
-    /// A check at a commit lists what the check before it didn't find on the same line, in the
-    /// same file or message, also once the commit names them.
+    /// A check at a commit lists what the check before it didn't find: another secret, or the same
+    /// one changed another way, in another place, or of another kind. The same secret on another
+    /// line isn't listed again, and the message of the commit being made is the made commit's
+    /// only once it's bound to it.
     #[test]
     fn lists_at_a_commit_only_what_the_check_before_it_did_not_find() {
-        let before = [
-            finding(changed("a.env"), Some(2), Change::Added),
-            finding(Place::Message(None), None, Change::Added),
-        ];
+        let before = Scanned {
+            findings: vec![
+                finding(changed("a.env"), Some(2), Change::Added),
+                finding(Place::Message(None), None, Change::Added),
+            ],
+            unchecked: Vec::new(),
+        };
+        let other_secret = Finding {
+            print: print_of("another token", false),
+            ..finding(changed("a.env"), Some(2), Change::Added)
+        };
         let found = [
             finding(changed("a.env"), Some(2), Change::Added),
             finding(changed("a.env"), Some(3), Change::Added),
-            finding(in_commit("1a2b3c4", "a.env"), Some(2), Change::Added),
+            finding(in_commit("1a2b3c4", "a.env"), Some(9), Change::Added),
+            finding(Place::Message(None), None, Change::Added),
             finding(message_of("1a2b3c4"), None, Change::Added),
             finding(changed("b.env"), Some(2), Change::Added),
             finding(changed("a.env"), Some(2), Change::Unchanged),
@@ -1002,35 +1140,182 @@ mod tests {
                 kind: "AWS access key".to_owned(),
                 ..finding(changed("a.env"), Some(2), Change::Added)
             },
+            other_secret,
         ];
 
-        let new = new_findings(&found, &before);
+        let new = new_findings(&found, &before.findings);
 
-        let kept = [&found[1], &found[4], &found[5], &found[6]];
+        let kept = [&found[4], &found[5], &found[6], &found[7], &found[8]];
         assert_eq!(new, kept.map(Clone::clone));
         assert_eq!(new_findings(&found, &[]), found);
+        let made = before.in_commits(&[CommitId::of("1a2b3c4")]);
+        let in_the_commit = [found[2].clone(), found[4].clone(), found[0].clone()];
+        assert_eq!(
+            new_findings(&in_the_commit, &made.findings),
+            [found[0].clone()]
+        );
     }
 
     /// A binary file too large to check is listed at a commit unless the check before it listed
-    /// it, in the same place or as the commit's file.
+    /// the same content, in the same place or as the commit's file.
     #[test]
     fn lists_at_a_commit_only_the_binary_files_not_listed_before() {
-        let file = |place: FileRef| Unchecked {
+        let file = |place: FileRef, blob: &str| Unchecked {
             place,
             size: MOST_BINARY_BYTES + 1,
+            blob: blob.repeat(40),
         };
-        let before = [file(FileRef::changed("big.bin"))];
+        let commit = CommitId::of("1a2b3c4");
+        let before = [file(FileRef::changed("big.bin"), "a")];
         let found = [
-            file(FileRef::changed("big.bin")),
-            file(FileRef::changed("big.bin").in_commit(&CommitId::of("1a2b3c4"))),
-            file(FileRef::changed("other.bin")),
+            file(FileRef::changed("big.bin"), "a"),
+            file(FileRef::changed("big.bin").in_commit(&commit), "a"),
+            file(FileRef::changed("big.bin"), "b"),
+            file(FileRef::changed("big.bin").in_commit(&commit), "b"),
+            file(FileRef::changed("other.bin"), "a"),
         ];
 
-        assert_eq!(
-            new_unchecked(&found, &before),
-            [file(FileRef::changed("other.bin"))]
-        );
+        assert_eq!(new_unchecked(&found, &before), found[2..]);
         assert_eq!(new_unchecked(&found, &[]), found);
+        let in_another = file(
+            FileRef::changed("big.bin").in_commit(&CommitId::of("5d6e7f8")),
+            "a",
+        );
+        assert_eq!(
+            new_unchecked(std::slice::from_ref(&in_another), &found[1..2]),
+            [in_another]
+        );
+    }
+
+    /// What the commits made since `base` hold, read as the check of a commit made reads them.
+    fn read_of_commits_made_since(repo: &Repo, base: &str) -> Scanned {
+        let base = repo.resolve(base).unwrap().unwrap();
+        let now = repo.head_and_branch_tips().unwrap();
+        let made = repo.commits_new_since(&tips_of(&[&base]), &now).unwrap();
+        let commits: Vec<CommitId> = made.iter().map(|commit| commit.id.clone()).collect();
+        let found = repo.read_commits(&commits, publication::read_log).unwrap();
+        with_binary_files(repo, found).unwrap()
+    }
+
+    /// What the check of the commits made on `base` up to HEAD refuses, after the check just
+    /// before them read `before`; `None` when it lets them through.
+    fn made_commit_refusal(repo: &Repo, base: &str, before: &Scanned) -> Option<String> {
+        let now = repo.head_and_branch_tips().unwrap();
+        let new = repo.commits_new_since(&tips_of(&[base]), &now).unwrap();
+        let made = CommitsMade {
+            on: Some(base),
+            commits: &new,
+        };
+        let mut checks = Checks::new(OnSecrets::Reject);
+        let checked = check_made_commit(repo, made, before, &mut checks, &WORDING);
+        checked.err().map(|error| error.to_string())
+    }
+
+    /// A commit the check can't read fails the check under either setting, saying it couldn't
+    /// check the commit; with no commits, there is nothing to read.
+    #[test]
+    fn says_it_couldnt_check_a_commit_it_couldnt_read() {
+        let (_dir, repo) = isolated_repo();
+        let missing = CommitMade {
+            id: CommitId::of("1111111"),
+            parents: Vec::new(),
+        };
+        for on_secrets in [OnSecrets::Reject, OnSecrets::Warn] {
+            let mut checks = Checks::new(on_secrets);
+            let unread = CommitsMade {
+                on: None,
+                commits: std::slice::from_ref(&missing),
+            };
+            let failed =
+                check_made_commit(&repo, unread, &Scanned::default(), &mut checks, &WORDING);
+            let failure = format!("{:#}", failed.unwrap_err());
+            assert!(failure.starts_with(UNCHECKED_COMMIT), "{failure}");
+            let nothing = CommitsMade {
+                on: None,
+                commits: &[],
+            };
+            assert!(
+                check_made_commit(&repo, nothing, &Scanned::default(), &mut checks, &WORDING)
+                    .is_ok()
+            );
+        }
+    }
+
+    /// The message of the commit made holds what the check just before it read in the message
+    /// being made, and no other secret of that kind.
+    #[test]
+    fn lists_at_the_made_commit_a_second_secret_in_its_message() {
+        let (dir, repo) = isolated_repo();
+        let base = run(dir.path(), &["rev-parse", "HEAD"]).trim().to_owned();
+        let typed = format!("fix: a\n\naws {}", aws_key());
+        let before = Scanned {
+            findings: redact::text(&typed, &Place::Message(None)).findings,
+            unchecked: Vec::new(),
+        };
+        commit_at(dir.path(), "a.txt", "a\n", &typed);
+        assert_eq!(made_commit_refusal(&repo, &base, &before), None);
+
+        run(dir.path(), &["reset", "-q", "--hard", &base]);
+        let hash = commit_at(
+            dir.path(),
+            "a.txt",
+            "a\n",
+            &format!("{typed} aws {}", other_aws_key()),
+        );
+
+        let shown = format!("   commit {hash} message  AWS access key");
+        assert_eq!(
+            made_commit_refusal(&repo, &base, &before),
+            Some(refused(&[&shown]))
+        );
+    }
+
+    /// When a hook makes another commit after the one made, only the one made holds what the
+    /// check before it read.
+    #[test]
+    fn binds_what_was_read_before_a_commit_only_to_the_commit_made() {
+        let (dir, repo) = isolated_repo();
+        let base = run(dir.path(), &["rev-parse", "HEAD"]).trim().to_owned();
+        let typed = format!("fix: a\n\naws {}", aws_key());
+        let before = Scanned {
+            findings: redact::text(&typed, &Place::Message(None)).findings,
+            unchecked: Vec::new(),
+        };
+        commit_at(dir.path(), "a.txt", "a\n", &typed);
+        let second = commit_at(dir.path(), "b.txt", "b\n", &typed);
+
+        let shown = format!("   commit {second} message  AWS access key");
+        assert_eq!(
+            made_commit_refusal(&repo, &base, &before),
+            Some(refused(&[&shown]))
+        );
+    }
+
+    /// In a file, the commit made lists another secret of a kind, on a line already flagged and in
+    /// a binary file, and not the same secret moved to another line.
+    #[test]
+    fn lists_at_the_made_commit_another_secret_of_a_kind_in_a_file() {
+        let (dir, repo) = isolated_repo();
+        let dir = dir.path();
+        let base = run(dir, &["rev-parse", "HEAD"]).trim().to_owned();
+        stage(dir, "deploy.env", &format!("aws {}\n", aws_key()));
+        stage(dir, "data.bin", &format!("\0aws {}\0", aws_key()));
+        let before = found_in_changes(&repo, Scope::Staged).unwrap();
+        stage(dir, "deploy.env", &format!("x\naws {}\n", aws_key()));
+        stage(dir, "data.bin", &format!("\0aws {}\0", aws_key()));
+        run(dir, &["commit", "-q", "-m", "add the settings"]);
+        assert_eq!(made_commit_refusal(&repo, &base, &before), None);
+
+        run(dir, &["reset", "-q", "--hard", &base]);
+        let both = format!("aws {} aws {}", aws_key(), other_aws_key());
+        stage(dir, "deploy.env", &format!("x\n{both}\n"));
+        stage(dir, "data.bin", &format!("\0{both}\0"));
+        let hash = commit_file(dir, &format!("x\n{both}\n"), "add the settings");
+
+        let refusal = made_commit_refusal(&repo, &base, &before).unwrap();
+        let in_data = format!("   commit {hash} data.bin  AWS access key");
+        let in_deploy = format!("   commit {hash} deploy.env:2  AWS access key");
+        assert_eq!(refusal, refused(&[&in_deploy, &in_data]));
     }
 
     /// The model doesn't read lockfiles, or what a user's own `exclude` names, but a commit
@@ -1099,13 +1384,7 @@ mod tests {
         let range = ["HEAD~1..HEAD"];
 
         let staged = refusal_of(check_staged(&repo, Scope::Staged));
-        let pushed = refusal_of(check_commits(
-            &repo,
-            &range,
-            OnSecrets::Reject,
-            &[],
-            &WORDING,
-        ));
+        let pushed = refusal_of(reject_commits(&repo, &range));
 
         assert_eq!(staged, refused(&["   lib.rs:1  AWS access key"]));
         let shown = format!("   commit {hash} deploy.env:1  AWS access key");
@@ -1161,7 +1440,7 @@ mod tests {
         hide_from_plain_reads(dir);
         let text = format!("a\n\nb\naws {}\n", aws_key());
         let hash = commit_at(dir, "notes/ø.env", &text, "more notes");
-        let check = check_commits(&repo, &["HEAD~1..HEAD"], OnSecrets::Reject, &[], &WORDING);
+        let check = reject_commits(&repo, &["HEAD~1..HEAD"]);
 
         let refusal = refusal_of(check);
 
@@ -1275,7 +1554,7 @@ mod tests {
         run(dir, &["checkout", "-q", "-b", "feature"]);
         let hash = commit_at(dir, "k.pem", &key_file("Cd1", true), "rotate");
 
-        let check = check_commits(&repo, &["main..HEAD"], OnSecrets::Reject, &[], &WORDING);
+        let check = reject_commits(&repo, &["main..HEAD"]);
 
         let error = check.unwrap_err().to_string();
         assert!(
@@ -1359,7 +1638,8 @@ mod tests {
         );
         let head = repo.head_commit().unwrap().unwrap();
 
-        let error = check_outgoing(&repo, &head, &[], OnSecrets::Reject).unwrap_err();
+        let checks = Checks::new(OnSecrets::Reject);
+        let error = check_outgoing(&repo, &head, &[], &checks).unwrap_err();
 
         let shown = format!("commit {hash} deploy.env:1  AWS access key");
         assert!(error.to_string().contains(&shown), "{error}");
@@ -1396,13 +1676,7 @@ mod tests {
             &format!("aws {}\n", aws_key()),
             "bump",
         );
-        let refusal = refusal_of(check_commits(
-            &repo,
-            &OUTGOING,
-            OnSecrets::Reject,
-            &[],
-            &WORDING,
-        ));
+        let refusal = refusal_of(reject_commits(&repo, &OUTGOING));
         assert_eq!(
             refusal,
             refused(&[
@@ -1468,7 +1742,7 @@ mod tests {
         );
         run(dir.path(), &["checkout", "-q", "-b", "feature"]);
         commit_file(dir.path(), "aws none\n", "take the key out");
-        let check = |range: &str| check_commits(&repo, &[range], OnSecrets::Reject, &[], &WORDING);
+        let check = |range: &str| reject_commits(&repo, &[range]);
 
         assert!(check("main..HEAD").is_ok());
         assert!(check("HEAD").is_err());
@@ -1487,10 +1761,9 @@ mod tests {
         let found = found_in_commits(&repo, &["HEAD"]).unwrap().findings;
 
         assert_eq!(warning(&found, &[], "going on"), Some(shown));
-        let in_file = finding(changed("deploy.env"), Some(1), Change::Added);
         let reported = [Finding {
-            kind: "AWS access key".to_owned(),
-            ..in_file
+            place: changed("deploy.env"),
+            ..found[0].clone()
         }];
         assert_eq!(warning(&found, &reported, "going on"), None);
         assert!(warn_about_commits(&repo, &["HEAD"], &[], "going on").is_ok());
@@ -1518,29 +1791,106 @@ mod tests {
         assert!(check_push(&repo, OnSecrets::Warn).is_ok());
     }
 
-    /// The push lists each commit's secret, even where the commit check listed the same kind in
-    /// the same file, since an older commit it sends may hold another.
+    /// Under warn, the push leaves out what the run's checks found in the commits they read, and
+    /// lists what an older commit adds, of the same kind in the same file too. Under reject it
+    /// refuses on all of them.
     #[test]
-    fn lists_every_commit_a_push_sends_that_adds_a_secret() {
+    fn leaves_out_at_the_push_what_the_runs_checks_of_commits_found() {
         let (dir, repo) = isolated_repo();
-        let older = commit_file(
-            dir.path(),
-            &format!("aws {}\n", aws_key()),
-            "add the settings",
-        );
-        let both = format!("aws {}\naws AKIA{}\n", aws_key(), "R".repeat(16));
-        stage(dir.path(), "deploy.env", &both);
-        check_changes(&repo, Scope::Staged, OnSecrets::Warn, &[], &WORDING).unwrap();
+        let older = commit_file(dir.path(), &format!("aws {}\n", aws_key()), "add a key");
+        let both = format!("aws {}\naws {}\n", aws_key(), other_aws_key());
         let newer = commit_file(dir.path(), &both, "add another key");
-        let shown = format!(
-            "pushing commits that add what look like secrets:\n   commit {newer} deploy.env:2  \
-             AWS access key\n   commit {older} deploy.env:1  AWS access key"
+        let mut checks = Checks::new(OnSecrets::Warn);
+        checks.record(read_of_commits_made_since(&repo, &older));
+        let in_older = format!("   commit {older} deploy.env:1  AWS access key");
+        let in_newer = format!("   commit {newer} deploy.env:2  AWS access key");
+
+        assert_eq!(
+            push_warnings(&repo, &checks),
+            [push_listing(std::slice::from_ref(&in_older))]
         );
+        let none = Checks::new(OnSecrets::Warn);
+        let both_listed = push_listing(&[in_newer.clone(), in_older.clone()]);
+        assert_eq!(push_warnings(&repo, &none), [both_listed]);
+        let mut rejecting = Checks::new(OnSecrets::Reject);
+        rejecting.record(read_of_commits_made_since(&repo, &older));
+        let refusal = refusal_of(check_push_after(&repo, &rejecting));
+        assert!(
+            refusal.contains(&format!("{in_newer}\n{in_older}\n")),
+            "{refusal}"
+        );
+    }
 
-        let found = found_in_commits(&repo, &OUTGOING).unwrap().findings;
-        let warned = verdict(&found, OnSecrets::Warn, &[], &PUSH);
+    /// Two secrets of one kind on one line are two findings at the push, under warn and reject.
+    #[test]
+    fn lists_two_secrets_of_one_kind_on_one_line_at_the_push() {
+        let (dir, repo) = isolated_repo();
+        let line = format!("aws {} aws {}\n", aws_key(), other_aws_key());
+        let hash = commit_file(dir.path(), &line, "add two keys");
+        let shown = format!("   commit {hash} deploy.env:1  AWS access key");
 
-        assert_eq!(warned, Verdict::Warn(shown));
+        let warned = push_warnings(&repo, &Checks::new(OnSecrets::Warn));
+        let refusal = refusal_of(check_push(&repo, OnSecrets::Reject));
+
+        assert_eq!(warned, [push_listing(&[shown.clone(), shown.clone()])]);
+        assert!(
+            refusal.contains(&format!("{shown}\n{shown}\n")),
+            "{refusal}"
+        );
+    }
+
+    /// A rebase makes new commits, so the push lists again what the run found in the old ones.
+    #[test]
+    fn lists_a_messages_secret_again_after_a_rebase() {
+        let (dir, repo) = isolated_repo();
+        let dir = dir.path();
+        let base = run(dir, &["rev-parse", "HEAD"]).trim().to_owned();
+        commit_at(dir, "a.txt", "a\n", &format!("add a\n\naws {}", aws_key()));
+        let mut checks = Checks::new(OnSecrets::Warn);
+        checks.record(read_of_commits_made_since(&repo, &base));
+        assert_eq!(push_warnings(&repo, &checks), Vec::<String>::new());
+        run(dir, &["checkout", "-q", "-b", "upstream", &base]);
+        commit_at(dir, "b.txt", "b\n", "add b");
+        run(dir, &["checkout", "-q", "main"]);
+        run(dir, &["rebase", "-q", "upstream"]);
+        let rebased = short_head(dir);
+
+        let shown = format!("   commit {rebased} message  AWS access key");
+        assert_eq!(push_warnings(&repo, &checks), [push_listing(&[shown])]);
+    }
+
+    /// A binary file too large to check is listed once in a run: the push leaves out the one the
+    /// run's checks of commits listed, and lists an older commit's other content at that path.
+    #[test]
+    fn lists_a_binary_file_too_large_to_check_once_in_a_run() {
+        let (dir, repo) = isolated_repo();
+        let dir = dir.path();
+        let big = |mark: &str| {
+            let mut bytes = format!("\0{mark}\0").into_bytes();
+            bytes.resize(usize::try_from(MOST_BINARY_BYTES).unwrap() + 1, 0);
+            fs::write(dir.join("big.bin"), bytes).unwrap();
+            run(dir, &["add", "big.bin"]);
+        };
+        big("older");
+        run(dir, &["commit", "-q", "-m", "add the data"]);
+        let older = short_head(dir);
+        big("newer");
+        run(dir, &["commit", "-q", "-m", "change the data"]);
+        let mut checks = Checks::new(OnSecrets::Warn);
+        checks.record(read_of_commits_made_since(&repo, &older));
+        assert_eq!(checks.unchecked().len(), 1);
+
+        let said = ui::test_support::listen();
+        check_push_after(&repo, &checks).unwrap();
+
+        let Verdict::Warn(listed) = unchecked_verdict(&[Unchecked {
+            place: FileRef::changed("big.bin").in_commit(&CommitId::of(&older)),
+            size: MOST_BINARY_BYTES + 1,
+            blob: String::new(),
+        }]) else {
+            panic!("no warning");
+        };
+        assert_eq!(said.warnings(), [listed]);
     }
 
     #[test]
@@ -1584,7 +1934,7 @@ mod tests {
         assert!(check_staged(&repo, Scope::Staged).is_ok());
         run(dir.path(), &["commit", "-q", "-m", "move the library"]);
         let range = ["HEAD~1..HEAD"];
-        assert!(check_commits(&repo, &range, OnSecrets::Reject, &[], &WORDING).is_ok());
+        assert!(reject_commits(&repo, &range).is_ok());
     }
 
     /// A graft can make a commit look published, or change what a commit adds, but a push sends
@@ -1699,10 +2049,12 @@ mod tests {
         let scanned = found_in_changes(&repo, Scope::Staged).unwrap();
 
         assert!(scanned.findings.is_empty());
-        let size = MOST_BINARY_BYTES + 1;
         let big = Unchecked {
             place: FileRef::changed("big.bin"),
-            size,
+            size: MOST_BINARY_BYTES + 1,
+            blob: run(dir.path(), &["rev-parse", ":big.bin"])
+                .trim()
+                .to_owned(),
         };
         assert_eq!(scanned.unchecked, [big]);
         assert!(check_staged(&repo, Scope::Staged).is_ok());
@@ -1713,6 +2065,7 @@ mod tests {
         let file = |n: u64| Unchecked {
             place: FileRef::changed(format!("pkg{n}/data.bin")),
             size: MOST_BINARY_BYTES + n * 1024 * 1024,
+            blob: n.to_string().repeat(40),
         };
         assert_eq!(unchecked_verdict(&[]), Verdict::Clean);
         assert_eq!(

@@ -93,6 +93,7 @@ The modules the commands share:
 | `git/lossless.rs` | Text that holds any bytes, so a patch of a file that isn't UTF-8 reaches `git apply` unchanged. |
 | `git/worktree.rs` | `TempWorktree`: a temporary checkout that leaves the user's work tree, index and branches alone. |
 | `git/commit_id.rs` | `CommitId`: a commit, the same as another by its full hash, shown by the abbreviation git gives it. |
+| `git/tips.rs` | Where HEAD and the refs point before a commit and after it, and the commits new between: what a commit and its hooks made. |
 | `temp.rs` | `PrivateDir`: a temporary folder that only your user account can enter. |
 | `github.rs` | Pull requests and issues through the GitHub CLI, `gh`. |
 | `prompt.rs` | Builds the conversation sent to the model for every command, and cleans up its replies. |
@@ -101,7 +102,8 @@ The modules the commands share:
 | `models.rs` | Choosing the model, and the context size to fit the prompt into. |
 | `fit.rs` | Shortens a diff to a size limit. |
 | `secrets.rs` | The secret checks: refusing or warning when a commit, a push or a pull request would add secrets. |
-| `secrets/finding.rs` | What a scan finds and where (`Finding`, `Place`), as the scans, the checks and the flows name it. |
+| `secrets/finding.rs` | What a scan finds and where (`Finding`, `Place`), as the scans, the checks and the flows name it, and when a finding listed before holds a later one. |
+| `secrets/checks.rs` | What a run's checks go by (`Checks`): the setting, and what the checks of commits found, which the push doesn't list again. |
 | `secrets/fingerprint.rs` | Fingerprints of secrets and lines: a keyed hash, with one key for the run that is never shown. |
 | `secrets/redact.rs` | Finds secrets in text before it goes to a model, and replaces them with `[REDACTED]`. |
 | `secrets/redact/diff_scan.rs` | Scans a diff a line at a time, following each side of a hunk. |

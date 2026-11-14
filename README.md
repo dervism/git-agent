@@ -688,8 +688,12 @@ removes doesn't stop anything; git-agent only lists it.
 To be warned instead, set `on_secrets = "warn"` in the config file, choose Warn under
 Secrets in `git agent config`, or pass `--on-secrets warn` for one run. git-agent then
 lists the secrets and carries on, and the model still gets `[REDACTED]` in their place.
-Secrets in files the model doesn't read, such as lockfiles, are listed too, and a push
-lists every secret its commits add, even one the commit already listed.
+Secrets in files the model doesn't read, such as lockfiles, are listed too. A push doesn't
+list again the secrets git-agent already listed in the same commits during the run, such
+as those of the commit it just made. It lists every other secret its commits add, those of
+older commits included. A secret in several commits, such as the messages of a split, is
+listed for each commit, and after a rebase onto the remote the commits are new, so their
+secrets are listed again.
 
 ### What git-agent recognizes
 

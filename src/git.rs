@@ -7,10 +7,12 @@ pub mod lossless;
 pub mod names;
 mod push;
 mod settings;
+mod tips;
 pub mod worktree;
 
 pub use commit_id::CommitId;
 pub use push::Destination;
+pub use tips::{CommitMade, MovedRef, Tips};
 
 use crate::safe_text::{one_line, without_styles};
 use crate::temp::PrivateDir;
@@ -446,15 +448,8 @@ impl Repo {
         self.git(&readable(args))
     }
 
-    /// Runs a read for the secret checks: a readable read, with [`PUBLISHED_SETTINGS`] and
-    /// without grafts.
-    fn git_published(&self, args: &[&str]) -> Result<String> {
-        let (command, args) = self.published_command(args);
-        Ok(String::from_utf8_lossy(&stdout_of(command, &args)?).into_owned())
-    }
-
-    /// Runs a read for the secret checks, as [`Repo::git_published`] does, and gives `read` git's
-    /// output as git writes it, so that none of it is held whole.
+    /// Runs a read for the secret checks, a readable read with [`PUBLISHED_SETTINGS`] and without
+    /// grafts, and gives `read` git's output as git writes it, so that none of it is held whole.
     fn stream_published<T>(
         &self,
         args: &[&str],
@@ -1571,12 +1566,6 @@ impl Repo {
         }
     }
 
-    /// The parents of `commit` as git stores it, whatever a replacement or a graft says.
-    pub fn stored_parents(&self, commit: &str) -> Result<Vec<String>> {
-        let line = self.git_published(&["rev-list", "--parents", "--max-count=1", commit, "--"])?;
-        Ok(line.split_whitespace().skip(1).map(str::to_owned).collect())
-    }
-
     /// Whether git reads and writes an index of git-agent's own here rather than the user's, as
     /// a split's commits do.
     pub fn uses_own_index(&self) -> bool {
@@ -2101,8 +2090,16 @@ fn exclude_pathspecs(patterns: &[String]) -> Vec<String> {
 /// What the tests of this module and its submodules share.
 #[cfg(test)]
 pub mod test_support {
+    pub use super::tips::test_support::tips_of;
     use super::*;
     use tempfile::TempDir;
+
+    /// The short hash of the commit HEAD is at in `dir`.
+    pub fn short_head(dir: &Path) -> String {
+        run(dir, &["rev-parse", "--short", "HEAD"])
+            .trim()
+            .to_owned()
+    }
 
     /// Runs git in `dir`, panicking on failure, and returns its stdout.
     pub fn run(dir: &Path, args: &[&str]) -> String {

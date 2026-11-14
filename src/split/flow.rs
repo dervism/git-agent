@@ -18,8 +18,7 @@ use crate::delivery::{NewCommit, commit, push, refuse_unknown_commit_args};
 use crate::git::worktree::TempWorktree;
 use crate::git::{Changes, Repo, Scope, names};
 use crate::review::{self, Action, Choice, Decline, Person, Review, Revisions, Terminal};
-use crate::secrets::contents::Scanned;
-use crate::secrets::{AtCommit, Wording, check_changes, redact, report_secrets};
+use crate::secrets::{Checks, Scanned, Wording, check_changes, redact, report_secrets};
 use crate::server::{Message, ModelServer};
 use crate::staging::{self, Purpose, Staged};
 use crate::ui;
@@ -211,11 +210,15 @@ async fn split_changes<S: ModelServer>(
         return Ok(());
     };
     let prepared = splitter.prepare_commits(&plan).await?;
-    let outcome = splitter.make_commits(&prepared, acceptance).await.context(
-        "the split stopped; the commits made so far stay, and the rest of the changes are as \
-         they were",
-    )?;
-    finish(repo, args, config, work, &outcome)
+    let mut checks = Checks::new(config.on_secrets);
+    let outcome = splitter
+        .make_commits(&prepared, acceptance, &mut checks)
+        .await
+        .context(
+            "the split stopped; the commits made so far stay, and the rest of the changes are as \
+             they were",
+        )?;
+    finish(repo, args, &checks, work, &outcome)
 }
 
 fn report_what_is_split(work: &Work, by_file: bool) {
@@ -233,11 +236,12 @@ fn report_what_is_split(work: &Work, by_file: bool) {
     }
 }
 
-/// Tells the user how the split ended, and pushes if they asked for that.
+/// Tells the user how the split ended, and pushes if they asked for that, checking what the push
+/// sends as the run's `checks` say.
 fn finish(
     repo: &Repo,
     args: &SplitArgs,
-    config: &Config,
+    checks: &Checks,
     work: &Work,
     outcome: &Outcome,
 ) -> Result<()> {
@@ -271,7 +275,7 @@ fn finish(
         }
     }
     if args.push && outcome.made > 0 {
-        push(repo, !args.commit, config.on_secrets).context(NOT_PUSHED)?;
+        push(repo, !args.commit, checks).context(NOT_PUSHED)?;
     }
     Ok(())
 }
@@ -588,11 +592,12 @@ impl<S: ModelServer> Splitter<'_, S> {
 
     /// Makes the planned commits one by one, each built in a temporary index
     /// from HEAD and its own changes, with the user reviewing each commit's message if the
-    /// plan's `acceptance` says so.
+    /// plan's `acceptance` says so. The run's `checks` keep what each made commit's check found.
     async fn make_commits(
         &self,
         prepared: &CommitPlan,
         acceptance: PlanAcceptance,
+        checks: &mut Checks,
     ) -> Result<Outcome> {
         let path = self.repo.git_path("GIT_AGENT_SPLIT_INDEX")?;
         let index = self.repo.with_index(path.clone());
@@ -600,6 +605,7 @@ impl<S: ModelServer> Splitter<'_, S> {
             .commit_each(
                 prepared,
                 &index,
+                checks,
                 async |message: String, conversation: &[Message], kind: Option<Kind>| {
                     if acceptance.reviews_each_message() {
                         self.reviewed(message, conversation, kind).await
@@ -698,11 +704,13 @@ impl<S: ModelServer> Splitter<'_, S> {
     }
 
     /// Makes the commits of `prepared`, asking `decide` about each from its
-    /// message, the conversation that wrote it and the kind of commit it is.
+    /// message, the conversation that wrote it and the kind of commit it is. The run's `checks`
+    /// keep what each commit's check found.
     async fn commit_each(
         &self,
         prepared: &CommitPlan,
         index: &Repo,
+        checks: &mut Checks,
         mut decide: impl AsyncFnMut(String, &[Message], Option<Kind>) -> Result<Decision>,
     ) -> Result<Outcome> {
         let mut committed = Committed::default();
@@ -767,11 +775,7 @@ impl<S: ModelServer> Splitter<'_, S> {
                 git_args: &self.args.git_args,
                 leave_out: &[],
             };
-            let at = AtCommit {
-                on_secrets: self.config.on_secrets,
-                before: &self.work.found,
-            };
-            commit(index, &new_commit, at)?;
+            commit(index, &new_commit, &self.work.found, checks)?;
             committed.record(&patch);
             outcome.made += 1;
             let made = self
@@ -859,9 +863,13 @@ fn report_merged(merged: &[String], why: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::OnSecrets;
     use crate::conversation::test_support::{ScriptedPerson, configured};
-    use crate::git::test_support::{isolated_repo, numbered_lines, run, with_submodule};
+    use crate::git::test_support::{
+        isolated_repo, numbered_lines, run, short_head, with_submodule,
+    };
     use crate::review::test_support::{action_for, last_lines_of_help};
+    use crate::secrets::test_support::{aws_key, push_warnings};
     use crate::server::test_support::FakeServer;
     use std::cell::{Cell, RefCell};
     use std::path::Path;
@@ -1072,8 +1080,9 @@ mod tests {
             let conversation = [Message::system(prompt::SPLIT_PROMPT)];
             let plan = splitter.new_plan(&conversation).await.unwrap();
             let prepared = splitter.prepare_commits(&plan).await.unwrap();
+            let mut checks = Checks::new(splitter.config.on_secrets);
             splitter
-                .make_commits(&prepared, PlanAcceptance::ReviewEach)
+                .make_commits(&prepared, PlanAcceptance::ReviewEach, &mut checks)
                 .await
                 .unwrap()
         })
@@ -1820,7 +1829,23 @@ mod tests {
         decisions: Vec<Decision>,
         server: &FakeServer<'_>,
     ) -> Result<Outcome> {
-        let config = Config::default();
+        let checked = commit_with_checks(repo, args, decisions, server, OnSecrets::Reject).await;
+        checked.map(|(outcome, _)| outcome)
+    }
+
+    /// Runs the commits of `server`'s plan with scripted decisions, with the secret checks set to
+    /// `on_secrets`, and returns the outcome and the run's checks.
+    async fn commit_with_checks(
+        repo: &Repo,
+        args: &SplitArgs,
+        decisions: Vec<Decision>,
+        server: &FakeServer<'_>,
+        on_secrets: OnSecrets,
+    ) -> Result<(Outcome, Checks)> {
+        let config = Config {
+            on_secrets,
+            ..Config::default()
+        };
         let work = changes_to_split(repo, args, &config)?.expect("changes to split");
         let units = split::describe(&work.files, 100_000)?.units;
         let model = configured(100_000);
@@ -1839,15 +1864,90 @@ mod tests {
         let prepared = splitter.prepare_commits(&plan).await?;
         let index = repo.with_index(repo.git_path("test-split-index")?);
         let decisions = RefCell::new(decisions.into_iter());
-        splitter
+        let mut checks = Checks::new(config.on_secrets);
+        let outcome = splitter
             .commit_each(
                 &prepared,
                 &index,
+                &mut checks,
                 async |_: String, _: &[Message], _: Option<Kind>| {
                     Ok(decisions.borrow_mut().next().expect("a decision"))
                 },
             )
-            .await
+            .await?;
+        Ok((outcome, checks))
+    }
+
+    /// Each commit's check lists the secret its message adds, though the commit before it had
+    /// the same one, and the push leaves out what the commits' checks found.
+    #[tokio::test]
+    async fn lists_the_secret_of_each_commits_message_and_the_push_leaves_them_out() {
+        let (dir, repo) = isolated_repo();
+        write(dir.path(), "a.txt", "a\n");
+        write(dir.path(), "b.txt", "b\n");
+        run(dir.path(), &["add", "--all"]);
+        run(dir.path(), &["commit", "-q", "-m", "add both"]);
+        write(dir.path(), "a.txt", "a2\n");
+        write(dir.path(), "b.txt", "b2\n");
+        run(dir.path(), &["add", "--all"]);
+        let typed = format!("feat: change\n\naws {}", aws_key());
+        let decisions = vec![Decision::Commit(typed.clone()), Decision::Commit(typed)];
+        let server = ScriptedModel::new(TWO_COMMITS, "feat: change").server();
+
+        let said = ui::test_support::listen();
+        let (outcome, checks) = commit_with_checks(
+            &repo,
+            &args(true, None),
+            decisions,
+            &server,
+            OnSecrets::Warn,
+        )
+        .await
+        .unwrap();
+
+        let listed = "committing what look like secrets:\n   message  AWS access key";
+        assert_eq!(said.warnings(), [listed, listed]);
+        drop(said);
+        assert_eq!(outcome.made, 2);
+        assert_eq!(push_warnings(&repo, &checks), Vec::<String>::new());
+        assert_eq!(push_warnings(&repo, &Checks::new(OnSecrets::Warn)).len(), 1);
+    }
+
+    /// A skipped commit's check found nothing in a commit, so the push lists an older commit's
+    /// copy of the secret it held.
+    #[tokio::test]
+    async fn lists_at_the_push_an_older_commits_secret_whose_commit_was_skipped() {
+        let (dir, repo) = isolated_repo();
+        let key = format!("aws {}\n", aws_key());
+        write(dir.path(), "a.env", &key);
+        write(dir.path(), "b.txt", "b\n");
+        run(dir.path(), &["add", "--all"]);
+        run(dir.path(), &["commit", "-q", "-m", "add the settings"]);
+        let older = short_head(dir.path());
+        write(dir.path(), "a.env", "plain\n");
+        run(dir.path(), &["commit", "-q", "-am", "take the key out"]);
+        write(dir.path(), "a.env", &key);
+        write(dir.path(), "b.txt", "b2\n");
+        run(dir.path(), &["add", "--all"]);
+        let decisions = vec![Decision::Skip, Decision::Commit("feat: b".to_owned())];
+        let server = ScriptedModel::new(TWO_COMMITS, "feat: change").server();
+
+        let (outcome, checks) = commit_with_checks(
+            &repo,
+            &args(true, None),
+            decisions,
+            &server,
+            OnSecrets::Warn,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!((outcome.made, outcome.skipped), (1, 1));
+        let shown = format!(
+            "pushing commits that add what look like secrets:\n   commit {older} a.env:1  AWS \
+             access key"
+        );
+        assert_eq!(push_warnings(&repo, &checks), [shown]);
     }
 
     fn commit_all() -> Vec<Decision> {

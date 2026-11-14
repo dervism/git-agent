@@ -46,7 +46,7 @@ use review::{Action, Choice, Decline, Person, Review, Revisions, Terminal};
 use secrets::finding::{Finding, Place};
 use secrets::redact;
 use secrets::{
-    AtCommit, Wording, added, check_changes, check_commits, list_findings, report_secrets,
+    Checks, Wording, added, check_changes, check_commits, list_findings, report_secrets,
     warn_about_commits,
 };
 use server::{Message, ModelServer, Server};
@@ -296,10 +296,7 @@ async fn generate(args: &GenerateArgs, overrides: &Overrides) -> Result<()> {
         &redacted.findings,
         &COMMIT_SECRETS,
     )?;
-    let at = AtCommit {
-        on_secrets: config.on_secrets,
-        before: &found,
-    };
+    let mut checks = Checks::new(config.on_secrets);
     let new_commit = |message| NewCommit {
         message,
         scope,
@@ -334,9 +331,9 @@ async fn generate(args: &GenerateArgs, overrides: &Overrides) -> Result<()> {
     }
     review::show_proposal(&COMMIT_REVIEW, &message)?;
     if args.commit {
-        commit(&repo, &new_commit(&message), at)?;
+        commit(&repo, &new_commit(&message), &found, &mut checks)?;
         if args.push {
-            push(&repo, false, config.on_secrets).context(NOT_PUSHED)?;
+            push(&repo, false, &checks).context(NOT_PUSHED)?;
         }
         return Ok(());
     }
@@ -360,9 +357,9 @@ async fn generate(args: &GenerateArgs, overrides: &Overrides) -> Result<()> {
         ui::info("Nothing committed.");
         return Ok(());
     };
-    commit(&repo, &new_commit(&message), at)?;
+    commit(&repo, &new_commit(&message), &found, &mut checks)?;
     if acceptance.pushes() || args.push {
-        push(&repo, true, config.on_secrets).context(NOT_PUSHED)?;
+        push(&repo, true, &checks).context(NOT_PUSHED)?;
     }
     Ok(())
 }
@@ -463,11 +460,12 @@ async fn pull_request(args: &PrArgs, overrides: &Overrides) -> Result<()> {
     }
     // Commit by commit rather than the branch's overall diff: a secret added in one commit and
     // removed in a later one is still in the history a push publishes.
+    let mut checks = Checks::new(config.on_secrets);
     check_commits(
         &repo,
         &[&format!("{base_ref}..HEAD")],
-        config.on_secrets,
         &findings,
+        &mut checks,
         &PULL_REQUEST_SECRETS,
     )?;
     report_secrets(
@@ -521,7 +519,7 @@ async fn pull_request(args: &PrArgs, overrides: &Overrides) -> Result<()> {
         draft: acceptance.is_draft() || args.draft,
         extra_args: &args.gh_args,
     };
-    create_pull_request(&repo, &pull_request, !args.create, config.on_secrets)
+    create_pull_request(&repo, &pull_request, !args.create, &checks)
 }
 
 async fn new_branch(args: &BranchArgs, overrides: &Overrides) -> Result<()> {
@@ -1278,14 +1276,14 @@ async fn explain_commits(args: &ExplainArgs, overrides: &Overrides) -> Result<()
     discuss(&server, &model, &subject.heading, conversation, &Terminal).await
 }
 
-/// Pushes the branch if GitHub lacks some of its commits, checking them for secrets as
-/// `on_secrets` says, then creates the pull request. With `ask`, the user confirms a rebase
-/// before the push.
+/// Pushes the branch if GitHub lacks some of its commits, checking them for secrets as the run's
+/// `checks` say, then creates the pull request. With `ask`, the user confirms a rebase before the
+/// push.
 fn create_pull_request(
     repo: &Repo,
     pull_request: &PullRequest,
     ask: bool,
-    on_secrets: OnSecrets,
+    checks: &Checks,
 ) -> Result<()> {
     const NOT_PUSHED: &str = "the branch was not pushed, so no pull request was created";
     if repo.has_unpushed_commits()? {
@@ -1293,7 +1291,7 @@ fn create_pull_request(
             "Pushing {} so GitHub has its commits.",
             pull_request.head
         ));
-        let pushed = push(repo, ask, on_secrets).context(NOT_PUSHED)?;
+        let pushed = push(repo, ask, checks).context(NOT_PUSHED)?;
         if !pushed {
             ui::info("No pull request created.");
             return Ok(());
@@ -1457,7 +1455,7 @@ fn show_config(overrides: &Overrides) -> Result<()> {
 mod tests {
     use super::*;
     use crate::git::test_support::{isolated_repo, run};
-    use crate::secrets::contents::Scanned;
+    use crate::secrets::Scanned;
     use crate::server::test_support::FakeServer;
     use conversation::test_support::configured;
     use review::test_support::{ScriptedPerson, action_for, last_lines_of_help};
@@ -1759,11 +1757,8 @@ mod tests {
             git_args: &[],
             leave_out: &[],
         };
-        let at = AtCommit {
-            on_secrets: config::OnSecrets::Reject,
-            before: &Scanned::default(),
-        };
-        commit(&repo, &new_commit, at).unwrap();
+        let mut checks = Checks::new(config::OnSecrets::Reject);
+        commit(&repo, &new_commit, &Scanned::default(), &mut checks).unwrap();
         assert_eq!(
             run(dir.path(), &["log", "-1", "--format=%B"]).trim_end(),
             message

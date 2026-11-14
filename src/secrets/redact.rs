@@ -8,13 +8,16 @@
 //! secrets in formats none of the rules know.
 
 use super::finding::{Change, Finding, Place};
+use super::fingerprint::{Fingerprint, Fingerprinting, Key};
 use crate::git::CommitId;
 use crate::safe_text::without_hidden;
 use key_block::{
-    KeyBlock, KeyBlockFacts, LongLineFacts, Taken, is_key_data, is_key_header, starts_key_block,
+    KeyBlock, KeyBlockFacts, LongLineFacts, Taken, is_key_data, is_key_header, key_data_of,
+    key_print, starts_key_block,
 };
 use regex_lite::Regex;
 use std::cell::OnceCell;
+use std::fmt;
 use std::ops::Range;
 use std::sync::LazyLock;
 
@@ -40,6 +43,42 @@ pub fn commit(commit: &CommitId, message: &str, patch: &str) -> Vec<Finding> {
 pub struct Redacted {
     pub text: String,
     pub findings: Vec<Finding>,
+}
+
+/// A secret a scan found: what it looks like, and its fingerprint.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Secret {
+    pub kind: String,
+    pub print: Fingerprint,
+}
+
+impl Secret {
+    /// A private key, whose print its block gives once it closes; until then, one that matches
+    /// nothing.
+    fn key() -> Self {
+        Self {
+            kind: PRIVATE_KEY.to_owned(),
+            print: Fingerprint::unmatched(),
+        }
+    }
+}
+
+/// A secret a rule matched on a line, its text, and whether it runs to the line's end, where a
+/// window of a long line can cut it.
+#[derive(Clone, PartialEq)]
+pub struct Matched {
+    pub secret: Secret,
+    pub(in crate::secrets) text: String,
+    pub to_end: bool,
+}
+
+impl fmt::Debug for Matched {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Matched")
+            .field("secret", &self.secret)
+            .field("to_end", &self.to_end)
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -222,15 +261,17 @@ static COMPILED: LazyLock<Vec<(&Rule, Regex)>> = LazyLock::new(|| {
 });
 
 /// A line cleaned of hidden characters and read once for every side that takes it: whether it's
-/// a private key's data or a header of a key's, its secrets replaced, and whether it then ends
-/// with a key's BEGIN line, each worked out the first time a side needs it, so that a line costs
-/// the same however many sides take it.
+/// a private key's data or a header of a key's, its key data, its secrets replaced, and whether it
+/// then ends with a key's BEGIN line, each worked out the first time a side needs it, so that a
+/// line is read once however many sides take it. Each side in a key's block still hashes the
+/// line's key data into its own print, in one piece.
 struct ScannedLine<'l> {
     original: &'l str,
     visible: String,
     data: OnceCell<bool>,
+    key_data: OnceCell<Vec<u8>>,
     header: OnceCell<bool>,
-    replaced: OnceCell<(String, Vec<String>)>,
+    replaced: OnceCell<(String, Vec<Matched>)>,
     begins_key: OnceCell<bool>,
 }
 
@@ -242,26 +283,41 @@ impl<'l> ScannedLine<'l> {
             original,
             visible: without_hidden(original).text,
             data: OnceCell::new(),
+            key_data: OnceCell::new(),
             header: OnceCell::new(),
             replaced: OnceCell::new(),
             begins_key: OnceCell::new(),
         }
     }
 
-    /// The line with its secrets replaced, and what they look like.
-    fn replaced(&self) -> &(String, Vec<String>) {
+    /// The line with its secrets replaced, and what the rules matched.
+    fn replaced(&self) -> &(String, Vec<Matched>) {
         self.replaced.get_or_init(|| {
-            let mut kinds = Vec::new();
-            (replace_secrets(&self.visible, &mut kinds), kinds)
+            let mut matched = Vec::new();
+            (replace_secrets(&self.visible, &mut matched), matched)
         })
     }
 
+    /// What the rules matched on the line.
+    fn into_matched(self) -> Vec<Matched> {
+        self.replaced();
+        self.replaced
+            .into_inner()
+            .map(|(_, matched)| matched)
+            .unwrap_or_default()
+    }
+
     /// What a side finds on the line when it takes it as `taken`.
-    fn kinds(&self, taken: Taken) -> Vec<String> {
+    fn secrets(&self, taken: Taken) -> Vec<Secret> {
         match taken {
             Taken::MoreOfAKey => Vec::new(),
-            Taken::Key => vec![PRIVATE_KEY.to_owned()],
-            Taken::Text => self.replaced().1.clone(),
+            Taken::Key => vec![Secret::key()],
+            Taken::Text => self
+                .replaced()
+                .1
+                .iter()
+                .map(|matched| matched.secret.clone())
+                .collect(),
         }
     }
 
@@ -276,8 +332,8 @@ impl<'l> ScannedLine<'l> {
                 Some(format!("{REDACTED}{}", &self.visible[end..]))
             }
             Taken::Text => {
-                let (text, kinds) = self.replaced();
-                Some(if kinds.is_empty() {
+                let (text, matched) = self.replaced();
+                Some(if matched.is_empty() {
                     self.original.to_owned()
                 } else {
                     text.clone()
@@ -301,28 +357,39 @@ impl KeyBlockFacts for ScannedLine<'_> {
             .begins_key
             .get_or_init(|| starts_key_block(&self.replaced().0))
     }
+
+    fn feed_data(&self, print: &mut Fingerprinting) {
+        print.feed(self.key_data.get_or_init(|| key_data_of(&self.visible)));
+    }
 }
 
 /// A line that holds what look like secrets.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Clone, PartialEq)]
 pub struct SecretLine {
     /// Its number, counted from 1.
     pub number: usize,
     /// The line, or for a private key every line of its data, since keys of one type can
     /// begin with the same line.
     pub text: String,
-    /// What each secret on it looks like.
-    pub kinds: Vec<String>,
+    pub secrets: Vec<Secret>,
+}
+
+impl fmt::Debug for SecretLine {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SecretLine")
+            .field("number", &self.number)
+            .field("secrets", &self.secrets)
+            .finish_non_exhaustive()
+    }
 }
 
 /// The lines of `lines` that hold secrets, scanned with the rules a diff's lines get, a private
 /// key's block across lines included.
 pub fn secret_lines(lines: impl IntoIterator<Item = String>) -> Vec<SecretLine> {
     let mut scan = LineScan::default();
-    lines
-        .into_iter()
-        .enumerate()
-        .fold(Vec::new(), |mut found: Vec<SecretLine>, (index, text)| {
+    let mut found = lines.into_iter().enumerate().fold(
+        Vec::new(),
+        |mut found: Vec<SecretLine>, (index, text)| {
             match scan.line(&text) {
                 Held::MoreOfAKey => {
                     if let Some(key) = found.last_mut() {
@@ -330,126 +397,183 @@ pub fn secret_lines(lines: impl IntoIterator<Item = String>) -> Vec<SecretLine> 
                         key.text.push_str(&text);
                     }
                 }
-                Held::Secrets(kinds) => found.push(SecretLine {
+                held => found.extend(held.secrets().map(|secrets| SecretLine {
                     number: index + 1,
                     text,
-                    kinds,
-                }),
-                Held::Nothing => {}
+                    secrets,
+                })),
             }
             found
-        })
+        },
+    );
+    let secrets = found.iter_mut().flat_map(|line| &mut line.secrets);
+    give_prints(secrets, scan.finish());
+    found
+}
+
+/// Gives the private keys among `secrets`, all a reader found in order, the `prints` their blocks
+/// gave, by their slots.
+pub fn give_prints<'s>(
+    secrets: impl IntoIterator<Item = &'s mut Secret>,
+    mut prints: Vec<(usize, Fingerprint)>,
+) {
+    prints.sort_unstable_by_key(|(slot, _)| *slot);
+    let mut prints = prints.into_iter().peekable();
+    for (slot, secret) in secrets.into_iter().enumerate() {
+        if let Some((_, print)) = prints.next_if(|(waiting, _)| *waiting == slot) {
+            debug_assert_eq!(secret.kind, PRIVATE_KEY, "a print's slot is a key's");
+            secret.print = print;
+        }
+    }
+    debug_assert!(prints.next().is_none(), "every print has a key's slot");
 }
 
 /// What a line holds, as far as secrets go, when lines are scanned one after another.
 #[derive(Debug, PartialEq)]
 pub enum Held {
-    /// What the secrets on it look like.
-    Secrets(Vec<String>),
+    Secrets(Vec<Secret>),
+    /// A private key's data, where it begins: the key, whose print [`LineScan::finish`] gives.
+    Key,
     /// More of the data of a private key, which belongs to the line the key's data began on.
     MoreOfAKey,
     Nothing,
 }
 
+impl Held {
+    /// What a line holds that isn't more of a key: these `secrets`, or nothing.
+    fn of(secrets: Vec<Secret>) -> Self {
+        if secrets.is_empty() {
+            Self::Nothing
+        } else {
+            Self::Secrets(secrets)
+        }
+    }
+
+    /// How many secrets the line holds.
+    fn count(&self) -> usize {
+        match self {
+            Self::Secrets(secrets) => secrets.len(),
+            Self::Key => 1,
+            Self::MoreOfAKey | Self::Nothing => 0,
+        }
+    }
+
+    /// The secrets the line holds, a key's with a print that waits for its block, if it holds any.
+    pub fn secrets(self) -> Option<Vec<Secret>> {
+        match self {
+            Self::Secrets(secrets) => Some(secrets),
+            Self::Key => Some(vec![Secret::key()]),
+            Self::MoreOfAKey | Self::Nothing => None,
+        }
+    }
+}
+
 /// Scans lines one after another, as [`secret_lines`] does, carrying a private key's block
-/// across them.
+/// across them. It numbers the secrets the lines hold in order, and [`LineScan::finish`] gives
+/// each key's print by that number, its slot.
 #[derive(Default)]
-pub struct LineScan(KeyBlock);
+pub struct LineScan {
+    block: KeyBlock,
+    /// How many secrets the lines so far held: the slot of the next one.
+    slot: usize,
+}
 
 impl LineScan {
     /// What `line`, the next line, holds.
     pub fn line(&mut self, line: &str) -> Held {
         let line = ScannedLine::of(line);
-        match self.0.take(&line, PLAIN) {
+        let taken = self.block.take(&line, PLAIN);
+        self.held(taken, || line.secrets(Taken::Text))
+    }
+
+    /// What a line taken as `taken` holds, `text` the secrets it holds as text; a key on it waits
+    /// at the next slot.
+    fn held(&mut self, taken: Taken, text: impl FnOnce() -> Vec<Secret>) -> Held {
+        let held = match self.block.wait_if_key(taken, self.slot) {
             Taken::MoreOfAKey => Held::MoreOfAKey,
-            taken => Held::of(line.kinds(taken)),
-        }
+            Taken::Key => Held::Key,
+            Taken::Text => Held::of(text()),
+        };
+        self.slot += held.count();
+        held
+    }
+
+    /// Ends the lines, which cuts off a key's block still open, and gives the private keys' prints
+    /// by their slots: where they are among all the secrets the lines held, in order.
+    pub fn finish(mut self) -> Vec<(usize, Fingerprint)> {
+        self.block.end();
+        self.block.take_prints()
     }
 
     /// Starts on the next line, too long to scan whole: it's to be scanned in windows, all its
     /// pieces fed to the [`LongLineScan`], and given to [`LineScan::end_long_line`].
     pub fn start_long_line(&self) -> LongLineScan {
-        self.0.start_long_line()
+        self.block.start_long_line()
     }
 
     /// What the long line `line` holds, now that its `windows` have been scanned.
     pub fn end_long_line(&mut self, line: LongLineScan, windows: Windows) -> Held {
         let facts = LongLineFacts::of(line, windows.ends_with_begin);
-        let taken = self.0.take(&facts, PLAIN);
-        windows.kinds_for(taken).map_or(Held::MoreOfAKey, Held::of)
+        debug_assert_eq!(facts.len(), 1, "a long line of one text, on its one side");
+        let taken = self.block.take(&facts[0], PLAIN);
+        self.held(taken, || windows.secrets)
     }
 }
 
-impl Held {
-    /// What a line holds that isn't more of a key: the secrets of these `kinds`, or nothing.
-    fn of(kinds: Vec<String>) -> Self {
-        if kinds.is_empty() {
-            Self::Nothing
-        } else {
-            Self::Secrets(kinds)
-        }
-    }
-}
-
-/// What the windows of a line too long to scan whole found: what its secrets look like, and
-/// whether, with them replaced, the line ends with a private key's BEGIN line, as its last window
-/// tells.
+/// What the windows of a line too long to scan whole found: its secrets, and whether, with them
+/// replaced, the line ends with a private key's BEGIN line, as its last window tells.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Windows {
-    pub kinds: Vec<String>,
+    pub secrets: Vec<Secret>,
     pub ends_with_begin: bool,
 }
 
-impl Windows {
-    /// What the long line these windows were scanned from holds on a side that takes it as
-    /// `taken`: nothing more (`None`) as more of a key's data, the key, or what they found.
-    fn kinds_for(self, taken: Taken) -> Option<Vec<String>> {
-        match taken {
-            Taken::MoreOfAKey => None,
-            Taken::Key => Some(vec![PRIVATE_KEY.to_owned()]),
-            Taken::Text => Some(self.kinds),
-        }
-    }
+/// What a window of a long line holds when it's scanned as a line on its own: what the rules
+/// match, and whether, its secrets replaced, it ends with a private key's BEGIN line.
+pub struct WindowScan {
+    pub matched: Vec<Matched>,
+    pub ends_with_begin: bool,
 }
 
 /// What `text`, a window of a long line, holds when it's scanned as a line on its own.
-pub fn scan_window(text: &str) -> Windows {
+pub fn scan_window(text: &str) -> WindowScan {
     let line = ScannedLine::of(text);
-    let mut block = KeyBlock::default();
-    let taken = block.take(&line, PLAIN);
-    Windows {
-        kinds: line.kinds(taken),
-        ends_with_begin: block.in_key(),
+    let ends_with_begin = line.begins_key();
+    WindowScan {
+        matched: line.into_matched(),
+        ends_with_begin,
     }
 }
 
-/// What the secrets in `text`, scanned as a line on its own, look like.
-pub fn kinds_in(text: &str) -> Vec<String> {
-    let line = ScannedLine::of(text);
-    let taken = KeyBlock::default().take(&line, PLAIN);
-    line.kinds(taken)
+/// What the rules match in `text`, scanned as a line on its own.
+pub fn matched_in(text: &str) -> Vec<Matched> {
+    ScannedLine::of(text).into_matched()
 }
 
 /// Replaces the secrets in plain text, such as a commit message. Findings are at `place`.
 pub fn text(text: &str, place: &Place) -> Redacted {
     let mut block = KeyBlock::default();
     let mut out = String::with_capacity(text.len());
-    let mut kinds = Vec::new();
+    let mut secrets = Vec::new();
     for line in text.split_inclusive('\n') {
         let line = ScannedLine::of(line);
         let taken = block.take(&line, PLAIN);
-        kinds.extend(line.kinds(taken));
+        let taken = block.wait_if_key(taken, secrets.len());
+        secrets.extend(line.secrets(taken));
         if let Some(content) = line.text(taken) {
             out.push_str(&content);
         }
     }
-    let findings = kinds
+    block.end();
+    give_prints(&mut secrets, block.take_prints());
+    let findings = secrets
         .into_iter()
-        .map(|kind| Finding {
+        .map(|secret| Finding {
             place: place.clone(),
             line: None,
             change: PLAIN,
-            kind,
+            print: secret.print,
+            kind: secret.kind,
         })
         .collect();
     Redacted {
@@ -458,7 +582,12 @@ pub fn text(text: &str, place: &Place) -> Redacted {
     }
 }
 
-fn replace_secrets(line: &str, kinds: &mut Vec<String>) -> String {
+/// `text` with its secrets replaced, for a caller that has no use for what they were.
+pub fn scrub(text: &str) -> String {
+    self::text(text, &Place::text("")).text
+}
+
+fn replace_secrets(line: &str, matched: &mut Vec<Matched>) -> String {
     let lower = line.to_ascii_lowercase();
     let mut line = line.to_owned();
     for (rule, regex) in COMPILED.iter() {
@@ -466,13 +595,36 @@ fn replace_secrets(line: &str, kinds: &mut Vec<String>) -> String {
             continue;
         }
         let found = secrets_found(rule, regex, &line);
+        matched.extend(
+            found
+                .iter()
+                .map(|(range, kind)| matched_at(rule, kind, &line, range.clone())),
+        );
         // From the end, so the ranges of earlier matches stay valid.
         for (range, _) in found.iter().rev() {
             line.replace_range(range.clone(), REDACTED);
         }
-        kinds.extend(found.into_iter().map(|(_, kind)| kind));
     }
     line
+}
+
+/// The secret of `kind` that `rule` matched at `range` of `line`, with its fingerprint: a private
+/// key's is that of its data, as a block's lines would give it.
+fn matched_at(rule: &Rule, kind: &str, line: &str, range: Range<usize>) -> Matched {
+    let text = &line[range.clone()];
+    let print = if rule.kind == PRIVATE_KEY {
+        key_print(text)
+    } else {
+        Key::for_run().of(text.as_bytes())
+    };
+    Matched {
+        secret: Secret {
+            kind: kind.to_owned(),
+            print,
+        },
+        text: text.to_owned(),
+        to_end: range.end == line.len(),
+    }
 }
 
 /// The secrets `rule` finds in `line`, with their kinds. A match that isn't a secret is searched
@@ -1040,7 +1192,13 @@ mod tests {
         let numbers: Vec<usize> = found.iter().map(|line| line.number).collect();
         assert_eq!(numbers, [3, 6]);
         assert_eq!(found[0].text, format!("{}\n{}", lines[2], lines[3]));
-        assert_eq!(found[0].kinds, ["private key"]);
+        let key = &found[0].secrets;
+        assert_eq!((key.len(), key[0].kind.as_str()), (1, "private key"));
+        assert_eq!(
+            key[0].print,
+            text_print(&lines[1..=4].join("\n")),
+            "its block closed"
+        );
         assert_eq!(found[1].text, lines[5]);
         assert!(secret_lines(Vec::new()).is_empty());
     }
@@ -1137,12 +1295,21 @@ mod tests {
         }
     }
 
-    /// Takes a long line, of `pieces`, whose windows found `kinds`, the way the line readers do.
+    /// A secret of `kind`, whose text is its kind.
+    fn secret(kind: &str) -> Secret {
+        Secret {
+            kind: kind.to_owned(),
+            print: Key::for_run().of(kind.as_bytes()),
+        }
+    }
+
+    /// Takes a long line, of `pieces`, whose windows found secrets of `kinds`, the way the line
+    /// readers do.
     fn long(scan: &mut LineScan, pieces: &[&str], kinds: &[&str]) -> Held {
         let mut line = scan.start_long_line();
         pieces.iter().for_each(|piece| line.feed(piece.as_bytes()));
         let windows = Windows {
-            kinds: kinds.iter().map(ToString::to_string).collect(),
+            secrets: kinds.iter().map(|kind| secret(kind)).collect(),
             ends_with_begin: scan_window(pieces[pieces.len() - 1]).ends_with_begin,
         };
         scan.end_long_line(line, windows)
@@ -1155,13 +1322,11 @@ mod tests {
     #[test]
     fn takes_a_long_line_in_a_key_block_by_all_of_it() {
         let begin = "-----BEGIN OPENSSH PRIVATE KEY-----";
-        let found = |kind: &str| Held::Secrets(vec![kind.to_owned()]);
+        let key = || Held::Key;
+        let found = |kind: &str| Held::Secrets(vec![secret(kind)]);
         let mut scan = LineScan::default();
         scan.line(begin);
-        assert_eq!(
-            long(&mut scan, &["AAAA", "BBBB"], &["x"]),
-            found("private key")
-        );
+        assert_eq!(long(&mut scan, &["AAAA", "BBBB"], &["x"]), key());
         assert_eq!(long(&mut scan, &["CCCC", "DDDD"], &["x"]), Held::MoreOfAKey);
         assert_eq!(long(&mut scan, &["EEEE", " ghp"], &["y"]), found("y"));
         assert_eq!(scan.line("FFFF"), Held::Nothing, "the block ended");
@@ -1169,7 +1334,7 @@ mod tests {
         let mut scan = LineScan::default();
         assert_eq!(long(&mut scan, &["AAAA", "BBBB"], &[]), Held::Nothing);
         assert_eq!(long(&mut scan, &["x", begin], &[]), Held::Nothing);
-        assert_eq!(scan.line("AAAA"), found("private key"), "a block begins");
+        assert_eq!(scan.line("AAAA"), key(), "a block begins");
     }
 
     /// What a key's block holds of a long line of `pieces`, after the lines `before`, and of the
@@ -1189,7 +1354,7 @@ mod tests {
     /// spaces with text after them.
     #[test]
     fn tells_a_long_header_line_by_all_of_it() {
-        let key = || Held::Secrets(vec!["private key".to_owned()]);
+        let key = || Held::Key;
 
         let header = in_block(&[], &["Comment: xx", "x x"], "AAAA");
         let long_name = in_block(&[], &["AAAAAA", "AA: v"], "BBBB");
@@ -1198,6 +1363,146 @@ mod tests {
         assert_eq!(header, (Held::Nothing, key()));
         assert_eq!(long_name, (Held::Nothing, key()));
         assert_eq!(spaces, (Held::Nothing, Held::Nothing));
+    }
+
+    /// A private key whose data is the lines tagged `tags`, with its BEGIN and END lines.
+    fn key_of(tags: &[&str]) -> Vec<String> {
+        use crate::secrets::test_support::{key_begin, key_data, key_end};
+        let data = tags.iter().map(|tag| key_data(tag));
+        std::iter::once(key_begin("OPENSSH"))
+            .chain(data)
+            .chain(std::iter::once(key_end("OPENSSH")))
+            .collect()
+    }
+
+    /// The print of the one secret plain text holds.
+    fn text_print(text: &str) -> Fingerprint {
+        let found = self::text(text, &Place::text("message")).findings;
+        assert_eq!(found.len(), 1, "{text}");
+        found[0].print
+    }
+
+    /// The print of the one secret a diff that adds `lines` to a file holds.
+    fn diff_print(lines: &[String]) -> Fingerprint {
+        let body: String = lines.iter().map(|line| format!("+{line}\n")).collect();
+        let diff = format!(
+            "diff --git a/k b/k\n--- /dev/null\n+++ b/k\n@@ -0,0 +1,{} @@\n{body}",
+            lines.len()
+        );
+        let found = self::diff(&diff).findings;
+        assert_eq!(found.len(), 1, "{diff}");
+        found[0].print
+    }
+
+    /// Keys of one type can begin with the same data line, so each reader tells them by all of
+    /// their data: plain text, a diff, and the lines of a binary file.
+    #[test]
+    fn tells_keys_with_the_same_first_line_apart_in_every_reader() {
+        let (one, two) = (key_of(&["Ab1", "Cd2"]), key_of(&["Ab1", "Ef3"]));
+        let lines_print = |key: &[String]| secret_lines(key.to_vec())[0].secrets[0].print;
+
+        assert_ne!(text_print(&one.join("\n")), text_print(&two.join("\n")));
+        assert_ne!(diff_print(&one), diff_print(&two));
+        assert_ne!(lines_print(&one), lines_print(&two));
+        assert_eq!(text_print(&one.join("\n")), diff_print(&one));
+        assert_eq!(text_print(&one.join("\n")), lines_print(&one));
+    }
+
+    /// A key reads the same however its lines are written: indented, as the pull request lists a
+    /// commit's message, with white space after them that `git commit` strips, on one line as
+    /// git joins a message's first paragraph, or with JSON's escaped line breaks.
+    #[test]
+    fn gives_a_key_the_same_print_however_its_lines_are_written() {
+        let key = key_of(&["Ab1", "Cd2", "Ef3"]);
+        let print = text_print(&key.join("\n"));
+        let indented: Vec<String> = key.iter().map(|line| format!("  {line}")).collect();
+        let trailing: Vec<String> = key.iter().map(|line| format!("{line}   ")).collect();
+
+        assert_eq!(text_print(&indented.join("\n")), print);
+        assert_eq!(text_print(&trailing.join("\n")), print);
+        assert_eq!(text_print(&key.join(" ")), print);
+        assert_eq!(text_print(&format!("\"{}\\n\"", key.join("\\n"))), print);
+    }
+
+    /// A key that a hunk or the text cuts off before its END line has a print of only the data it
+    /// shows, never equal to a whole key's of the same data.
+    #[test]
+    fn gives_a_key_cut_off_before_its_end_a_partial_print() {
+        let whole = key_of(&["Ab1", "Cd2"]);
+        let cut = &whole[..whole.len() - 1];
+
+        assert_ne!(diff_print(cut), diff_print(&whole));
+        assert_eq!(diff_print(cut), diff_print(cut));
+        assert_ne!(text_print(&cut.join("\n")), text_print(&whole.join("\n")));
+        assert_eq!(text_print(&cut.join("\n")), diff_print(cut));
+    }
+
+    /// The data of a long line in a key's block, read a piece at a time, reaches the key's print,
+    /// as a scan of the line whole gives it: keys that differ only there differ.
+    #[test]
+    fn takes_a_long_data_line_into_its_keys_print() {
+        let print = |pieces: &[&str]| {
+            let mut scan = LineScan::default();
+            scan.line("-----BEGIN OPENSSH PRIVATE KEY-----");
+            assert_eq!(long(&mut scan, pieces, &[]), Held::Key);
+            scan.line("-----END OPENSSH PRIVATE KEY-----");
+            let prints: Vec<Fingerprint> =
+                scan.finish().into_iter().map(|(_, print)| print).collect();
+            prints
+        };
+        let whole = |line: &str| {
+            let text = format!(
+                "-----BEGIN OPENSSH PRIVATE KEY-----\n{line}\n-----END OPENSSH PRIVATE KEY-----"
+            );
+            text_print(&text)
+        };
+
+        assert_eq!(print(&["AAAA", "BBBB"]), [whole("AAAABBBB")]);
+        assert_ne!(print(&["AAAA", "BBBB"]), print(&["AAAA", "CCCC"]));
+    }
+
+    /// A secret's print is that of its own text: two tokens of one kind differ, and one token
+    /// reads the same in plain text, in a diff, and among a binary file's lines.
+    #[test]
+    fn prints_each_secret_by_its_own_text() {
+        let one = format!("ghp_{}", noise(36));
+        let two = format!("ghp_{}", &noise(40)[4..]);
+        let line = |token: &str| format!("export TOKEN={token}");
+        let lines_print = |token: &str| secret_lines(vec![line(token)])[0].secrets[0].print;
+
+        assert_ne!(text_print(&line(&one)), text_print(&line(&two)));
+        assert_eq!(text_print(&line(&one)), diff_print(&[line(&one)]));
+        assert_eq!(text_print(&line(&one)), lines_print(&one));
+    }
+
+    /// A key that a hunk's or a file's header cuts off in a diff has the partial print of the data
+    /// it shows, as at the end of a text, never a whole key's.
+    #[test]
+    fn gives_a_key_cut_off_by_a_header_a_partial_print() {
+        let whole = key_of(&["Ab1", "Cd2"]);
+        let cut = &whole[..whole.len() - 1];
+        let added: String = cut.iter().map(|line| format!("+{line}\n")).collect();
+        let start = format!("diff --git a/k b/k\n--- /dev/null\n+++ b/k\n@@ -0,0 +1,3 @@\n{added}");
+        let by_hunk = format!("{start}@@ -10,0 +11 @@\n+x = 1\n");
+        let by_file =
+            format!("{start}diff --git a/l b/l\n--- /dev/null\n+++ b/l\n@@ -0,0 +1 @@\n+x\n");
+
+        for diff in [by_hunk, by_file] {
+            let found = self::diff(&diff).findings;
+            assert_eq!(found.len(), 1, "{diff}");
+            assert_eq!(found[0].print, text_print(&cut.join("\n")), "{diff}");
+            assert_ne!(found[0].print, text_print(&whole.join("\n")), "{diff}");
+        }
+    }
+
+    /// A print whose slot no key has means the reader lost count of its secrets, which a debug
+    /// build stops on rather than give a key the wrong print.
+    #[test]
+    #[should_panic(expected = "every print has a key's slot")]
+    fn stops_on_a_print_whose_slot_no_key_has() {
+        let mut secrets = vec![Secret::key()];
+        let print = Key::for_run().of(b"key");
+        give_prints(&mut secrets, vec![(0, print), (3, print)]);
     }
 
     /// A key on one line, as in a cloud provider's JSON credentials, is replaced whole.

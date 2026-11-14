@@ -3,16 +3,16 @@
 //! so their blobs are read instead.
 
 use super::finding::{Change, FileRef, Finding, Place};
+use super::fingerprint::{Fingerprint, Fingerprinting, Key};
 use super::lines::{Line, Lines};
-use super::redact::{self, Held, LineScan, SecretLine};
+use super::redact::{self, Held, LineScan, Secret, SecretLine, give_prints};
 use crate::git::blob::BlobBatch;
 use crate::git::{Repo, diff, names};
 use anyhow::{Context, Result, bail};
-use std::collections::hash_map::{DefaultHasher, RandomState};
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::hash::{BuildHasher, Hasher};
 use std::io::{self, BufRead, BufReader, Cursor, Read};
 use std::rc::Rc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// The most of a binary file that is read. A larger one isn't checked.
 pub const MOST_BINARY_BYTES: u64 = 16 * 1024 * 1024;
@@ -36,7 +36,7 @@ pub struct BinaryFile {
 }
 
 /// A binary file over [`MOST_BINARY_BYTES`], which isn't checked.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Unchecked {
     pub place: FileRef,
     pub size: u64,
@@ -61,22 +61,30 @@ enum Content {
 /// as the file, so that a scan of many blobs holds little of each.
 struct Secrets {
     number: usize,
-    fingerprint: Fingerprint,
-    kinds: Vec<String>,
+    fingerprint: LinePrint,
+    secrets: Vec<Secret>,
 }
 
-/// What tells one line from another: 128 bits, keyed afresh for each scan, so that no text can
-/// be made to share another's, which would turn an added secret into an unchanged one.
-type Fingerprint = u128;
+/// What tells one line from another within a scan, apart from the prints of the secrets on it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct LinePrint(Fingerprint);
 
-/// Gives lines their fingerprints, with a key of their own.
-struct Fingerprints(RandomState);
+/// Gives lines their fingerprints, keyed afresh for each scan, so that no text can be made to
+/// share another's, which would turn an added secret into an unchanged one: the run's key, with
+/// the scan's own number fed first.
+struct Fingerprints(u64);
 
 impl Fingerprints {
-    fn of(&self, text: &str) -> Fingerprint {
+    /// The fingerprints of a scan of its own.
+    fn new() -> Self {
+        static SCANS: AtomicU64 = AtomicU64::new(0);
+        Self(SCANS.fetch_add(1, Ordering::Relaxed))
+    }
+
+    fn of(&self, text: &str) -> LinePrint {
         let mut print = self.start();
         print.feed(text.as_bytes());
-        print.finish()
+        LinePrint(print.finish())
     }
 
     /// A fingerprint to feed text as it comes, for a line too long to hold whole or a private
@@ -86,11 +94,10 @@ impl Fingerprints {
     /// long as the hasher joins what it's fed, as std's does; if it didn't, the key would count as
     /// added.
     fn start(&self) -> Fingerprinting {
-        Fingerprinting([0, 1].map(|part| {
-            let mut hasher = self.0.build_hasher();
-            hasher.write_u8(part);
-            hasher
-        }))
+        let mut print = Key::for_run().start();
+        print.feed(b"line of scan ");
+        print.feed(&self.0.to_le_bytes());
+        print
     }
 
     /// `line`, kept by its fingerprint.
@@ -98,28 +105,13 @@ impl Fingerprints {
         Secrets {
             number: line.number,
             fingerprint: self.of(&line.text),
-            kinds: line.kinds,
+            secrets: line.secrets,
         }
     }
 
     /// `lines`, each kept by its fingerprint.
     fn of_lines(&self, lines: Vec<SecretLine>) -> Vec<Secrets> {
         lines.into_iter().map(|line| self.secrets(line)).collect()
-    }
-}
-
-/// A fingerprint being fed, in its two halves.
-#[derive(Clone)]
-struct Fingerprinting([DefaultHasher; 2]);
-
-impl Fingerprinting {
-    fn feed(&mut self, bytes: &[u8]) {
-        self.0.iter_mut().for_each(|half| half.write(bytes));
-    }
-
-    fn finish(&self) -> Fingerprint {
-        let [high, low] = &self.0;
-        (u128::from(high.finish()) << 64) | u128::from(low.finish())
     }
 }
 
@@ -311,7 +303,7 @@ impl<'b, B: Blobs> Contents<'b, B> {
             read: HashMap::new(),
             uses,
             cap,
-            fingerprints: Fingerprints(RandomState::new()),
+            fingerprints: Fingerprints::new(),
         })
     }
 
@@ -369,11 +361,12 @@ fn findings_in(
             _ => Change::Added,
         };
         let number = text.then_some(line.number);
-        line.kinds.iter().map(move |kind| Finding {
+        line.secrets.iter().map(move |secret| Finding {
             place: Place::File(file.place.clone()),
             line: number,
             change,
-            kind: kind.clone(),
+            print: secret.print,
+            kind: secret.kind.clone(),
         })
     });
     Ok(findings.collect())
@@ -384,7 +377,7 @@ fn findings_in(
 fn held_by_parents(
     contents: &mut Contents<'_, impl Blobs>,
     parents: &[String],
-) -> Result<Option<HashSet<Fingerprint>>> {
+) -> Result<Option<HashSet<LinePrint>>> {
     parents
         .iter()
         .try_fold(Some(HashSet::new()), |held, parent| {
@@ -467,7 +460,7 @@ struct SecretLines<'f> {
 struct Waiting {
     number: usize,
     print: Fingerprinting,
-    kinds: Vec<String>,
+    secrets: Vec<Secret>,
 }
 
 impl SecretLines<'_> {
@@ -476,8 +469,11 @@ impl SecretLines<'_> {
         let text = String::from_utf8_lossy(bytes.strip_suffix(b"\n").unwrap_or(bytes));
         match self.scan.line(&text) {
             Held::MoreOfAKey => self.more_of_a_key(text.as_bytes()),
-            Held::Secrets(kinds) => self.found_on(number, text.as_bytes(), kinds),
-            Held::Nothing => {}
+            held => {
+                if let Some(secrets) = held.secrets() {
+                    self.found_on(number, text.as_bytes(), secrets);
+                }
+            }
         }
     }
 
@@ -506,17 +502,20 @@ impl SecretLines<'_> {
             }
         })?;
         match self.scan.end_long_line(line, windows) {
-            Held::Secrets(kinds) => self.keep(Some(Waiting {
-                number,
-                print: own,
-                kinds,
-            })),
             Held::MoreOfAKey => {
                 if let (Some(last), Some(more)) = (&mut self.last, more) {
                     last.print = more;
                 }
             }
-            Held::Nothing => {}
+            held => {
+                if let Some(secrets) = held.secrets() {
+                    self.keep(Some(Waiting {
+                        number,
+                        print: own,
+                        secrets,
+                    }));
+                }
+            }
         }
         Ok(())
     }
@@ -529,14 +528,14 @@ impl SecretLines<'_> {
         }
     }
 
-    /// Takes `text`, the line `number`, which holds secrets that look like `kinds`.
-    fn found_on(&mut self, number: usize, text: &[u8], kinds: Vec<String>) {
+    /// Takes `text`, the line `number`, which holds `secrets`.
+    fn found_on(&mut self, number: usize, text: &[u8], secrets: Vec<Secret>) {
         let mut print = self.fingerprints.start();
         print.feed(text);
         self.keep(Some(Waiting {
             number,
             print,
-            kinds,
+            secrets,
         }));
     }
 
@@ -545,15 +544,24 @@ impl SecretLines<'_> {
         if let Some(last) = std::mem::replace(&mut self.last, next) {
             self.found.push(Secrets {
                 number: last.number,
-                fingerprint: last.print.finish(),
-                kinds: last.kinds,
+                fingerprint: LinePrint(last.print.finish()),
+                secrets: last.secrets,
             });
         }
     }
 
+    /// The secret lines found, each private key with its print; one still open at the end is
+    /// cut off.
     fn finish(mut self) -> Vec<Secrets> {
         self.keep(None);
-        self.found
+        let Self {
+            scan, mut found, ..
+        } = self;
+        give_prints(
+            found.iter_mut().flat_map(|line| &mut line.secrets),
+            scan.finish(),
+        );
+        found
     }
 }
 
@@ -1139,8 +1147,8 @@ mod tests {
     /// another line.
     #[test]
     fn keys_the_fingerprints_of_each_scan_afresh() {
-        let one = Fingerprints(RandomState::new());
-        let two = Fingerprints(RandomState::new());
+        let one = Fingerprints::new();
+        let two = Fingerprints::new();
         let line = format!("aws {}", aws_key());
 
         assert_eq!(one.of(&line), one.of(&line));
@@ -1148,8 +1156,58 @@ mod tests {
         assert_ne!(one.of(&line), two.of(&line));
     }
 
+    /// A private key whose data is the lines tagged `tags`, with its BEGIN and END lines.
+    fn key_text(data: &[String]) -> String {
+        use super::super::test_support::{key_begin, key_end};
+        let lines = std::iter::once(key_begin("OPENSSH"))
+            .chain(data.iter().cloned())
+            .chain(std::iter::once(key_end("OPENSSH")));
+        lines.collect::<Vec<_>>().join("\n")
+    }
+
+    /// The print of the one secret plain text holds, as a scan of the text gives it.
+    fn print_in_text(text: &str) -> Fingerprint {
+        redact::text(text, &Place::text("blob")).findings[0].print
+    }
+
+    /// A text blob's private keys get the prints a scan of the text gives them: keys that share
+    /// their first data line differ, and a data line too long to read whole counts too.
+    #[test]
+    fn gives_the_keys_of_a_text_blob_their_prints() {
+        use super::super::test_support::key_data;
+        let one = key_text(&[key_data("Ab1"), key_data("Cd2")]);
+        let two = key_text(&[key_data("Ab1"), key_data("Ef3")]);
+        let long = key_text(&[key_data("Ab1"), "A".repeat(WINDOW + 10)]);
+        let print = |text: &str| {
+            let lines = lines_of(format!("{text}\n").as_bytes());
+            assert_eq!(lines.len(), 1);
+            lines[0].secrets[0].print
+        };
+
+        assert_eq!(print(&one), print_in_text(&one));
+        assert_ne!(print(&one), print(&two));
+        assert_eq!(print(&long), print_in_text(&long));
+        assert_ne!(print(&long), print(&one));
+    }
+
+    /// A binary file of many runs that each hold a secret is read in time that grows with how
+    /// many there are: a few seconds here in a debug build for 100,000 of them.
+    #[test]
+    fn reads_a_binary_of_many_secrets_in_time() {
+        let runs: Vec<u8> = (0..100_000)
+            .flat_map(|n| format!("aws AKIA{n:0>16}\0").into_bytes())
+            .collect();
+        let bytes = [b"\0".as_slice(), &runs].concat();
+
+        let start = std::time::Instant::now();
+        let lines = lines_of(&bytes);
+
+        assert_eq!(lines.len(), 100_000);
+        assert!(start.elapsed().as_secs() < 30, "{:?}", start.elapsed());
+    }
+
     fn lines_of(bytes: &[u8]) -> Vec<Secrets> {
-        let fingerprints = Fingerprints(RandomState::new());
+        let fingerprints = Fingerprints::new();
         match content_of(bytes, &fingerprints).unwrap() {
             Content::Read { lines, .. } => lines,
             Content::TooLarge(_) => panic!("text is never too large"),
@@ -1170,7 +1228,7 @@ mod tests {
 
         let found: Vec<(usize, usize)> = lines_of(&text)
             .iter()
-            .map(|line| (line.number, line.kinds.len()))
+            .map(|line| (line.number, line.secrets.len()))
             .collect();
 
         assert_eq!(found, [(1, 1), (2, 1), (3, 1), (4, 1)]);
@@ -1192,8 +1250,8 @@ mod tests {
 
         assert_eq!(lines.len(), 1);
         assert_eq!(
-            (lines[0].number, lines[0].kinds.as_slice()),
-            (2, &["private key".to_owned()][..])
+            (lines[0].number, lines[0].secrets[0].kind.as_str()),
+            (2, "private key")
         );
     }
 
@@ -1238,9 +1296,9 @@ mod tests {
             redact::secret_lines(text.lines().map(ToOwned::to_owned))
                 .into_iter()
                 .flat_map(|line| {
-                    line.kinds
+                    line.secrets
                         .into_iter()
-                        .map(move |kind| (Some(line.number), kind))
+                        .map(move |secret| (Some(line.number), secret.kind))
                 })
                 .collect();
         assert_eq!(found, whole);

@@ -8,6 +8,7 @@
 
 pub mod contents;
 pub mod finding;
+pub mod fingerprint;
 mod lines;
 mod publication;
 pub mod redact;
@@ -19,6 +20,7 @@ use anyhow::{Result, bail};
 use contents::{MOST_BINARY_BYTES, Scanned, Unchecked};
 use finding::{Change, Finding, Place};
 use publication::Found;
+use std::collections::HashSet;
 
 /// How to make a check pass when its findings aren't secrets.
 const ADVICE: &str = "If they aren't real secrets, add --on-secrets warn, or choose Warn under \
@@ -204,19 +206,16 @@ fn found_in_commits(repo: &Repo, range: &[&str]) -> Result<Scanned> {
 
 /// What `scans` found together, each finding and each file not checked once, in the order found.
 fn each_once(scans: Vec<Scanned>) -> Scanned {
+    let (mut findings, mut files) = (HashSet::new(), HashSet::new());
     scans
         .into_iter()
         .fold(Scanned::default(), |mut all, scanned| {
-            for finding in scanned.findings {
-                if !all.findings.contains(&finding) {
-                    all.findings.push(finding);
-                }
-            }
-            for file in scanned.unchecked {
-                if !all.unchecked.contains(&file) {
-                    all.unchecked.push(file);
-                }
-            }
+            let new = scanned.findings.into_iter();
+            all.findings
+                .extend(new.filter(|finding| findings.insert(finding.clone())));
+            let new = scanned.unchecked.into_iter();
+            all.unchecked
+                .extend(new.filter(|file| files.insert(file.clone())));
             all
         })
 }
@@ -762,6 +761,7 @@ mod tests {
 
     fn finding(place: Place, line: Option<usize>, change: Change) -> Finding {
         Finding {
+            print: fingerprint::Key::for_run().of(b"a GitHub token"),
             place,
             line,
             change,
@@ -814,6 +814,29 @@ mod tests {
 
     fn check_staged(repo: &Repo, scope: Scope) -> Result<Scanned> {
         check_changes(repo, scope, OnSecrets::Reject, &[], &WORDING)
+    }
+
+    /// What the scans of a push's places found together holds each finding once, in time that
+    /// grows with how many there are: a second or so here in a debug build, where a search of all
+    /// those kept for each took minutes.
+    #[test]
+    fn keeps_each_finding_of_many_once_quickly() {
+        let many = |from: usize| -> Vec<Finding> {
+            (from..from + 100_000)
+                .map(|n| Finding {
+                    print: fingerprint::Key::for_run().of(&n.to_le_bytes()),
+                    ..finding(changed("one.min.js"), Some(1), Change::Added)
+                })
+                .collect()
+        };
+        let scans = [many(0), many(50_000)].map(|findings| Scanned {
+            findings,
+            unchecked: Vec::new(),
+        });
+        let started = std::time::Instant::now();
+        let all = each_once(scans.into());
+        assert_eq!(all.findings.len(), 150_000);
+        assert!(started.elapsed().as_secs() < 30, "{:?}", started.elapsed());
     }
 
     #[test]

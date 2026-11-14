@@ -1,10 +1,11 @@
 //! What a scan finds, and where: the words the scans, the checks and the flows share.
 
+use super::fingerprint::Fingerprint;
 use crate::git::CommitId;
 use std::fmt;
 
 /// A secret that was found, and replaced wherever the text goes to a model.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Finding {
     pub place: Place,
     /// Its line in the file's new version, or in the old version for a removed
@@ -13,6 +14,8 @@ pub struct Finding {
     pub change: Change,
     /// What it looks like, e.g. "GitHub token".
     pub kind: String,
+    /// The secret's fingerprint, which tells it from another of the same kind.
+    pub print: Fingerprint,
 }
 
 impl Finding {
@@ -26,7 +29,7 @@ impl Finding {
 }
 
 /// What a change does to the line a secret is on.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Change {
     /// The change adds the line, or the secret is in a commit message.
     Added,
@@ -37,7 +40,7 @@ pub enum Change {
 }
 
 /// Where a finding is.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Place {
     File(FileRef),
     /// A commit's message, or without a commit the message of the commit being made.
@@ -91,7 +94,7 @@ impl fmt::Display for Place {
 }
 
 /// A file of the changes, or of a commit's patch.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
 pub struct FileRef {
     pub commit: Option<CommitId>,
     pub path: String,

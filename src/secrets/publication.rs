@@ -6,7 +6,7 @@
 use super::contents::{BinaryFile, BinaryFiles};
 use super::finding::{Change, Finding, Place};
 use super::lines::{Line, Lines};
-use super::redact::{DiffScan, Held, LineScan};
+use super::redact::{DiffScan, Held, LineScan, Secret, give_prints};
 use crate::git::{CommitId, LogLine, LogMarks, UNREADABLE_LOG};
 use anyhow::{Result, bail};
 use std::io::BufRead;
@@ -204,7 +204,7 @@ impl CommitRead {
 #[derive(Default)]
 struct MessageRead {
     scan: LineScan,
-    kinds: Vec<String>,
+    secrets: Vec<Secret>,
 }
 
 impl MessageRead {
@@ -231,20 +231,22 @@ impl MessageRead {
 
     /// Keeps the secrets a line holds.
     fn take(&mut self, held: Held) {
-        if let Held::Secrets(kinds) = held {
-            self.kinds.extend(kinds);
-        }
+        self.secrets.extend(held.secrets().into_iter().flatten());
     }
 
-    /// The secrets found, as findings in `place`.
+    /// The secrets found, as findings in `place`, each private key with its print; one still open
+    /// at the message's end is cut off.
     fn findings(self, place: &Place) -> Vec<Finding> {
-        self.kinds
+        let Self { scan, mut secrets } = self;
+        give_prints(&mut secrets, scan.finish());
+        secrets
             .into_iter()
-            .map(|kind| Finding {
+            .map(|secret| Finding {
                 place: place.clone(),
                 line: None,
                 change: Change::Added,
-                kind,
+                print: secret.print,
+                kind: secret.kind,
             })
             .collect()
     }

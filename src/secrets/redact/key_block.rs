@@ -3,7 +3,9 @@
 
 use crate::safe_text::Unhidden;
 use crate::secrets::finding::Change;
+use crate::secrets::fingerprint::{Fingerprint, Fingerprinting, Key};
 use regex_lite::Regex;
+use std::mem;
 use std::sync::LazyLock;
 
 static KEY_BEGIN: LazyLock<Regex> = LazyLock::new(|| {
@@ -30,6 +32,9 @@ pub(super) trait KeyBlockFacts {
     fn is_header(&self) -> bool;
     /// Whether the line, with its secrets replaced, ends with a private key's BEGIN line.
     fn begins_key(&self) -> bool;
+    /// Feeds the line's key data to `print`, the print of the block the line is in. A long line,
+    /// read before its block takes it, gives the print it fed as it came from that block's own.
+    fn feed_data(&self, print: &mut Fingerprinting);
 }
 
 /// What a line too long to scan whole is to a private key's block, once all of it has been read:
@@ -38,16 +43,24 @@ pub(super) trait KeyBlockFacts {
 pub(super) struct LongLineFacts {
     in_key: Option<InKey>,
     begins_key: bool,
+    /// The print of the side's block, fed the line's key data.
+    print: Option<Fingerprinting>,
 }
 
 impl LongLineFacts {
     /// The facts of `line`, all of it read, whose last window, its secrets replaced, ends with a
-    /// key's BEGIN line or not (`ends_with_begin`).
-    pub(super) fn of(line: LongLineScan, ends_with_begin: bool) -> Self {
-        Self {
-            in_key: line.verdict(),
-            begins_key: ends_with_begin,
-        }
+    /// key's BEGIN line or not (`ends_with_begin`): one for each side it was started for, in that
+    /// order, with that side's print.
+    pub(super) fn of(line: LongLineScan, ends_with_begin: bool) -> Vec<Self> {
+        let (in_key, prints) = line.verdict();
+        prints
+            .into_iter()
+            .map(|print| Self {
+                in_key,
+                begins_key: ends_with_begin,
+                print,
+            })
+            .collect()
     }
 }
 
@@ -63,6 +76,12 @@ impl KeyBlockFacts for LongLineFacts {
     fn begins_key(&self) -> bool {
         self.begins_key
     }
+
+    fn feed_data(&self, print: &mut Fingerprinting) {
+        if let Some(fed) = &self.print {
+            print.clone_from(fed);
+        }
+    }
 }
 
 /// A line too long to scan whole, read a piece at a time: whether the line before left a private
@@ -73,22 +92,28 @@ pub struct LongLineScan {
     text: Unhidden,
     data: KeyData,
     header: KeyHeader,
+    /// The print of the block of each side that holds the line, fed its key data as it comes,
+    /// which the side keeps only if all of the line turns out to be data.
+    prints: Vec<Option<Fingerprinting>>,
 }
 
 /// What a long line in a private key's block is, once all of it has been read.
+#[derive(Clone, Copy)]
 struct InKey {
     data: bool,
     header: bool,
 }
 
 impl LongLineScan {
-    /// Starts on a line, `in_key` if the line before left a private key's block open.
-    pub(super) fn starting(in_key: bool) -> Self {
+    /// Starts on a line, `in_key` if the line before left a private key's block open, with the
+    /// `prints` of the blocks of the sides that hold it.
+    pub(super) fn starting(in_key: bool, prints: Vec<Option<Fingerprinting>>) -> Self {
         Self {
             in_key,
             text: Unhidden::default(),
             data: KeyData::default(),
             header: KeyHeader::default(),
+            prints,
         }
     }
 
@@ -97,23 +122,33 @@ impl LongLineScan {
     pub fn feed(&mut self, piece: &[u8]) {
         if self.in_key {
             let text = self.text.piece(piece);
-            self.data.feed(&text);
-            self.header.feed(&text);
+            self.take(&text);
         }
     }
 
-    /// What the line is to the key's block it's in, or `None` outside a block.
-    fn verdict(mut self) -> Option<InKey> {
+    fn take(&mut self, text: &str) {
+        let mut data = Vec::new();
+        self.data
+            .feed_printing(text, |piece| data.extend_from_slice(piece));
+        for print in self.prints.iter_mut().flatten() {
+            print.feed(&data);
+        }
+        self.header.feed(text);
+    }
+
+    /// What the line is to the key's block it's in, or `None` outside a block, and the prints
+    /// fed its data.
+    fn verdict(mut self) -> (Option<InKey>, Vec<Option<Fingerprinting>>) {
         if !self.in_key {
-            return None;
+            return (None, self.prints);
         }
         let rest = self.text.finish();
-        self.data.feed(&rest);
-        self.header.feed(&rest);
-        Some(InKey {
+        self.take(&rest);
+        let in_key = InKey {
             data: self.data.is_key_data(),
             header: self.header.is_key_header(),
-        })
+        };
+        (Some(in_key), self.prints)
     }
 }
 
@@ -226,6 +261,16 @@ impl KeyData {
         *self = text.chars().fold(*self, KeyData::next);
     }
 
+    /// Feeds `text`, as [`KeyData::feed`] does, and gives `data` each character it takes as data.
+    fn feed_printing(&mut self, text: &str, mut data: impl FnMut(&[u8])) {
+        for character in text.chars() {
+            *self = self.next(character);
+            if *self == KeyData::Data {
+                data(&[character as u8]);
+            }
+        }
+    }
+
     fn next(self, character: char) -> Self {
         let code = character.is_whitespace() || "\"'`,;+".contains(character);
         let data = character.is_ascii_alphanumeric() || "+/=".contains(character);
@@ -251,27 +296,87 @@ impl KeyData {
     }
 }
 
-/// Follows a private key's block across the lines of one text, or one side of a diff: whether
-/// they're inside a block, and which changes its data has reported.
+/// Follows a private key's block across the lines of one text, or one side of a diff, and gives
+/// the findings that wait for a key its print once the key's block closes.
 #[derive(Default)]
 pub(super) struct KeyBlock {
     /// After a line that ends with a BEGIN marker, until the key's data ends.
-    in_key: bool,
-    /// What the lines of the key's data that have been reported do: the key's data becomes one
-    /// [`REDACTED`](super::REDACTED) line for each change, so that a key that replaces another,
-    /// whose old lines git shows first, is reported as added too.
+    open: Option<OpenBlock>,
+    /// The prints of the blocks that closed, by the slot of each finding that waited for one.
+    closed: Vec<(usize, Fingerprint)>,
+}
+
+/// A key's block that is open: the print of its data so far, what the lines of its data that have
+/// been reported do, and the slots of the findings that wait for its print. The key's data becomes
+/// one [`REDACTED`](super::REDACTED) line for each change, so that a key that replaces another,
+/// whose old lines git shows first, is reported as added too.
+struct OpenBlock {
+    print: Fingerprinting,
     key_changes: Vec<Change>,
+    waiting: Vec<usize>,
+}
+
+impl OpenBlock {
+    fn new() -> Self {
+        Self {
+            print: Key::for_run().start(),
+            key_changes: Vec::new(),
+            waiting: Vec::new(),
+        }
+    }
+
+    /// How a line of the key's data that makes `change` is taken: as the key, the first in the
+    /// block to make the change, else as more of it.
+    fn key_data(&mut self, change: Change) -> Taken {
+        if self.key_changes.contains(&change) {
+            Taken::MoreOfAKey
+        } else {
+            self.key_changes.push(change);
+            Taken::Key
+        }
+    }
 }
 
 impl KeyBlock {
     /// Whether the lines so far have left a key's block open.
     pub(super) fn in_key(&self) -> bool {
-        self.in_key
+        self.open.is_some()
     }
 
     /// Starts on the next line, too long to scan whole.
     pub(super) fn start_long_line(&self) -> LongLineScan {
-        LongLineScan::starting(self.in_key)
+        LongLineScan::starting(self.in_key(), vec![self.data_print()])
+    }
+
+    /// The print of the open block's data so far.
+    pub(super) fn data_print(&self) -> Option<Fingerprinting> {
+        self.open.as_ref().map(|open| open.print.clone())
+    }
+
+    /// Has the finding at `slot` wait for the open block's print, as it's the key's.
+    pub(super) fn wait(&mut self, slot: usize) {
+        if let Some(open) = &mut self.open {
+            open.waiting.push(slot);
+        }
+    }
+
+    /// Has the key a line was taken for, as `taken` tells, wait for the open block's print at
+    /// `slot`.
+    pub(super) fn wait_if_key(&mut self, taken: Taken, slot: usize) -> Taken {
+        if taken == Taken::Key {
+            self.wait(slot);
+        }
+        taken
+    }
+
+    /// Ends the text, or the hunk: an open block's key is cut off, and its print partial.
+    pub(super) fn end(&mut self) {
+        self.close(true);
+    }
+
+    /// The prints of the blocks that closed, by the slot of each finding that waited.
+    pub(super) fn take_prints(&mut self) -> Vec<(usize, Fingerprint)> {
+        mem::take(&mut self.closed)
     }
 
     /// Takes `line`, which makes `change`, whole or a long line read in pieces: inside a key's
@@ -279,44 +384,35 @@ impl KeyBlock {
     /// more of it after that. Any other line is text; it ends the block unless it's a header of
     /// the key's, and starts one if, with its secrets replaced, it ends with a key's BEGIN line.
     pub(super) fn take(&mut self, line: &impl KeyBlockFacts, change: Change) -> Taken {
-        if self.in_key && line.is_data() {
-            return self.key_data(change);
+        if let Some(open) = &mut self.open
+            && line.is_data()
+        {
+            line.feed_data(&mut open.print);
+            return open.key_data(change);
         }
-        if self.in_key {
-            // Encrypted keys have headers such as "Proc-Type: 4,ENCRYPTED" before
-            // their data. Anything else, such as the END line, ends the block.
-            self.in_key = line.is_header();
+        // Encrypted keys have headers such as "Proc-Type: 4,ENCRYPTED" before
+        // their data. Anything else, such as the END line, ends the block.
+        if self.in_key() && !line.is_header() {
+            self.close(false);
         }
         if line.begins_key() {
-            self.begin_block();
+            self.close(false);
+            self.open = Some(OpenBlock::new());
         }
         Taken::Text
     }
 
-    /// How a line of the key's data that makes `change` is taken: as the key, the first in the
-    /// block to make the change, else as more of it.
-    fn key_data(&mut self, change: Change) -> Taken {
-        if self.newly_reported(change) {
-            Taken::Key
-        } else {
-            Taken::MoreOfAKey
+    /// Closes the open block, whole or `partial`: each finding that waits gets its print.
+    fn close(&mut self, partial: bool) {
+        if let Some(open) = self.open.take() {
+            let print = if partial {
+                open.print.finish_partial()
+            } else {
+                open.print.finish()
+            };
+            self.closed
+                .extend(open.waiting.into_iter().map(|slot| (slot, print)));
         }
-    }
-
-    /// Starts a key's block, after its BEGIN line.
-    fn begin_block(&mut self) {
-        self.in_key = true;
-        self.key_changes.clear();
-    }
-
-    /// Whether a line of the key's data that makes `change` is the first of the block to make
-    /// it, and so reports the key, as a set's `insert` tells; the change is remembered.
-    fn newly_reported(&mut self, change: Change) -> bool {
-        let first = !self.key_changes.contains(&change);
-        if first {
-            self.key_changes.push(change);
-        }
-        first
     }
 }
 
@@ -334,6 +430,26 @@ pub(super) fn starts_key_block(line: &str) -> bool {
 /// [`KeyData`] tells it.
 pub(super) fn is_key_data(line: &str) -> bool {
     KeyData::of(line).is_key_data()
+}
+
+/// The key data of `line`, a line of a key's data: its base64 characters, without what code puts
+/// around them.
+pub(super) fn key_data_of(line: &str) -> Vec<u8> {
+    let mut data = Vec::new();
+    KeyData::default().feed_printing(line, |piece| data.extend_from_slice(piece));
+    data
+}
+
+/// The print of a private key written on one line, as a string literal of code writes it, or as
+/// git joins a message's first paragraph: the key data of each of its lines, split where white
+/// space or a `\n` escape is, as the lines of a block would give it.
+pub(super) fn key_print(text: &str) -> Fingerprint {
+    let mut print = Key::for_run().start();
+    text.split("\\n")
+        .flat_map(str::split_whitespace)
+        .filter(|line| is_key_data(line))
+        .for_each(|line| print.feed(&key_data_of(line)));
+    print.finish()
 }
 
 /// Whether `line` is a header line of a private key's, as [`KeyHeader`] tells it.
@@ -367,15 +483,15 @@ mod tests {
         for _ in 0..200_000 {
             let (whole, pieces) = picks.pieces(&parts, 9);
             let in_key = KeyBlock {
-                in_key: true,
-                key_changes: Vec::new(),
+                open: Some(OpenBlock::new()),
+                ..KeyBlock::default()
             };
             let mut line = in_key.start_long_line();
 
             pieces.iter().for_each(|piece| line.feed(piece));
 
             let text = without_hidden(&String::from_utf8_lossy(&whole)).text;
-            let verdict = line.verdict().expect("in a key's block");
+            let verdict = line.verdict().0.expect("in a key's block");
             let by_stripping = (data_by_stripping(&text), header_by_stripping(&text));
             assert_eq!(
                 (verdict.data, verdict.header),

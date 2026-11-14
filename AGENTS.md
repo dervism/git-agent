@@ -102,6 +102,7 @@ The modules the commands share:
 | `fit.rs` | Shortens a diff to a size limit. |
 | `secrets.rs` | The secret checks: refusing or warning when a commit, a push or a pull request would add secrets. |
 | `secrets/finding.rs` | What a scan finds and where (`Finding`, `Place`), as the scans, the checks and the flows name it. |
+| `secrets/fingerprint.rs` | Fingerprints of secrets and lines: a keyed hash, with one key for the run that is never shown. |
 | `secrets/redact.rs` | Finds secrets in text before it goes to a model, and replaces them with `[REDACTED]`. |
 | `secrets/redact/diff_scan.rs` | Scans a diff a line at a time, following each side of a hunk. |
 | `secrets/redact/key_block.rs` | A private key's block, followed from line to line. |

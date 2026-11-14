@@ -2,10 +2,11 @@
 //! side of a hunk, the result and every parent, followed as a text of its own.
 
 use super::key_block::{KeyBlock, KeyBlockFacts, LongLineFacts, LongLineScan, Taken};
-use super::{Redacted, ScannedLine, Windows};
+use super::{Redacted, ScannedLine, Secret, Windows};
 use crate::git::diff::is_file_header;
 use crate::git::names;
 use crate::secrets::finding::{Change, Finding, Place};
+use crate::secrets::fingerprint::Fingerprint;
 
 /// Replaces the secrets in a diff. Findings name the file and the line.
 pub fn diff(diff: &str) -> Redacted {
@@ -81,20 +82,21 @@ impl DiffScan {
     /// Scans `line`, the next line of the diff, with its line end.
     pub fn line<'l>(&mut self, line: &'l str) -> Kept<'l> {
         if is_file_header(line) {
+            self.restart_sides(Sides::default());
             self.path = names::of_diff(line);
             self.hunk = None;
-            self.sides = Sides::default();
         } else if line.starts_with("@@") {
             let hunk = Hunk::starting(line);
-            self.sides = Sides::of(hunk.parents.len());
+            self.restart_sides(Sides::of(hunk.parents.len()));
             self.hunk = Some(hunk);
         } else if let Some((markers, change, number)) = self.take(line) {
-            let mut kinds = Vec::new();
-            let content = self
+            let slot = self.findings.len();
+            let scanned = self
                 .sides
-                .scan(markers, &line[markers.len()..], change, &mut kinds);
-            self.found(change, number, kinds);
+                .scan(markers, &line[markers.len()..], change, slot);
+            self.found(change, number, scanned.secrets);
             let markers = markers.as_str();
+            let content = scanned.text;
             return content.map_or(Kept::Dropped, |content| Kept::Scanned { markers, content });
         }
         Kept::Outside(line)
@@ -118,18 +120,25 @@ impl DiffScan {
 
     /// Takes what the windows of `text` found.
     pub fn end_long_line(&mut self, text: LongText, windows: Windows) {
-        let markers = Markers::of(&text.columns);
-        let kinds = self
-            .sides
-            .end_long_line(markers, text.change, text.line, windows);
-        if let Some(kinds) = kinds {
-            self.found(text.change, text.number, kinds);
-        }
+        let (change, number) = (text.change, text.number);
+        let slot = self.findings.len();
+        let secrets = self.sides.end_long_line(text, windows, slot);
+        self.found(change, number, secrets);
     }
 
-    /// The findings so far.
-    pub fn findings(self) -> Vec<Finding> {
+    /// The findings of the whole diff: a private key still open is cut off.
+    pub fn findings(mut self) -> Vec<Finding> {
+        self.restart_sides(Sides::default());
         self.findings
+    }
+
+    /// Ends the hunk's sides, which cuts off a private key still open, gives the findings of the
+    /// keys their prints, and goes on with `next`.
+    fn restart_sides(&mut self, next: Sides) {
+        let mut ended = std::mem::replace(&mut self.sides, next);
+        for (slot, print) in ended.end() {
+            self.findings[slot].print = print;
+        }
     }
 
     /// The markers of `line`, if it's a line of the current hunk, with what the line does and
@@ -141,14 +150,24 @@ impl DiffScan {
         Some((markers, change, number))
     }
 
-    fn found(&mut self, change: Change, number: usize, kinds: Vec<String>) {
-        self.findings.extend(kinds.into_iter().map(|kind| Finding {
-            place: Place::file(self.path.clone()),
-            line: Some(number),
-            change,
-            kind,
-        }));
+    /// Takes the `secrets` of the line `number`, which makes `change`.
+    fn found(&mut self, change: Change, number: usize, secrets: Vec<Secret>) {
+        let path = &self.path;
+        self.findings
+            .extend(secrets.into_iter().map(|secret| Finding {
+                place: Place::file(path.clone()),
+                line: Some(number),
+                change,
+                print: secret.print,
+                kind: secret.kind,
+            }));
     }
+}
+
+/// A hunk's line as its sides took it: what goes on to the model, if anything, and its secrets.
+struct ScannedLineOfHunk {
+    text: Option<String>,
+    secrets: Vec<Secret>,
 }
 
 /// A hunk's sides, each scanned as a file of its own: the result, which holds its kept and added
@@ -201,33 +220,51 @@ impl Sides {
             .chain(parents)
     }
 
+    /// Ends every side, which cuts off a private key still open, and gives the keys' prints, by
+    /// the slots of their findings.
+    fn end(&mut self) -> Vec<(usize, Fingerprint)> {
+        std::iter::once(&mut self.result)
+            .chain(&mut self.parents)
+            .flat_map(|side| {
+                side.end();
+                side.take_prints()
+            })
+            .collect()
+    }
+
     /// `content`, a line with these `markers` that makes `change`, with its secrets replaced,
-    /// read once and taken by each side that holds it, adding to `kinds` what the side it's
-    /// reported on finds. It's left out, or becomes its key's [`REDACTED`](super::REDACTED) line,
-    /// where any side that holds it takes it for a private key's data; and a line shaped like key
-    /// data shows only as that line while any side is in a key's block, whether it holds the line
-    /// or not, since the old key's BEGIN line can be all that's left of it.
+    /// read once and taken by each side that holds it, with what the side it's reported on finds,
+    /// a key there taking `slot`. It's left out, or becomes its key's
+    /// [`REDACTED`](super::REDACTED) line, where any side that holds it takes it for a private
+    /// key's data; and a line shaped like key data shows only as that line while any side is in a
+    /// key's block, whether it holds the line or not, since the old key's BEGIN line can be all
+    /// that's left of it.
     fn scan(
         &mut self,
         markers: Markers,
         content: &str,
         change: Change,
-        kinds: &mut Vec<String>,
-    ) -> Option<String> {
+        slot: usize,
+    ) -> ScannedLineOfHunk {
         let line = ScannedLine::of(content);
         let data_in_an_open_block = self.any_in_key() && line.is_data();
-        let mut reported = None;
+        let mut reported: Option<(&mut KeyBlock, Taken)> = None;
         let mut least = Taken::Text;
         for (side, change) in self.holding(markers, change) {
             let taken = side.take(&line, change);
-            reported.get_or_insert(taken);
             least = least.min(taken);
+            if reported.is_none() {
+                reported = Some((side, taken));
+            }
         }
         if data_in_an_open_block {
             least = least.min(Taken::Key);
         }
-        kinds.extend(line.kinds(reported.unwrap_or(Taken::Text)));
-        line.text(least)
+        let taken = reported.map_or(Taken::Text, |(side, taken)| side.wait_if_key(taken, slot));
+        ScannedLineOfHunk {
+            text: line.text(least),
+            secrets: line.secrets(taken),
+        }
     }
 
     /// Whether any side is in a private key's block.
@@ -237,27 +274,38 @@ impl Sides {
 
     /// Starts on a line with these `markers`, which makes `change`, too long to scan whole.
     fn start_long_line(&mut self, markers: Markers, change: Change) -> LongLineScan {
-        let in_key = self.holding(markers, change).any(|(side, _)| side.in_key());
-        LongLineScan::starting(in_key)
+        let sides: Vec<_> = self
+            .holding(markers, change)
+            .map(|(side, _)| (side.in_key(), side.data_print()))
+            .collect();
+        let in_key = sides.iter().any(|(in_key, _)| *in_key);
+        LongLineScan::starting(in_key, sides.into_iter().map(|(_, print)| print).collect())
     }
 
-    /// What the long line with these `markers`, which makes `change`, holds on the side it's
-    /// reported on, now that its `windows` have been scanned. Every side that holds it takes it,
-    /// so that each side's block goes on from it.
-    fn end_long_line(
-        &mut self,
-        markers: Markers,
-        change: Change,
-        line: LongLineScan,
-        windows: Windows,
-    ) -> Option<Vec<String>> {
-        let facts = LongLineFacts::of(line, windows.ends_with_begin);
-        let mut reported = None;
-        for (side, change) in self.holding(markers, change) {
-            let taken = side.take(&facts, change);
-            reported.get_or_insert(taken);
+    /// What the long line `text` holds on the side it's reported on, a key there taking `slot`,
+    /// now that its `windows` have been scanned. Every side that holds it takes it, with the facts
+    /// started for it, so that each side's block goes on from it.
+    fn end_long_line(&mut self, text: LongText, windows: Windows, slot: usize) -> Vec<Secret> {
+        let facts = LongLineFacts::of(text.line, windows.ends_with_begin);
+        let markers = Markers::of(&text.columns);
+        let holding: Vec<_> = self.holding(markers, text.change).collect();
+        debug_assert_eq!(
+            holding.len(),
+            facts.len(),
+            "the sides the line was started for"
+        );
+        let mut reported: Option<(&mut KeyBlock, Taken)> = None;
+        for ((side, change), facts) in holding.into_iter().zip(&facts) {
+            let taken = side.take(facts, change);
+            if reported.is_none() {
+                reported = Some((side, taken));
+            }
         }
-        windows.kinds_for(reported?)
+        match reported.map(|(side, taken)| side.wait_if_key(taken, slot)) {
+            Some(Taken::Key) => vec![Secret::key()],
+            Some(Taken::Text) => windows.secrets,
+            Some(Taken::MoreOfAKey) | None => Vec::new(),
+        }
     }
 }
 
@@ -640,7 +688,10 @@ mod tests {
         let text = scan.start_long_line("+added").expect("a hunk's line");
         assert_eq!(text.markers(), 1);
         let windows = Windows {
-            kinds: vec!["AWS access key".to_owned()],
+            secrets: vec![Secret {
+                kind: "AWS access key".to_owned(),
+                print: crate::secrets::fingerprint::Key::for_run().of(b"key"),
+            }],
             ends_with_begin: false,
         };
         scan.end_long_line(text, windows);
@@ -674,6 +725,34 @@ mod tests {
         let found = diff_findings(&diff);
 
         assert!(found.is_empty());
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "{:?}",
+            start.elapsed()
+        );
+    }
+
+    /// A private key's block that every parent of a merge holds costs each side one hash of each
+    /// data line, in one piece: a few seconds here in a debug build for 512 parents and 800 KiB of
+    /// key data, which a byte at a time would take well over the limit to hash.
+    #[test]
+    fn reads_a_key_every_parent_holds_in_time() {
+        use crate::secrets::test_support::{key_begin, key_end};
+        let parents = 512;
+        let signs = "@".repeat(parents + 1);
+        let ranges = "-1,52 ".repeat(parents);
+        let kept = |text: &str| format!("{}{text}\n", " ".repeat(parents));
+        let data: String = (0..50).map(|_| kept(&"A".repeat(16 * 1024))).collect();
+        let diff = format!(
+            "diff --cc k\n--- a/k\n+++ b/k\n{signs} {ranges}+1,52 {signs}\n{}{data}{}",
+            kept(&key_begin("OPENSSH")),
+            kept(&key_end("OPENSSH")),
+        );
+
+        let start = Instant::now();
+        let found = diff_findings(&diff);
+
+        assert_eq!(found.len(), 1);
         assert!(
             start.elapsed() < Duration::from_secs(10),
             "{:?}",

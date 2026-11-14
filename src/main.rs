@@ -785,7 +785,7 @@ async fn tidy_commits(args: &TidyArgs, overrides: &Overrides) -> Result<()> {
         .budget()
         .user_message_bytes(prompt::TIDY_PROMPT)
         .saturating_sub(notes_bytes(args.hint.as_deref()));
-    let text = redact::text(&tidy::describe(&commits, room), &Place::text("commits")).text;
+    let text = redact::scrub(&tidy::describe(&commits, room));
     let conversation = prompt::tidy_messages(&text, args.hint.as_deref());
     report_model(&model, tokens_in(&conversation));
     let tidier = Tidier {
@@ -955,7 +955,7 @@ impl Tidier<'_> {
             changes.diff = redact::diff(&changes.diff).text;
             let mut hint = format!(
                 "The commit's current message doesn't say what it does:\n{}",
-                redact::text(&commit.message, &Place::text("message")).text
+                redact::scrub(&commit.message)
             );
             if let Some(extra) = &args.hint {
                 hint = format!("{hint}\n{extra}");

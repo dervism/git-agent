@@ -794,7 +794,7 @@ mod tests {
     use crate::config::DEFAULT_EXCLUDE;
     use crate::git::CommitId;
     use crate::git::test_support::{
-        isolated_repo, move_pointer, run, short_head, tips_of, with_submodule,
+        graft, isolated_repo, move_pointer, run, short_head, tips_of, with_submodule,
     };
     use finding::FileRef;
     use finding::test_support::{in_commit, print_of};
@@ -1954,8 +1954,7 @@ mod tests {
             dir,
             &["update-ref", "refs/remotes/origin/main", first.trim()],
         );
-        let grafts = format!("{} {}\n", first.trim(), second.trim());
-        fs::write(dir.join(".git/info/grafts"), grafts).unwrap();
+        graft(dir, &first, &[&second]);
         let grafted = run(dir, &["log", "--format=%h", "HEAD", "--not", "--remotes"]);
         assert!(grafted.is_empty(), "{grafted}");
 

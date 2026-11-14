@@ -374,7 +374,9 @@ mod tests {
     #[cfg(unix)]
     use crate::git::test_support::hook;
     use crate::git::test_support::{
-        add_remote, commit_elsewhere, isolate, isolated_repo, run, short_head, tips_of,
+        ShowParents, add_remote, commit_elsewhere, commit_on_no_branch, graft,
+        graft_and_write_a_bitmap, has_object, isolate, isolated_repo, replace_parents, run,
+        short_head, tips_of,
     };
     use crate::secrets::contents::MOST_BINARY_BYTES;
     use crate::secrets::test_support::{aws_key, other_aws_key, push_listing};
@@ -664,6 +666,39 @@ mod tests {
             remote_head(remote.path()),
             run(dir.path(), &["rev-parse", "HEAD"])
         );
+    }
+
+    /// Whatever a graft, a bitmap written under one, or a replacement shows as the pushed commit's
+    /// parents, the push lists nothing and sends the commits as they are stored, as the checks read
+    /// them. With nothing found the setting makes no difference, and warn lists whatever a check
+    /// does find.
+    #[test]
+    fn pushes_what_the_checks_read_whatever_a_graft_or_a_replacement_says() {
+        let rewrites: [(&str, ShowParents); 3] = [
+            ("graft", graft),
+            ("graft in a bitmap", graft_and_write_a_bitmap),
+            ("replacement", replace_parents),
+        ];
+        for (case, show_parents) in rewrites {
+            let (dir, repo) = isolated_repo();
+            let dir = dir.path();
+            let remote = add_remote(&repo);
+            let hash = |name: &str| run(dir, &["rev-parse", name]).trim().to_owned();
+            let keyed = commit_on_no_branch(dir, "deploy.env", &format!("aws {}\n", aws_key()));
+            let key_blob = hash(&format!("{keyed}:deploy.env"));
+            fs::write(dir.join("lib.rs"), "fn b() {}\n").unwrap();
+            run(dir, &["commit", "-q", "-am", "feat: b"]);
+            let pushed = hash("HEAD");
+            show_parents(dir, &pushed, &[&hash("HEAD~1"), &keyed]);
+            assert!(run(dir, &["log", "--format=%H"]).contains(&keyed), "{case}");
+
+            let warned = warnings_of_a_push(&repo, &Checks::new(OnSecrets::Warn));
+
+            assert!(warned.is_empty(), "{case}: {warned:?}");
+            assert_eq!(remote_head(remote.path()).trim(), pushed, "{case}");
+            assert!(!has_object(remote.path(), &keyed), "{case}");
+            assert!(!has_object(remote.path(), &key_blob), "{case}");
+        }
     }
 
     /// Commits what's staged, or all tracked changes, with `message`, checked as `on_secrets` says.

@@ -10,6 +10,12 @@ use anyhow::{Context, Result, bail};
 use std::collections::BTreeSet;
 use std::process::{Command, Stdio};
 
+/// Has `git push` find what to send by walking the history, not through reachability bitmaps. It
+/// sets `pack.useBitmaps`, which git has read since bitmaps came in 2.0, rather than
+/// `push.useBitmaps`, which came in 2.38: git 2.26 to 2.37 would ignore that as a key it doesn't
+/// know.
+const NO_BITMAPS: [&str; 2] = ["-c", "pack.useBitmaps=false"];
+
 /// Where the current branch is pushed: a remote, and the branch there, and what the push does
 /// with submodules.
 #[derive(Debug, Clone, PartialEq)]
@@ -278,7 +284,11 @@ impl Repo {
 
     /// The `git push` of [`Repo::push_commit`], with `stdout` for git's standard output. It isn't
     /// git-agent's own: a `pre-push` hook writes there. With the reader of that output gone, the
-    /// hook would die, and the push with it.
+    /// hook would die, and the push with it. The push runs without replacements, grafts and
+    /// bitmaps, so that it sends the history the secret checks read, whichever of git's programs
+    /// sends it for the remote. A `pre-push` hook inherits that environment: the git it runs sees
+    /// no replacements or grafts either, and uses no bitmaps, though git's submodule commands set
+    /// the first two aside.
     fn push_command(
         &self,
         commit: &str,
@@ -287,15 +297,17 @@ impl Repo {
     ) -> Result<Command> {
         let commit = super::object_hash(commit)?;
         let refspec = format!("{commit}:refs/heads/{}", destination.branch);
-        let mut command = self.command(&[
+        let push = [
+            "--no-replace-objects",
             "push",
             "--no-follow-tags",
             destination.submodules.option(),
             "--",
             &destination.remote,
             &refspec,
-        ]);
-        command.stdout(stdout);
+        ];
+        let mut command = self.command(&[&NO_BITMAPS[..], &push].concat());
+        super::without_grafts(&mut command).stdout(stdout);
         Ok(command)
     }
 
@@ -469,7 +481,8 @@ mod tests {
     #[cfg(unix)]
     use crate::git::test_support::hook;
     use crate::git::test_support::{
-        add_remote, commit_elsewhere, isolate, isolated_repo, push, run, with_submodule,
+        ShowParents, add_remote, commit_elsewhere, commit_on_no_branch, graft_and_write_a_bitmap,
+        has_object, isolate, isolated_repo, push, replace_parents, run, with_submodule,
     };
     use std::fs;
     use std::path::Path;
@@ -510,6 +523,40 @@ mod tests {
         fs::write(dir.join("lib.rs"), content).unwrap();
         repo.commit(subject, Scope::Tracked, &[], &[]).unwrap();
         head(repo)
+    }
+
+    /// Whatever a graft, with a bitmap written then, or a replacement shows as the pushed commit's
+    /// parents, the push sends the commits as they are stored, as the secret checks read them, and
+    /// its `pre-push` hook sees them so too.
+    #[cfg(unix)]
+    #[test]
+    fn pushes_the_commits_as_git_stores_them_whatever_a_graft_or_a_replacement_says() {
+        let rewrites: [(&str, ShowParents); 2] = [
+            ("graft in a bitmap", graft_and_write_a_bitmap),
+            ("replacement", replace_parents),
+        ];
+        for (case, show_parents) in rewrites {
+            let (dir, repo) = isolated_repo();
+            let dir = dir.path();
+            let remote = add_remote(&repo);
+            let elsewhere = commit_on_no_branch(dir, "other.rs", "fn other() {}\n");
+            let pushed = commit(dir, &repo, "fn b() {}\n", "feat: second");
+            let parents = |dir: &Path| run(dir, &["rev-list", "--parents", "-n", "1", "HEAD"]);
+            let stored = parents(dir);
+            let parent = run(dir, &["rev-parse", "HEAD~1"]);
+            show_parents(dir, &pushed, &[&parent, &elsewhere]);
+            assert_ne!(parents(dir), stored, "{case}");
+            let script = "git rev-list --parents -n 1 HEAD > hook-saw\n";
+            hook(dir, "pre-push", script);
+
+            push(&repo);
+
+            let at_main = run(remote.path(), &["rev-parse", "main"]);
+            assert_eq!(at_main.trim(), pushed, "{case}");
+            assert!(!has_object(remote.path(), &elsewhere), "{case}");
+            let saw = fs::read_to_string(dir.join("hook-saw")).unwrap();
+            assert_eq!(saw, stored, "{case}");
+        }
     }
 
     #[test]

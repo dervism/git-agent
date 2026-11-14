@@ -176,9 +176,16 @@ const PUBLISHED_SETTINGS: [&str; 5] = [
     "core.bigFileThreshold=512m",
 ];
 
-/// A graft file that can't exist, since `/dev/null` is no folder. Grafts change the parents
-/// git's reads see, but not what a push sends.
+/// A graft file that can't exist on Unix, where `/dev/null` is no folder, so git reads no grafts
+/// and doesn't warn about a missing file. Elsewhere the reads and the push still read the same one.
 const NO_GRAFTS: &str = "/dev/null/no-grafts";
+
+/// Has `command` see each commit with the parents it records, not those a graft gives it, as the
+/// reads for the secret checks and the push both do. A shallow clone's history still ends where
+/// the clone cut it, for both.
+fn without_grafts(command: &mut Command) -> &mut Command {
+    command.env("GIT_GRAFT_FILE", NO_GRAFTS)
+}
 
 pub struct Repo {
     /// Directory git commands run in.
@@ -463,7 +470,7 @@ impl Repo {
     fn published_command<'a>(&self, args: &[&'a str]) -> (Command, Vec<&'a str>) {
         let args = readable(&[&PUBLISHED_SETTINGS[..], args].concat());
         let mut command = self.command(&args);
-        command.env("GIT_GRAFT_FILE", NO_GRAFTS);
+        without_grafts(&mut command);
         (command, args)
     }
 
@@ -2187,6 +2194,80 @@ pub mod test_support {
         run(clone.path(), &["add", "--all"]);
         run(clone.path(), &["commit", "-q", "-m", subject]);
         run(clone.path(), &["push", "-q"]);
+    }
+
+    /// A commit with no parent that no branch holds, whose tree has `file` with `content`. HEAD
+    /// must be on a branch, with a clean work tree; both are left as they were, though the commit
+    /// stays in HEAD's reflog.
+    pub fn commit_on_no_branch(dir: &Path, file: &str, content: &str) -> String {
+        let branch = run(dir, &["branch", "--show-current"]);
+        run(dir, &["switch", "-q", "--orphan", "no-branch"]);
+        fs::write(dir.join(file), content).unwrap();
+        run(dir, &["add", "--", file]);
+        run(dir, &["commit", "-q", "-m", "on no branch"]);
+        let commit = run(dir, &["rev-parse", "HEAD"]).trim().to_owned();
+        run(dir, &["switch", "-q", branch.trim()]);
+        run(dir, &["branch", "-q", "-D", "no-branch"]);
+        commit
+    }
+
+    /// Makes the repository's one graft give `commit` the `parents`, which git follows unless told
+    /// not to, and turns off the hint git gives about grafts on every command.
+    pub fn graft(dir: &Path, commit: &str, parents: &[&str]) {
+        let file = dir.join(run(dir, &["rev-parse", "--git-path", "info/grafts"]).trim());
+        fs::create_dir_all(file.parent().unwrap()).unwrap();
+        fs::write(file, hashes(commit, parents).join(" ") + "\n").unwrap();
+        run(dir, &["config", "advice.graftFileDeprecated", "false"]);
+    }
+
+    /// A way to have git show a commit with parents it doesn't record, as [`graft`] does.
+    pub type ShowParents = fn(&Path, &str, &[&str]);
+
+    /// Grafts as [`graft`] does, then writes a reachability bitmap, and checks that git wrote one.
+    pub fn graft_and_write_a_bitmap(dir: &Path, commit: &str, parents: &[&str]) {
+        graft(dir, commit, parents);
+        run(dir, &["repack", "-a", "-d", "-b", "-q"]);
+        let packs = dir.join(run(dir, &["rev-parse", "--git-path", "objects/pack"]).trim());
+        let bitmaps = fs::read_dir(packs)
+            .unwrap()
+            .filter(|entry| entry.as_ref().unwrap().path().extension() == Some("bitmap".as_ref()))
+            .count();
+        assert_eq!(bitmaps, 1, "git wrote no bitmap");
+    }
+
+    /// Gives `commit` the `parents` through `git replace`, which git's reads follow unless told
+    /// not to.
+    pub fn replace_parents(dir: &Path, commit: &str, parents: &[&str]) {
+        run(
+            dir,
+            &[&["replace", "--graft"], &hashes(commit, parents)[..]].concat(),
+        );
+    }
+
+    /// `commit` and its `parents`, without the line ends git prints after a hash.
+    fn hashes<'a>(commit: &'a str, parents: &[&'a str]) -> Vec<&'a str> {
+        [commit]
+            .iter()
+            .chain(parents)
+            .map(|hash| hash.trim())
+            .collect()
+    }
+
+    /// Whether the repository at `dir` holds the object `hash`, which must be a valid name.
+    pub fn has_object(dir: &Path, hash: &str) -> bool {
+        let output = Command::new("git")
+            .current_dir(dir)
+            .args(["cat-file", "-e", hash])
+            .output()
+            .unwrap();
+        match output.status.code() {
+            Some(0) => true,
+            Some(1) => false,
+            _ => panic!(
+                "git cat-file -e {hash} failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            ),
+        }
     }
 
     /// A repository with lib.rs committed, without the user's global settings

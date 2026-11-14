@@ -379,7 +379,9 @@ mod tests {
         short_head, tips_of,
     };
     use crate::secrets::contents::MOST_BINARY_BYTES;
-    use crate::secrets::test_support::{aws_key, other_aws_key, push_listing};
+    use crate::secrets::test_support::{
+        aws_key, listing_of_twelve, other_aws_key, push_listing, twelve_keys,
+    };
     use std::fs;
     use std::path::Path;
     use tempfile::TempDir;
@@ -1084,6 +1086,31 @@ mod tests {
     /// The warning of a push that lists the key in `place`.
     fn push_lists(place: &str) -> String {
         push_listing(&[format!("   {place}  AWS access key")])
+    }
+
+    /// The changes add twelve keys to one file. Under warn, the check before the model names every
+    /// one, ten on lines of their own and the rest by their lines; the commit lists nothing more,
+    /// and the push leaves them all out.
+    #[test]
+    fn names_every_key_of_a_commit_that_the_push_leaves_out() {
+        let (dir, repo) = isolated_repo();
+        let dir = dir.path();
+        let _remote = add_remote(&repo);
+        fs::write(dir.join("deploy.env"), twelve_keys()).unwrap();
+        run(dir, &["add", "deploy.env"]);
+
+        let said = ui::test_support::listen();
+        let before = read_before_the_model(&repo);
+        let checks = commit_after(&repo, "feat: deploy", &before);
+        let warned = said.warnings();
+        drop(said);
+
+        assert_eq!(warned.len(), 1, "{warned:?}");
+        assert!(
+            warned[0].ends_with(&listing_of_twelve("deploy.env")),
+            "{warned:?}"
+        );
+        assert_eq!(warnings_of_a_push(&repo, &checks), Vec::<String>::new());
     }
 
     /// The push leaves out what the commit made added, and lists the key an older commit added

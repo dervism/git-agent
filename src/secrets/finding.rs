@@ -366,7 +366,7 @@ pub mod test_support {
     }
 
     /// Places that hold each other, or don't, in every way the rule tells them apart.
-    fn every_kind_of_place() -> [Place; 10] {
+    pub fn every_kind_of_place() -> [Place; 10] {
         [
             Place::file("a.env"),
             Place::file("b.env"),

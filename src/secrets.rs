@@ -11,6 +11,7 @@ pub mod contents;
 pub mod finding;
 pub mod fingerprint;
 mod lines;
+mod listing;
 mod publication;
 pub mod redact;
 
@@ -66,8 +67,21 @@ pub fn report_secrets(findings: &[Finding], advice: &str) {
         findings.len(),
         redact::REDACTED
     ));
-    ui::info(list_findings(&findings.iter().collect::<Vec<_>>()));
+    ui::info(listing::findings(findings));
     ui::info(ui::dim(&format!("   {advice}")));
+}
+
+/// Lists the secrets the commits add, which the model gets as `[REDACTED]`.
+pub fn report_secrets_the_commits_add(findings: &[Finding]) {
+    let added = added(findings);
+    if added.is_empty() {
+        return;
+    }
+    ui::warn(format!(
+        "the commits add what look like secrets; the model gets {} in their place:\n{}",
+        redact::REDACTED,
+        listing::findings(added)
+    ));
 }
 
 /// Checks every file of what a commit of `scope` will hold. `reported` holds the findings the
@@ -302,23 +316,13 @@ fn with_binary_files(repo: &Repo, found: Found) -> Result<Scanned> {
 /// The warning that lists the binary files too large to check, if there are any. They don't
 /// stop anything, whatever the setting.
 fn unchecked_verdict(unchecked: &[Unchecked]) -> Verdict {
-    const SHOWN: usize = 5;
-    const MIB: f64 = 1024.0 * 1024.0;
     if unchecked.is_empty() {
         return Verdict::Clean;
-    }
-    let mut lines: Vec<String> = unchecked
-        .iter()
-        .take(SHOWN)
-        .map(|file| format!("   {}  ({:.1} MiB)", file.place, file.size as f64 / MIB))
-        .collect();
-    if unchecked.len() > SHOWN {
-        lines.push(format!("   … and {} more", unchecked.len() - SHOWN));
     }
     Verdict::Warn(format!(
         "git-agent didn't check these binary files for secrets, since each is over {} MiB:\n{}",
         MOST_BINARY_BYTES / (1024 * 1024),
-        lines.join("\n")
+        listing::unchecked(unchecked)
     ))
 }
 
@@ -345,7 +349,7 @@ fn refusal(findings: &[Finding], wording: &Wording) -> Option<String> {
         format!(
             "{}:\n{}\n{} {ADVICE}",
             wording.refused,
-            list_findings(&added),
+            listing::findings(added),
             wording.fix
         )
     })
@@ -359,7 +363,7 @@ fn warning(findings: &[Finding], reported: &[Finding], warned: &str) -> Option<S
         .into_iter()
         .filter(|finding| !earlier.holds(finding))
         .collect();
-    (!new.is_empty()).then(|| format!("{warned}:\n{}", list_findings(&new)))
+    (!new.is_empty()).then(|| format!("{warned}:\n{}", listing::findings(new)))
 }
 
 /// Those of `findings` that `before` doesn't hold, so that a check at a commit lists only what's
@@ -396,36 +400,11 @@ fn settle(verdict: Verdict) -> Result<()> {
 }
 
 /// The findings the change adds, rather than leaves alone or removes.
-pub fn added(findings: &[Finding]) -> Vec<&Finding> {
+fn added(findings: &[Finding]) -> Vec<&Finding> {
     findings
         .iter()
         .filter(|finding| finding.change == Change::Added)
         .collect()
-}
-
-/// The first few findings, one per line.
-pub fn list_findings(findings: &[&Finding]) -> String {
-    const SHOWN: usize = 5;
-    let mut lines: Vec<String> = findings
-        .iter()
-        .take(SHOWN)
-        .map(|finding| {
-            let place = match finding.line {
-                Some(line) => format!("{}:{line}", finding.place),
-                None => finding.place.to_string(),
-            };
-            let change = match finding.change {
-                Change::Added => "",
-                Change::Unchanged => ", on an unchanged line",
-                Change::Removed => ", on a removed line",
-            };
-            format!("   {place}  {}{change}", finding.kind)
-        })
-        .collect();
-    if findings.len() > SHOWN {
-        lines.push(format!("   … and {} more", findings.len() - SHOWN));
-    }
-    lines.join("\n")
 }
 
 /// What the tests of the secret checks share.
@@ -448,6 +427,20 @@ pub mod test_support {
     /// The warning of a push that lists `shown`, one finding per line.
     pub fn push_listing(shown: &[String]) -> String {
         format!("{}:\n{}", PUSH.warned, shown.join("\n"))
+    }
+
+    /// Twelve copies of a key, one per line: more than a list names on lines of their own.
+    pub fn twelve_keys() -> String {
+        format!("aws {}\n", aws_key()).repeat(12)
+    }
+
+    /// How a list names the keys of [`twelve_keys`] in a file at `place`: ten on lines of their own,
+    /// the rest on one line.
+    pub fn listing_of_twelve(place: &str) -> String {
+        let each = (1..=10).map(|line| format!("   {place}:{line}  AWS access key"));
+        let rest = format!("   … and 2 more in {place}, on lines 11-12: AWS access key");
+        let lines: Vec<String> = each.chain([rest]).collect();
+        lines.join("\n")
     }
 
     /// An AWS access key's shape, built at run time so that the source holds no key.
@@ -788,7 +781,8 @@ pub mod test_support {
 #[cfg(test)]
 mod tests {
     use super::test_support::{
-        aws_key, key_begin, key_data, key_end, other_aws_key, push_listing, push_warnings,
+        aws_key, key_begin, key_data, key_end, listing_of_twelve, other_aws_key, push_listing,
+        push_warnings, twelve_keys,
     };
     use super::*;
     use crate::config::DEFAULT_EXCLUDE;
@@ -923,11 +917,12 @@ mod tests {
     }
 
     /// One secret in 20,000 files, or on 20,000 lines of one, in an older commit and in a commit the
-    /// run read: each is looked up in time that doesn't grow with how many share its print. Under a
-    /// second here in a debug build, well inside the bound.
+    /// run read: each is looked up in time that doesn't grow with how many share its print, and the
+    /// warning names each file on a line, or the lines past ten on one. Under a second here in a
+    /// debug build, well inside the bound.
     #[test]
     fn looks_up_many_copies_of_one_secret_quickly() {
-        let in_files = |commit: &str| -> Vec<Finding> {
+        let in_files: fn(&str) -> Vec<Finding> = |commit| {
             (1..=20_000)
                 .map(|n| {
                     finding(
@@ -938,18 +933,22 @@ mod tests {
                 })
                 .collect()
         };
-        let on_lines = |commit: &str| -> Vec<Finding> {
+        let on_lines: fn(&str) -> Vec<Finding> = |commit| {
             (1..=20_000)
                 .map(|line| finding(in_commit(commit, "a.env"), Some(line), Change::Added))
                 .collect()
         };
+        let last_file = "   commit 1a2b3c4 20000.env:1  GitHub token";
+        let rest = "   … and 19,990 more in commit 1a2b3c4 a.env, on lines 11-20000: GitHub token";
+        let shapes = [(in_files, 20_001, last_file), (on_lines, 12, rest)];
         let started = std::time::Instant::now();
 
-        for copies in [in_files, on_lines] {
+        for (copies, lines, last) in shapes {
             let (older, read) = (copies("1a2b3c4"), copies("5d6e7f8"));
             let warned = warning(&older, &read, "going on").unwrap();
             assert_eq!(new_findings(&older, &read).len(), 20_000);
-            assert!(warned.ends_with("… and 19995 more"), "{warned}");
+            assert_eq!(warned.lines().count(), lines);
+            assert_eq!(warned.lines().last(), Some(last));
             assert!(new_findings(&read, &read).is_empty());
         }
         assert!(started.elapsed().as_secs() < 10, "{:?}", started.elapsed());
@@ -977,36 +976,82 @@ mod tests {
         assert!(started.elapsed().as_secs() < 10, "{:?}", started.elapsed());
     }
 
+    /// Five findings in one file, then one in another: a refusal, a warning and the flow's own list
+    /// each name all six, the last one too.
     #[test]
-    fn lists_each_finding_with_its_place_and_what_the_change_does_to_it() {
-        let findings = [
-            finding(changed("src/a.rs"), Some(3), Change::Added),
-            finding(message_of("1a2b3c4"), None, Change::Unchanged),
-            finding(changed("b.env"), Some(9), Change::Removed),
-        ];
-        assert_eq!(
-            list_findings(&findings.iter().collect::<Vec<_>>()),
-            "   src/a.rs:3  GitHub token\n   commit 1a2b3c4 message  GitHub token, on an \
-             unchanged line\n   b.env:9  GitHub token, on a removed line"
-        );
-        assert_eq!(list_findings(&[]), "");
+    fn names_the_finding_that_comes_after_five_others() {
+        let six: Vec<Finding> = (1..=5)
+            .map(|line| finding(changed("a.env"), Some(line), Change::Added))
+            .chain([finding(changed("b.env"), Some(1), Change::Added)])
+            .collect();
+        let each: Vec<String> = (1..=5)
+            .map(|line| format!("   a.env:{line}  GitHub token"))
+            .chain(["   b.env:1  GitHub token".to_owned()])
+            .collect();
+        let listed = each.join("\n");
+
+        let refused = verdict(&six, OnSecrets::Reject, &[], &WORDING);
+        let warned = verdict(&six, OnSecrets::Warn, &[], &WORDING);
+        let said = ui::test_support::listen();
+        report_secrets(&six, "Take them out.");
+
+        let stopped = format!("stopped:\n{listed}\nFix it. {ADVICE}");
+        assert_eq!(refused, Verdict::Refuse(stopped));
+        assert_eq!(warned, Verdict::Warn(format!("going on:\n{listed}")));
+        assert!(said.lines().contains(&listed), "{:?}", said.lines());
     }
 
+    /// Tidy's list names the secrets the commits add, and says nothing when they add none.
     #[test]
-    fn lists_the_first_five_and_counts_the_rest() {
-        let findings: Vec<Finding> = (1..=6)
-            .map(|line| finding(changed("a.rs"), Some(line), Change::Added))
+    fn reports_the_secrets_the_commits_add() {
+        let found = [
+            finding(in_commit("1a2b3c4", "a.env"), Some(2), Change::Added),
+            finding(in_commit("1a2b3c4", "b.env"), Some(5), Change::Removed),
+            finding(message_of("5d6e7f8"), None, Change::Added),
+        ];
+        let said = ui::test_support::listen();
+
+        report_secrets_the_commits_add(&found);
+        report_secrets_the_commits_add(&found[1..2]);
+
+        let listed = "the commits add what look like secrets; the model gets [REDACTED] in their \
+                      place:\n   commit 1a2b3c4 a.env:2  GitHub token\n   commit 5d6e7f8 message  \
+                      GitHub token";
+        assert_eq!(said.warnings(), [listed]);
+    }
+
+    /// A pull request's commit adds twelve keys to one file. The flow's own list names every one,
+    /// ten on lines of their own and the rest by their lines; the check of the commits lists
+    /// nothing more, and the push leaves them all out.
+    #[test]
+    fn names_every_key_of_a_pull_request_that_the_push_leaves_out() {
+        let (dir, repo) = isolated_repo();
+        let base = run(dir.path(), &["rev-parse", "HEAD"]).trim().to_owned();
+        let head = commit_file(dir.path(), &twelve_keys(), "add the keys");
+        let overall = run(dir.path(), &["diff", &base, "HEAD"]);
+        let reported = redact::diff(&overall).findings;
+        let range = format!("{base}..HEAD");
+        let mut checks = Checks::new(OnSecrets::Warn);
+
+        let said = ui::test_support::listen();
+        check_commits(&repo, &[&range], &reported, &mut checks, &WORDING).unwrap();
+        report_secrets(&reported, "Take them out.");
+
+        let listed = listing_of_twelve("deploy.env");
+        assert!(said.lines().contains(&listed), "{:?}", said.lines());
+        let heading = "found 12 possible secret(s); the model gets [REDACTED] in their place:";
+        assert_eq!(said.warnings(), [heading]);
+        let recorded: Vec<(String, Option<usize>)> = checks
+            .findings()
+            .iter()
+            .map(|finding| (finding.place.to_string(), finding.line))
             .collect();
-        let all: Vec<&Finding> = findings.iter().collect();
-        let five = list_findings(&all[..5]);
-        assert_eq!(five.lines().count(), 5);
-        assert!(five.ends_with("a.rs:5  GitHub token"), "{five}");
-        let six = list_findings(&all);
-        assert_eq!(six.lines().count(), 6);
-        assert!(
-            six.ends_with("a.rs:5  GitHub token\n   … and 1 more"),
-            "{six}"
-        );
+        let each_line: Vec<(String, Option<usize>)> = (1..=12)
+            .map(|line| (format!("commit {head} deploy.env"), Some(line)))
+            .collect();
+        assert_eq!(recorded, each_line);
+        drop(said);
+        assert_eq!(push_warnings(&repo, &checks), Vec::<String>::new());
     }
 
     #[test]
@@ -1074,7 +1119,7 @@ mod tests {
         for (file, text) in pairs {
             for (shown, later) in [(at(file.clone()), at(text.clone())), (at(text), at(file))] {
                 let before = std::slice::from_ref(&shown);
-                let listed = format!("w:\n{}", list_findings(&[&later]));
+                let listed = format!("w:\n{}", listing::findings([&later]));
                 assert_eq!(
                     warning(std::slice::from_ref(&later), before, "w"),
                     Some(listed)
@@ -2079,8 +2124,9 @@ mod tests {
         let Verdict::Warn(text) = unchecked_verdict(&six) else {
             panic!("no warning");
         };
+        assert_eq!(text.lines().count(), 7);
         assert!(
-            text.ends_with("pkg5/data.bin  (21.0 MiB)\n   … and 1 more"),
+            text.ends_with("pkg5/data.bin  (21.0 MiB)\n   pkg6/data.bin  (22.0 MiB)"),
             "{text}"
         );
     }

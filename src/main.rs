@@ -46,7 +46,7 @@ use review::{Action, Choice, Decline, Person, Review, Revisions, Terminal};
 use secrets::finding::{Finding, Place};
 use secrets::redact;
 use secrets::{
-    Checks, Wording, added, check_changes, check_commits, list_findings, report_secrets,
+    Checks, Wording, check_changes, check_commits, report_secrets, report_secrets_the_commits_add,
     warn_about_commits,
 };
 use server::{Message, ModelServer, Server};
@@ -763,14 +763,7 @@ async fn tidy_commits(args: &TidyArgs, overrides: &Overrides) -> Result<()> {
         commits[commits.len() - 1].short,
         safe_text::one_line(commits[commits.len() - 1].subject())
     ));
-    let added = added(&findings);
-    if !added.is_empty() {
-        ui::warn(format!(
-            "the commits add what look like secrets; the model gets {} in their place:\n{}",
-            redact::REDACTED,
-            list_findings(&added)
-        ));
-    }
+    report_secrets_the_commits_add(&findings);
     warn_about_commits(
         &repo,
         &[&range],

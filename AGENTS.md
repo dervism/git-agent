@@ -104,6 +104,7 @@ The modules the commands share:
 | `secrets.rs` | The secret checks: refusing or warning when a commit, a push or a pull request would add secrets. |
 | `secrets/finding.rs` | What a scan finds and where (`Finding`, `Place`), as the scans, the checks and the flows name it, and when a finding listed before holds a later one. |
 | `secrets/checks.rs` | What a run's checks go by (`Checks`): the setting, and what the checks of commits found, which the push doesn't list again. |
+| `secrets/listing.rs` | How the checks list what they found: every finding by its place and line, past ten in a place on one line, and every file too large to check. |
 | `secrets/fingerprint.rs` | Fingerprints of secrets and lines: a keyed hash, with one key for the run that is never shown. |
 | `secrets/redact.rs` | Finds secrets in text before it goes to a model, and replaces them with `[REDACTED]`. |
 | `secrets/redact/diff_scan.rs` | Scans a diff a line at a time, following each side of a hunk. |
